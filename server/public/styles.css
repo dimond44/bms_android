@@ -221,6 +221,28 @@ dialog label { display: grid; gap: 7px; margin: 22px 0 12px; color: var(--muted)
 dialog input { height: 46px; padding: 0 13px; border: 1px solid var(--line); border-radius: 11px; outline: 0; background: var(--surface-2); color: var(--text); text-transform: none; }
 dialog input:focus { border-color: var(--yellow-deep); box-shadow: 0 0 0 3px rgba(255, 196, 0, .15); }
 .primary-button { width: 100%; height: 46px; margin-top: 10px; border: 0; border-radius: 11px; background: linear-gradient(135deg, var(--yellow), var(--yellow-deep)); color: #17130a; font-weight: 800; cursor: pointer; }
+.ghost-button { height: 40px; padding: 0 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); color: var(--text); font-weight: 700; cursor: pointer; }
+.ghost-button:hover { border-color: var(--yellow-deep); background: color-mix(in srgb, var(--yellow) 10%, var(--surface)); }
+.write-note { margin: 0 0 14px; color: var(--muted); line-height: 1.5; }
+.write-toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.write-file { display: inline-flex; align-items: center; height: 40px; padding: 0 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-2); font-weight: 700; cursor: pointer; }
+.write-file:hover { border-color: var(--yellow-deep); background: color-mix(in srgb, var(--yellow) 10%, var(--surface)); }
+.write-file input { display: none; }
+.write-file-name { min-height: 18px; margin: 0 0 12px; color: var(--muted); font-size: 12px; }
+.write-table input { width: 100%; min-width: 90px; height: 36px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); color: var(--text); }
+.write-table input:focus { outline: 0; border-color: var(--yellow-deep); }
+.write-table .write-skipped { color: var(--muted); font-size: 12px; }
+.write-row.skipped td { opacity: .55; }
+.write-param-key { margin-top: 3px; color: var(--muted); font-size: 11px; font-weight: 500; text-transform: none; letter-spacing: 0; }
+.write-table .mono { font-variant-numeric: tabular-nums; }
+.write-action { display: grid; gap: 4px; justify-items: start; }
+.write-action-button { height: 34px; padding: 0 12px; border: 0; border-radius: 8px; background: linear-gradient(135deg, var(--yellow), var(--yellow-deep)); color: #17130a; font-weight: 800; cursor: pointer; }
+.write-action-button:disabled { opacity: .45; cursor: default; }
+.write-action-status { color: var(--muted); font-size: 11px; white-space: normal; max-width: 180px; }
+.write-action-status.pending { color: var(--yellow-deep); }
+.write-action-status.writing { color: var(--yellow-deep); }
+.write-action-status.done { color: #1ca037; }
+.write-action-status.failed { color: var(--red); }
 .form-error { margin-bottom: 0; color: var(--red); font-size: 12px; }
 
 @media (max-width: 1050px) {

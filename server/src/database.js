@@ -73,6 +73,28 @@ function openDatabase(filename) {
 
     CREATE INDEX IF NOT EXISTS config_checks_bms_time_idx
       ON config_checks(bms_uid, checked_at DESC);
+
+    CREATE TABLE IF NOT EXISTS write_commands (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bms_uid TEXT NOT NULL,
+      param_key TEXT NOT NULL,
+      label TEXT,
+      register TEXT NOT NULL,
+      unit TEXT,
+      value REAL NOT NULL,
+      raw_value INTEGER NOT NULL,
+      scale REAL NOT NULL,
+      offset REAL NOT NULL,
+      status TEXT NOT NULL,
+      error TEXT,
+      actual REAL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (bms_uid) REFERENCES batteries(bms_uid) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS write_commands_bms_status_idx
+      ON write_commands(bms_uid, status, id);
   `);
 
   ensureColumn(db, "batteries", "advertised_name", "TEXT");
@@ -197,8 +219,114 @@ function openDatabase(filename) {
       return saveConfigCheck(payload, receivedAt);
     },
 
+    enqueueWriteCommand(command, receivedAt = Date.now()) {
+      db.prepare(`
+        UPDATE write_commands
+        SET status = 'superseded', updated_at = @updated_at
+        WHERE bms_uid = @bms_uid
+          AND param_key = @param_key
+          AND status IN ('pending', 'writing')
+      `).run({
+        bms_uid: command.bms_uid,
+        param_key: command.param_key,
+        updated_at: receivedAt,
+      });
+
+      const result = db.prepare(`
+        INSERT INTO write_commands (
+          bms_uid, param_key, label, register, unit, value, raw_value,
+          scale, offset, status, error, actual, created_at, updated_at
+        ) VALUES (
+          @bms_uid, @param_key, @label, @register, @unit, @value, @raw_value,
+          @scale, @offset, 'pending', NULL, NULL, @created_at, @updated_at
+        )
+      `).run({
+        bms_uid: command.bms_uid,
+        param_key: command.param_key,
+        label: command.label ?? null,
+        register: command.register,
+        unit: command.unit ?? null,
+        value: command.value,
+        raw_value: command.raw_value,
+        scale: command.scale,
+        offset: command.offset,
+        created_at: receivedAt,
+        updated_at: receivedAt,
+      });
+      return Number(result.lastInsertRowid);
+    },
+
+    listWriteCommands(bmsUid, options = {}) {
+      const limit = Number.isInteger(options.limit) ? options.limit : 20;
+      const staleBefore = options.staleBefore ?? 0;
+      const status = options.status;
+      const rows = status === "pending"
+        ? db.prepare(`
+            SELECT *
+            FROM write_commands
+            WHERE bms_uid = ?
+              AND (
+                status = 'pending'
+                OR (status = 'writing' AND updated_at < ?)
+              )
+            ORDER BY id ASC
+            LIMIT ?
+          `).all(bmsUid, staleBefore, limit)
+        : db.prepare(`
+            SELECT *
+            FROM write_commands
+            WHERE bms_uid = ?
+            ORDER BY id DESC
+            LIMIT ?
+          `).all(bmsUid, limit);
+      return rows.map(mapWriteCommand);
+    },
+
+    getWriteCommand(id) {
+      const row = db.prepare("SELECT * FROM write_commands WHERE id = ?").get(id);
+      return row ? mapWriteCommand(row) : null;
+    },
+
+    claimWriteCommand(id, updatedAt = Date.now()) {
+      const result = db.prepare(`
+        UPDATE write_commands
+        SET status = 'writing', updated_at = ?
+        WHERE id = ? AND status IN ('pending', 'writing')
+      `).run(updatedAt, id);
+      return Number(result.changes) > 0;
+    },
+
+    updateWriteCommand(id, patch, updatedAt = Date.now()) {
+      const current = db.prepare("SELECT * FROM write_commands WHERE id = ?").get(id);
+      if (!current) return null;
+      db.prepare(`
+        UPDATE write_commands
+        SET status = @status,
+            error = @error,
+            actual = @actual,
+            updated_at = @updated_at
+        WHERE id = @id
+      `).run({
+        id,
+        status: patch.status ?? current.status,
+        error: patch.error === undefined ? current.error : patch.error,
+        actual: patch.actual === undefined ? current.actual : patch.actual,
+        updated_at: updatedAt,
+      });
+      const row = db.prepare("SELECT * FROM write_commands WHERE id = ?").get(id);
+      return row ? mapWriteCommand(row) : null;
+    },
+
     hasBattery(bmsUid) {
       return db.prepare("SELECT 1 FROM batteries WHERE bms_uid = ?").get(bmsUid) != null;
+    },
+
+    getBattery(bmsUid) {
+      return db.prepare(`
+        SELECT bms_uid, bluetooth_name, advertised_name, hardware_family
+        FROM batteries
+        WHERE bms_uid = ?
+      `).get(bmsUid) || null;
     },
 
     listBatteries() {
@@ -219,6 +347,18 @@ function openDatabase(filename) {
           t.voltage,
           t.current,
           t.soc,
+          t.remaining_ah,
+          t.estimated_full_ah,
+          t.nominal_capacity_ah,
+          t.cell_diff_v,
+          t.min_cell_v,
+          t.max_cell_v,
+          t.min_temp,
+          t.max_temp,
+          t.charge_mos,
+          t.discharge_mos,
+          t.cells_json,
+          t.temps_json,
           t.errors_json,
           c.id AS config_check_id,
           c.received_at AS config_received_at,
@@ -253,6 +393,10 @@ function openDatabase(filename) {
       return rows.map((row) => {
         const {
           errors_json: errorsJson,
+          cells_json: cellsJson,
+          temps_json: tempsJson,
+          charge_mos: chargeMos,
+          discharge_mos: dischargeMos,
           config_check_id: configCheckId,
           config_received_at: configReceivedAt,
           config_checked_at: configCheckedAt,
@@ -269,6 +413,10 @@ function openDatabase(filename) {
         } = row;
         return {
           ...battery,
+          charge_mos: integerToBoolean(chargeMos),
+          discharge_mos: integerToBoolean(dischargeMos),
+          cells: parseJson(cellsJson, {}),
+          temps: parseJson(tempsJson, {}),
           errors: parseJson(errorsJson, []),
           config_check: configCheckId == null ? null : {
             id: configCheckId,
@@ -414,6 +562,12 @@ function booleanToInteger(value) {
   return null;
 }
 
+function integerToBoolean(value) {
+  if (value === 1) return true;
+  if (value === 0) return false;
+  return null;
+}
+
 function parseJson(value, fallback) {
   if (value == null) return fallback;
   try {
@@ -421,6 +575,26 @@ function parseJson(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function mapWriteCommand(row) {
+  return {
+    id: row.id,
+    bms_uid: row.bms_uid,
+    key: row.param_key,
+    label: row.label,
+    register: row.register,
+    unit: row.unit,
+    value: row.value,
+    raw_value: row.raw_value,
+    scale: row.scale,
+    offset: row.offset,
+    status: row.status,
+    error: row.error,
+    actual: row.actual,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
 }
 
 function ensureColumn(db, table, column, definition) {

@@ -41,7 +41,24 @@ test("GET / возвращает web-админку", async () => {
   assert.match(response.headers.get("content-type"), /text\/html/);
   assert.match(body, /ЛИФЕРЫЧ BMS/);
   assert.match(body, /Основное/);
+  assert.match(body, /Запись параметров/);
+  assert.match(body, /Записать/);
   assert.match(body, /Архив записей/);
+});
+
+test("GET /api/v1/config-template отдаёт шаблон и требует ключ", async () => {
+  const unauthorized = await fetch(`${baseUrl}/api/v1/config-template`);
+  assert.equal(unauthorized.status, 401);
+
+  const response = await fetch(`${baseUrl}/api/v1/config-template`, {
+    headers: { "x-api-key": API_KEY },
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.template.id, "liferych-lfp-default");
+  assert.ok(Array.isArray(body.template.parameters));
+  assert.ok(body.template.parameters.some((item) => item.key === "sleep_timeout"));
 });
 
 test("GET /styles.css возвращает стили админки", async () => {
@@ -87,6 +104,9 @@ test("GET возвращает батарею и историю без api_key",
   assert.equal(batteriesBody.batteries.length, 1);
   assert.equal(batteriesBody.batteries[0].bms_uid, "daly-AA:BB:CC:DD:EE:FF");
   assert.equal(batteriesBody.batteries[0].voltage, 52.4);
+  assert.equal(batteriesBody.batteries[0].remaining_ah, 153);
+  assert.equal(batteriesBody.batteries[0].charge_mos, true);
+  assert.deepEqual(batteriesBody.batteries[0].cells, { 1: 3.275, 2: 3.281 });
 
   const historyResponse = await fetch(
     `${baseUrl}/api/v1/batteries/${encodeURIComponent("daly-AA:BB:CC:DD:EE:FF")}/telemetry?limit=10`,
@@ -252,6 +272,138 @@ test("POST проверки конфигурации валидирует вло
 
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { ok: false, error: "invalid_mismatches" });
+});
+
+test("очередь записи sleep_timeout ставится и подтверждается приложением", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+  const uid = "write-queue-bms";
+  const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...createFullPayload(), bms_uid: uid }),
+  });
+  assert.equal(telemetry.status, 201);
+
+  const created = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "sleep_timeout", value: 3600 }),
+  });
+  assert.equal(created.status, 201);
+  const createdBody = await created.json();
+  assert.equal(createdBody.ok, true);
+  assert.equal(createdBody.command.key, "sleep_timeout");
+  assert.equal(createdBody.command.status, "pending");
+  assert.equal(createdBody.command.register, "0x0115");
+  assert.equal(createdBody.command.raw_value, 360);
+
+  const pending = await fetch(
+    `${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands?status=pending`,
+    { headers: { "x-api-key": API_KEY } },
+  );
+  const pendingBody = await pending.json();
+  assert.equal(pending.status, 200);
+  assert.equal(pendingBody.commands.length, 1);
+  assert.equal(pendingBody.commands[0].id, createdBody.command.id);
+
+  const writing = await fetch(
+    `${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands/${createdBody.command.id}/ack`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ status: "writing" }),
+    },
+  );
+  assert.equal(writing.status, 200);
+  assert.equal((await writing.json()).command.status, "writing");
+
+  const done = await fetch(
+    `${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands/${createdBody.command.id}/ack`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ status: "done", actual: 3600 }),
+    },
+  );
+  assert.equal(done.status, 200);
+  const doneBody = await done.json();
+  assert.equal(doneBody.command.status, "done");
+  assert.equal(doneBody.command.actual, 3600);
+
+  const emptyPending = await fetch(
+    `${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands?status=pending`,
+    { headers: { "x-api-key": API_KEY } },
+  );
+  assert.equal((await emptyPending.json()).commands.length, 0);
+});
+
+test("очередь записи отклоняет неизвестный параметр", async () => {
+  const uid = "write-queue-bms";
+  const response = await fetch(
+    `${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY },
+      body: JSON.stringify({ key: "not_a_real_param", value: 1 }),
+    },
+  );
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { ok: false, error: "unknown_param" });
+});
+
+test("очередь записи принимает остальные параметры шаблона", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+  const uid = "write-queue-bms";
+
+  const cellOv = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "cell_over_voltage", value: 3.65 }),
+  });
+  assert.equal(cellOv.status, 201);
+  const cellBody = await cellOv.json();
+  assert.equal(cellBody.command.register, "0x0131");
+  assert.equal(cellBody.command.raw_value, 3650);
+
+  const temp = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "charge_high_temp", value: 65 }),
+  });
+  assert.equal(temp.status, 201);
+  assert.equal((await temp.json()).command.raw_value, 105);
+
+  const pack = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "pack_over_voltage", value: 14.6 }),
+  });
+  assert.equal(pack.status, 201);
+  assert.equal((await pack.json()).command.raw_value, 146);
+});
+
+test("очередь записи не ставит DL-параметры для красной BMS", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+  const uid = "DL-write-skip-bms";
+  const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...createFullPayload(),
+      bms_uid: uid,
+      bluetooth_name: "DL-4119040183E6",
+      advertised_name: "DL-4119040183E6",
+    }),
+  });
+  assert.equal(telemetry.status, 201);
+
+  const response = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "balance_delta", value: 10 }),
+  });
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { ok: false, error: "skipped_for_dl_red" });
 });
 
 function createFullPayload() {

@@ -1,5 +1,8 @@
 const express = require("express");
+const fs = require("node:fs");
 const path = require("node:path");
+
+const WRITE_COMMAND_STALE_MS = 120000;
 
 const NUMERIC_FIELDS = [
   "voltage",
@@ -84,6 +87,18 @@ function createApp({ database, apiKey }) {
     response.json({ ok: true, batteries: database.listBatteries() });
   });
 
+  app.get("/api/v1/config-template", requireHeaderApiKey, (_request, response) => {
+    try {
+      return response.json({ ok: true, template: loadConfigTemplate() });
+    } catch (error) {
+      if (error && error.code === "TEMPLATE_NOT_FOUND") {
+        return response.status(404).json({ ok: false, error: "template_not_found" });
+      }
+      console.error(error);
+      return response.status(500).json({ ok: false, error: "template_read_error" });
+    }
+  });
+
   app.get(
     "/api/v1/batteries/:bmsUid/telemetry",
     requireHeaderApiKey,
@@ -127,6 +142,138 @@ function createApp({ database, apiKey }) {
       });
     },
   );
+
+  const requireAnyApiKey = (request, response, next) => {
+    const supplied = request.get("x-api-key") || request.body?.api_key || request.query.api_key;
+    if (supplied !== apiKey) {
+      return response.status(401).json({ ok: false, error: "unauthorized" });
+    }
+    return next();
+  };
+
+  app.get("/api/v1/batteries/:bmsUid/write-commands", requireAnyApiKey, (request, response) => {
+    const bmsUid = request.params.bmsUid;
+    if (!database.hasBattery(bmsUid)) {
+      return response.status(404).json({ ok: false, error: "battery_not_found" });
+    }
+    const limit = parseLimit(request.query.limit ?? "20");
+    if (limit == null) {
+      return response.status(400).json({ ok: false, error: "invalid_limit" });
+    }
+    const status = typeof request.query.status === "string" ? request.query.status : undefined;
+    return response.json({
+      ok: true,
+      bms_uid: bmsUid,
+      commands: database.listWriteCommands(bmsUid, {
+        status,
+        limit,
+        staleBefore: Date.now() - WRITE_COMMAND_STALE_MS,
+      }),
+    });
+  });
+
+  app.post("/api/v1/batteries/:bmsUid/write-commands", requireAnyApiKey, (request, response) => {
+    const bmsUid = request.params.bmsUid;
+    if (!database.hasBattery(bmsUid)) {
+      return response.status(404).json({ ok: false, error: "battery_not_found" });
+    }
+
+    const key = typeof request.body?.key === "string" ? request.body.key.trim() : "";
+    const value = request.body?.value;
+    if (!key) {
+      return response.status(400).json({ ok: false, error: "invalid_key" });
+    }
+    if (!isFiniteNumber(value)) {
+      return response.status(400).json({ ok: false, error: "invalid_value" });
+    }
+
+    let template;
+    try {
+      template = loadConfigTemplate();
+    } catch (error) {
+      if (error && error.code === "TEMPLATE_NOT_FOUND") {
+        return response.status(404).json({ ok: false, error: "template_not_found" });
+      }
+      console.error(error);
+      return response.status(500).json({ ok: false, error: "template_read_error" });
+    }
+
+    const param = (Array.isArray(template.parameters) ? template.parameters : []).find((item) => item.key === key);
+    if (!param || typeof param.register !== "string") {
+      return response.status(400).json({ ok: false, error: "unknown_param" });
+    }
+    if (param.enforcement === "info" || param.enforcement === "informational") {
+      return response.status(400).json({ ok: false, error: "not_writable" });
+    }
+
+    const skipFor = Array.isArray(param.skip_for) ? param.skip_for : [];
+    if (skipFor.includes("dl_red") && isRedDlBattery(database.getBattery(bmsUid))) {
+      return response.status(400).json({ ok: false, error: "skipped_for_dl_red" });
+    }
+
+    const scale = Number(param.scale);
+    const offset = Number(param.offset) || 0;
+    if (!Number.isFinite(scale) || scale === 0) {
+      return response.status(400).json({ ok: false, error: "invalid_scale" });
+    }
+
+    const rawValue = Math.round((value - offset) * scale);
+    if (!Number.isInteger(rawValue) || rawValue < 0 || rawValue > 0xffff) {
+      return response.status(400).json({ ok: false, error: "value_out_of_range" });
+    }
+
+    const commandId = database.enqueueWriteCommand({
+      bms_uid: bmsUid,
+      param_key: key,
+      label: param.label || key,
+      register: param.register,
+      unit: param.unit || null,
+      value,
+      raw_value: rawValue,
+      scale,
+      offset,
+    });
+
+    return response.status(201).json({
+      ok: true,
+      command: database.getWriteCommand(commandId),
+    });
+  });
+
+  app.post("/api/v1/batteries/:bmsUid/write-commands/:id/ack", requireAnyApiKey, (request, response) => {
+    const bmsUid = request.params.bmsUid;
+    const id = Number.parseInt(request.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      return response.status(400).json({ ok: false, error: "invalid_id" });
+    }
+
+    const current = database.getWriteCommand(id);
+    if (!current || current.bms_uid !== bmsUid) {
+      return response.status(404).json({ ok: false, error: "command_not_found" });
+    }
+
+    const status = request.body?.status;
+    if (status === "writing") {
+      database.claimWriteCommand(id);
+      return response.json({ ok: true, command: database.getWriteCommand(id) });
+    }
+    if (status !== "done" && status !== "failed") {
+      return response.status(400).json({ ok: false, error: "invalid_status" });
+    }
+
+    const actual = request.body?.actual;
+    if (actual != null && !isFiniteNumber(actual)) {
+      return response.status(400).json({ ok: false, error: "invalid_actual" });
+    }
+    const errorText = typeof request.body?.error === "string" ? request.body.error.slice(0, 300) : null;
+
+    const updated = database.updateWriteCommand(id, {
+      status,
+      actual: actual == null ? null : actual,
+      error: status === "failed" ? errorText : null,
+    });
+    return response.json({ ok: true, command: updated });
+  });
 
   app.use((_request, response) => {
     response.status(404).json({ ok: false, error: "not_found" });
@@ -273,6 +420,24 @@ function isNonNegativeInteger(value) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function loadConfigTemplate() {
+  const templatePath = path.resolve(__dirname, "..", "..", "config", "bms_config_template.json");
+  if (!fs.existsSync(templatePath)) {
+    const error = new Error("template_not_found");
+    error.code = "TEMPLATE_NOT_FOUND";
+    throw error;
+  }
+  return JSON.parse(fs.readFileSync(templatePath, "utf8"));
+}
+
+function isRedDlBattery(battery) {
+  if (!battery) return false;
+  if (battery.hardware_family === "dl_red") return true;
+  return [battery.advertised_name, battery.bluetooth_name, battery.bms_uid].some(
+    (value) => typeof value === "string" && /^\s*DL/i.test(value),
+  );
 }
 
 module.exports = { createApp };

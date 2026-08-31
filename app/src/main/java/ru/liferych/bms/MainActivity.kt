@@ -37,6 +37,7 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
@@ -60,6 +61,8 @@ private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_su
 private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
 private const val SERVER_WARRANTY_UPDATE_URL = "http://dimond44.xsph.ru/api/warranty_update.php"
 private const val SERVER_API_KEY = "change_me_api_key_2026"
+private const val APP_VERSION = "0.2.8-name-cycles"
+private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
 private const val CONFIG_UPLOAD_INTERVAL_MS = 300000L
 private const val CONFIG_PREFS_NAME = "bms_config_cache"
@@ -122,6 +125,18 @@ data class ConfigReadRequest(
     val slave: Int,
     val start: Int,
     val count: Int
+)
+
+data class RemoteWriteCommand(
+    val id: Int,
+    val key: String,
+    val label: String,
+    val register: Int,
+    val rawValue: Int,
+    val value: Double,
+    val scale: Double,
+    val offset: Double,
+    val unit: String
 )
 
 data class BmsConfigTemplate(
@@ -395,6 +410,17 @@ class MainActivity : ComponentActivity() {
     private var lastConfigUploadAt: Long = 0L
     private var configUploading: Boolean = false
     private var lastConfigStatus: String = "not_read"
+    private var remoteWriteInProgress: Boolean = false
+    private var remoteWriteAwaitingVerify: Boolean = false
+    private var pendingRemoteWrite: RemoteWriteCommand? = null
+    private var lastRemoteWritePollAt: Long = 0L
+    private val remoteWritePollRunnable = object : Runnable {
+        override fun run() {
+            if (bluetoothGatt == null || writeCharacteristic == null || !polling) return
+            fetchAndApplyRemoteWrites()
+            mainHandler.postDelayed(this, REMOTE_WRITE_POLL_MS)
+        }
+    }
     private var lastKnownSoc: Double? = null
     private var lastKnownChargeMosTextText: String? = null
     private var lastKnownDischargeMosTextText: String? = null
@@ -437,6 +463,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var balanceValue: TextView
     private lateinit var heatValue: TextView
     private lateinit var batteryInfoText: TextView
+    private lateinit var deviceNameValue: TextView
+    private lateinit var cycleCountValue: TextView
     private lateinit var t1Text: TextView
     private lateinit var t2Text: TextView
     private lateinit var cellsLayout: LinearLayout
@@ -1643,13 +1671,19 @@ class MainActivity : ComponentActivity() {
             icon: String,
             initial: String,
             label: String,
-            sub: String
+            sub: String,
+            valueSize: Float = 18f,
+            truncate: Boolean = false
         ): Pair<LinearLayout, TextView> {
             val value = TextView(this).apply {
                 text = initial
-                textSize = 18f
+                textSize = valueSize
                 setTextColor(Color.rgb(16, 17, 20))
                 typeface = interFont(760)
+                if (truncate) {
+                    maxLines = 2
+                    ellipsize = TextUtils.TruncateAt.END
+                }
             }
             val box = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -1690,14 +1724,16 @@ class MainActivity : ComponentActivity() {
         metricRow2.addView(modeMetric.first, marginLp(0, -2, 4, 0, 0, 0).apply { weight = 1f })
         content.addView(metricRow2, marginLp(-1, -2, 0, 8, 0, 0))
 
-        batteryInfoText = TextView(this).apply {
-            textSize = 13f
-            setTextColor(Color.rgb(16, 17, 20))
-            typeface = interFont(700)
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = round(Color.rgb(237, 250, 242), dp(14), Color.rgb(31, 179, 90), 1)
-        }
-        content.addView(batteryInfoText)
+        val metricRow3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val nameMetric = metricBox("⌁", selectedDeviceName.ifBlank { "--" }, "Имя устройства", "Bluetooth", 14f, true)
+        deviceNameValue = nameMetric.second
+        metricRow3.addView(nameMetric.first, marginLp(0, -2, 0, 0, 4, 0).apply { weight = 1.4f })
+        val cyclesMetric = metricBox("#", "--", "Циклы", "Заряд / разряд")
+        cycleCountValue = cyclesMetric.second
+        metricRow3.addView(cyclesMetric.first, marginLp(0, -2, 4, 0, 0, 0).apply { weight = 1f })
+        content.addView(metricRow3, marginLp(-1, -2, 0, 8, 0, 0))
+
+        batteryInfoText = TextView(this).apply { visibility = View.GONE }
 
         chargeMosValue = TextView(this)
         dischargeMosValue = TextView(this)
@@ -4671,6 +4707,7 @@ class MainActivity : ComponentActivity() {
     private fun disconnectGatt() {
         polling = false
         pollLoopToken++
+        resetRemoteWriteState()
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
@@ -4730,6 +4767,7 @@ class MainActivity : ComponentActivity() {
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 polling = false
                 pollLoopToken++
+                resetRemoteWriteState()
                 configAutoReadStartedForConnection = false
                 templateCheckShownForConnection = false
                 latestTemplateCheck = null
@@ -4830,11 +4868,12 @@ class MainActivity : ComponentActivity() {
                     // Так текущие данные 0x90-0x98 появляются сразу, а длинное чтение конфига
                     // не блокирует первые опросы BMS после подключения.
                     mainHandler.postDelayed({
-                        if (polling && !configReadInProgress) {
+                        if (polling && !configReadInProgress && !remoteWriteInProgress) {
                             startConfigReadIfNeeded(force = true)
                         }
                     }, CONFIG_AUTO_READ_DELAY_MS)
                 }
+                startRemoteWritePolling()
                 mainHandler.postDelayed({ pollOnce() }, 300)
             }
         }
@@ -4972,7 +5011,7 @@ class MainActivity : ComponentActivity() {
     private fun pollOnce(token: Int) {
         if (token != pollLoopToken) return
         if (!polling) return
-        if (configReadInProgress) {
+        if (configReadInProgress || remoteWriteInProgress) {
             mainHandler.postDelayed({ pollOnce(token) }, 1000)
             return
         }
@@ -4992,7 +5031,7 @@ class MainActivity : ComponentActivity() {
     ) {
         if (token != pollLoopToken) return
         if (!polling) return
-        if (configReadInProgress) {
+        if (configReadInProgress || remoteWriteInProgress) {
             mainHandler.postDelayed({ pollOnce(token) }, 1000)
             return
         }
@@ -5257,11 +5296,17 @@ class MainActivity : ComponentActivity() {
             }
         )
         val device = selectedDeviceName.ifBlank { selectedAddress ?: "не выбрано" }
-        val cycles = data.cycles?.let { " · Циклов: $it" }.orEmpty()
-        batteryInfoText.text = if (data.errors.isEmpty()) {
-            "✓  Нормальное состояние · Устройство: $device$cycles"
-        } else {
-            "!  Требуется внимание · Устройство: $device$cycles"
+        if (::deviceNameValue.isInitialized) deviceNameValue.text = device
+        if (::cycleCountValue.isInitialized) {
+            cycleCountValue.text = data.cycles?.toString() ?: "--"
+        }
+        if (::batteryInfoText.isInitialized) {
+            val cycles = data.cycles?.let { " · Циклов: $it" }.orEmpty()
+            batteryInfoText.text = if (data.errors.isEmpty()) {
+                "✓  Нормальное состояние · Устройство: $device$cycles"
+            } else {
+                "!  Требуется внимание · Устройство: $device$cycles"
+            }
         }
 
         renderCells()
@@ -5688,8 +5733,240 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun resetRemoteWriteState() {
+        remoteWriteInProgress = false
+        remoteWriteAwaitingVerify = false
+        pendingRemoteWrite = null
+        stopRemoteWritePolling()
+    }
+
+    private fun startRemoteWritePolling() {
+        mainHandler.removeCallbacks(remoteWritePollRunnable)
+        mainHandler.postDelayed(remoteWritePollRunnable, 1500)
+    }
+
+    private fun stopRemoteWritePolling() {
+        mainHandler.removeCallbacks(remoteWritePollRunnable)
+    }
+
+    private fun fetchAndApplyRemoteWrites(force: Boolean = false) {
+        if (remoteWriteInProgress || configReadInProgress) return
+        val uid = bmsUid()
+        if (bluetoothGatt == null || writeCharacteristic == null) return
+        if (uid.isBlank() || uid == "unknown_bms") return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastRemoteWritePollAt < 2500L) return
+        lastRemoteWritePollAt = now
+
+        thread {
+            val encoded = URLEncoder.encode(uid, "UTF-8")
+            val json = adminJsonRequest(
+                "GET",
+                "/api/v1/batteries/$encoded/write-commands?status=pending&limit=20"
+            )
+            val commands = json?.optJSONArray("commands") ?: JSONArray()
+            val parsed = if (commands.length() > 0) {
+                parseRemoteWriteCommand(commands.optJSONObject(0))
+            } else {
+                null
+            }
+            runOnUiThread {
+                if (parsed != null) startRemoteWrite(parsed)
+            }
+        }
+    }
+
+    private fun parseRemoteWriteCommand(obj: JSONObject?): RemoteWriteCommand? {
+        if (obj == null) return null
+        val id = obj.optInt("id", 0)
+        val key = obj.optString("key")
+        val registerText = obj.optString("register")
+        val rawValue = obj.optInt("raw_value", Int.MIN_VALUE)
+        val value = obj.optDouble("value", Double.NaN)
+        if (id <= 0 || key.isBlank() || registerText.isBlank() || rawValue == Int.MIN_VALUE || value.isNaN()) {
+            return null
+        }
+        val register = try {
+            registerText.removePrefix("0x").removePrefix("0X").toInt(16)
+        } catch (_: Exception) {
+            return null
+        }
+        return RemoteWriteCommand(
+            id = id,
+            key = key,
+            label = obj.optString("label").ifBlank { key },
+            register = register,
+            rawValue = rawValue,
+            value = value,
+            scale = obj.optDouble("scale", 1.0).takeIf { it != 0.0 } ?: 1.0,
+            offset = obj.optDouble("offset", 0.0),
+            unit = obj.optString("unit")
+        )
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startRemoteWrite(command: RemoteWriteCommand) {
+        if (remoteWriteInProgress || configReadInProgress) return
+        if (bluetoothGatt == null || writeCharacteristic == null) return
+        if (command.key in DL_RED_SKIPPED_TEMPLATE_KEYS && isRedDlBms()) {
+            ackRemoteWrite(command, "failed", null, "skipped_for_dl_red")
+            mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 250)
+            return
+        }
+
+        pendingRemoteWrite = command
+        remoteWriteInProgress = true
+        remoteWriteAwaitingVerify = false
+        pollLoopToken++
+        toast("Запись с сайта: ${command.label} = ${formatTemplateNumber(command.value)} ${command.unit}".trim())
+        ackRemoteWrite(command, "writing", null, null)
+
+        val timeFrame = buildDalyTimeFrame()
+        val writeFrame = buildModbusWriteSingleRequest(0x81, command.register, command.rawValue)
+        val openFrame = buildModbusWriteSingleRequest(0x81, 0x0174, 0x00A2)
+        configRaw["remote_write_key"] = command.key
+        configRaw["remote_write_raw"] = command.rawValue.toString()
+        configRaw["remote_write_frame"] = bytesToHex(writeFrame)
+
+        val timeOk = writeBleFrame(timeFrame)
+        configRaw["remote_write_time"] = if (timeOk) "ok" else "failed"
+        mainHandler.postDelayed({
+            val writeOk = writeBleFrame(writeFrame)
+            configRaw["remote_write_reg"] = if (writeOk) "ok" else "failed"
+            if (!writeOk) {
+                failRemoteWrite("ble_write_failed")
+                return@postDelayed
+            }
+            mainHandler.postDelayed({
+                writeBleFrame(openFrame)
+                mainHandler.postDelayed({
+                    remoteWriteAwaitingVerify = true
+                    startConfigReadIfNeeded(force = true)
+                    if (!configReadInProgress) {
+                        mainHandler.postDelayed({
+                            if (remoteWriteAwaitingVerify && !configReadInProgress) {
+                                failRemoteWrite("config_read_not_started")
+                            }
+                        }, 400)
+                    }
+                }, 900)
+            }, 250)
+        }, 140)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun writeBleFrame(frame: ByteArray): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        val ch = writeCharacteristic ?: return false
+        return try {
+            ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            ch.value = frame
+            gatt.writeCharacteristic(ch)
+        } catch (e: Exception) {
+            configRaw["remote_write_error"] = e.message ?: e.toString()
+            false
+        }
+    }
+
+    private fun finishRemoteWriteVerification() {
+        val command = pendingRemoteWrite
+        remoteWriteAwaitingVerify = false
+        if (command == null) {
+            remoteWriteInProgress = false
+            pollOnce()
+            return
+        }
+        val raw = configRegisters[command.register]
+        val actual = raw?.let { (it.toDouble() / command.scale) + command.offset }
+        val ok = raw != null && (
+            raw == command.rawValue ||
+                (actual != null && kotlin.math.abs(actual - command.value) <= 0.05)
+            )
+        configRaw["remote_write_verify"] = if (ok) {
+            "OK raw=$raw actual=$actual"
+        } else {
+            "NOT_CONFIRMED raw=${raw ?: "null"} actual=${actual ?: "null"} expected_raw=${command.rawValue}"
+        }
+        ackRemoteWrite(
+            command,
+            if (ok) "done" else "failed",
+            actual,
+            if (ok) null else "not_confirmed"
+        )
+        pendingRemoteWrite = null
+        remoteWriteInProgress = false
+        rememberCurrentBmsState()
+        refreshManageIfVisible()
+        toast(
+            if (ok) "${command.label}: ${formatTemplateNumber(actual)} ${command.unit}".trim()
+            else "Не подтверждено: ${command.label}"
+        )
+        uploadConfigSnapshot(force = true)
+        mainHandler.postDelayed({ pollOnce() }, 400)
+        mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 1200)
+    }
+
+    private fun failRemoteWrite(reason: String) {
+        val command = pendingRemoteWrite
+        remoteWriteAwaitingVerify = false
+        remoteWriteInProgress = false
+        pendingRemoteWrite = null
+        if (command != null) ackRemoteWrite(command, "failed", null, reason)
+        toast("Не удалось записать параметр: $reason")
+        mainHandler.postDelayed({ pollOnce() }, 400)
+        mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 800)
+    }
+
+    private fun ackRemoteWrite(command: RemoteWriteCommand, status: String, actual: Double?, error: String?) {
+        val uid = bmsUid()
+        thread {
+            val encoded = URLEncoder.encode(uid, "UTF-8")
+            val body = JSONObject().apply {
+                put("api_key", SERVER_API_KEY)
+                put("status", status)
+                if (actual != null && actual.isFinite()) put("actual", actual)
+                if (!error.isNullOrBlank()) put("error", error)
+            }
+            adminJsonRequest("POST", "/api/v1/batteries/$encoded/write-commands/${command.id}/ack", body)
+        }
+    }
+
+    private fun adminJsonRequest(method: String, path: String, body: JSONObject? = null): JSONObject? {
+        return try {
+            val conn = (URL(adminServerUrl(path)).openConnection() as HttpURLConnection).apply {
+                requestMethod = method
+                connectTimeout = 8000
+                readTimeout = 8000
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("x-api-key", SERVER_API_KEY)
+                if (body != null) {
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                }
+            }
+            if (body != null) {
+                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            }
+            val code = conn.responseCode
+            val text = try {
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                stream?.bufferedReader(Charsets.UTF_8)?.readText().orEmpty()
+            } catch (_: Exception) {
+                ""
+            }
+            conn.disconnect()
+            if (text.isBlank()) return null
+            JSONObject(text)
+        } catch (e: Exception) {
+            Log.w(BLE_LOG_TAG, "admin request $method $path failed: ${e.message}")
+            null
+        }
+    }
+
     private fun startConfigReadIfNeeded(force: Boolean) {
-        if (configReadInProgress || configUploading) return
+        if (configReadInProgress) return
+        if (configUploading && !remoteWriteAwaitingVerify) return
+        if (remoteWriteInProgress && !remoteWriteAwaitingVerify) return
         val now = System.currentTimeMillis()
         if (!force && now - lastConfigUploadAt < CONFIG_UPLOAD_INTERVAL_MS) return
 
@@ -5806,11 +6083,17 @@ class MainActivity : ComponentActivity() {
             rememberCurrentBmsState()
             refreshManageIfVisible()
 
+            if (remoteWriteAwaitingVerify) {
+                finishRemoteWriteVerification()
+                return
+            }
+
             mainHandler.postDelayed({
                 rememberCurrentBmsState()
                 showTemplateCheckDialogIfNeeded()
                 uploadConfigSnapshot(force = true)
                 scheduleExactSocWriteTest()
+                fetchAndApplyRemoteWrites()
             }, 1200)
 
             mainHandler.postDelayed({ pollOnce() }, 800)
@@ -6129,7 +6412,7 @@ class MainActivity : ComponentActivity() {
         obj.put("bluetooth_name", selectedDeviceName)
         obj.put("bluetooth_address", selectedAddress ?: "")
         putHardwareIdentity(obj)
-        obj.put("app_version", "0.2.4-owner-profile")
+        obj.put("app_version", APP_VERSION)
         obj.put("read_status", lastConfigStatus)
         obj.put("template_check", templateCheckUploadJson())
 

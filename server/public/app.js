@@ -5,7 +5,7 @@
   const API_KEY_STORAGE = "liferych:bms:api-key";
   const THEME_STORAGE = "liferych:bms:theme";
   const TAB_STORAGE = "liferych:bms:tab";
-  const DASH_TABS = ["overview", "owner", "balancing", "dynamics", "journal", "archive"];
+  const DASH_TABS = ["overview", "owner", "balancing", "dynamics", "journal", "archive", "write"];
   const REFRESH_INTERVAL_MS = 15000;
   const ONLINE_AFTER_MS = 45000;
   const DL_RED_SKIPPED_KEYS = new Set([
@@ -16,7 +16,6 @@
     "balance_delta",
   ]);
   const RED_DL_LABEL = "Красная BMS DL-серия (старая)";
-  const HISTORY_LIMIT = 100;
 
   const state = {
     apiKey: localStorage.getItem(API_KEY_STORAGE) || "",
@@ -28,6 +27,13 @@
     refreshTimer: 0,
     abortController: null,
     requestId: 0,
+    configTemplate: null,
+    templatePromise: null,
+    writeDrafts: {},
+    writeSourceName: "",
+    writeRenderedUid: "",
+    writeCommands: [],
+    writeBusyKey: "",
   };
 
   const dom = {
@@ -74,6 +80,14 @@
     eventList: document.getElementById("eventList"),
     historyCount: document.getElementById("historyCount"),
     historyBody: document.getElementById("historyBody"),
+    writeTemplateMeta: document.getElementById("writeTemplateMeta"),
+    writeFileInput: document.getElementById("writeFileInput"),
+    writeLoadTemplate: document.getElementById("writeLoadTemplate"),
+    writeFillTemplate: document.getElementById("writeFillTemplate"),
+    writeQueueAll: document.getElementById("writeQueueAll"),
+    writeDownloadPlan: document.getElementById("writeDownloadPlan"),
+    writeFileName: document.getElementById("writeFileName"),
+    writeBody: document.getElementById("writeBody"),
     toast: document.getElementById("toast"),
     keyDialog: document.getElementById("keyDialog"),
     keyForm: document.getElementById("keyForm"),
@@ -100,6 +114,21 @@
       renderBatteryList();
     });
     dom.keyForm.addEventListener("submit", handleKeySubmit);
+    if (dom.writeLoadTemplate) {
+      dom.writeLoadTemplate.addEventListener("click", () => loadConfigTemplate({ force: true, fill: false }));
+    }
+    if (dom.writeFillTemplate) {
+      dom.writeFillTemplate.addEventListener("click", fillWriteValuesFromTemplate);
+    }
+    if (dom.writeQueueAll) {
+      dom.writeQueueAll.addEventListener("click", queueAllRemoteWrites);
+    }
+    if (dom.writeDownloadPlan) {
+      dom.writeDownloadPlan.addEventListener("click", downloadWritePlan);
+    }
+    if (dom.writeFileInput) {
+      dom.writeFileInput.addEventListener("change", handleWriteFileUpload);
+    }
     window.addEventListener("resize", debounce(() => drawHistoryChart(), 120));
 
     if (!state.apiKey) {
@@ -147,12 +176,28 @@
       renderBatteryList();
 
       if (state.selectedUid) {
-        const historyPath = `/api/v1/batteries/${encodeURIComponent(state.selectedUid)}/telemetry?limit=${HISTORY_LIMIT}`;
-        const historyBody = await apiGet(historyPath, state.abortController.signal);
-        if (requestId !== state.requestId) return;
-        state.history = Array.isArray(historyBody.telemetry) ? historyBody.telemetry : [];
+        try {
+          const historyPath = `/api/v1/batteries/${encodeURIComponent(state.selectedUid)}/telemetry?limit=${HISTORY_LIMIT}`;
+          const historyBody = await apiGet(historyPath, state.abortController.signal);
+          if (requestId !== state.requestId) return;
+          state.history = Array.isArray(historyBody.telemetry) ? historyBody.telemetry : [];
+        } catch (error) {
+          if (error && error.status === 401) throw error;
+          if (error && error.name === "AbortError" && requestId !== state.requestId) return;
+        }
+        try {
+          const writesPath = `/api/v1/batteries/${encodeURIComponent(state.selectedUid)}/write-commands?limit=20`;
+          const writesBody = await apiGet(writesPath, state.abortController.signal);
+          if (requestId !== state.requestId) return;
+          state.writeCommands = Array.isArray(writesBody.commands) ? writesBody.commands : [];
+        } catch (error) {
+          if (error && error.status === 401) throw error;
+          if (error && error.name === "AbortError" && requestId !== state.requestId) return;
+          if (!(error && error.name === "AbortError")) state.writeCommands = [];
+        }
       } else {
         state.history = [];
+        state.writeCommands = [];
       }
 
       renderDashboard();
@@ -169,7 +214,9 @@
         return;
       }
       setServerState("error", "Ошибка связи");
-      renderListMessage("Не удалось загрузить данные. Проверьте сервер и попробуйте снова.");
+      if (state.batteries.length === 0) {
+        renderListMessage("Не удалось загрузить данные. Проверьте сервер и попробуйте снова.");
+      }
       showToast("Не удалось загрузить данные");
     } finally {
       if (requestId === state.requestId) setLoading(false);
@@ -193,6 +240,30 @@
       throw error;
     }
     return response.json();
+  }
+
+  async function apiSend(method, path, body) {
+    const response = await fetch(path, {
+      method,
+      headers: {
+        "x-api-key": state.apiKey,
+        "content-type": "application/json",
+      },
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+    if (response.status === 401) {
+      const error = new Error("unauthorized");
+      error.status = 401;
+      throw error;
+    }
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(payload.error || `request failed: ${response.status}`);
+      error.status = response.status;
+      error.payload = payload;
+      throw error;
+    }
+    return payload;
   }
 
   function reconcileSelection() {
@@ -280,7 +351,7 @@
       return;
     }
 
-    const latest = state.history[0] || battery;
+    const latest = { ...battery, ...(state.history[0] || {}) };
     dom.emptyState.classList.add("hidden");
     dom.dashboard.classList.remove("hidden");
 
@@ -305,6 +376,7 @@
     renderTemperatures(latest);
     renderFeeds(latest);
     renderHistoryTable();
+    renderWritePanel(battery);
     drawHistoryChart();
   }
 
@@ -562,6 +634,493 @@
       if (errors > 0) errorCell.title = item.errors.join(", ");
       dom.historyBody.append(row);
     }
+  }
+
+  const WRITE_SNAPSHOT_ALIASES = {
+    sleep_timeout: ["sleep_time_s_num", "sleep_time_s"],
+    soc_calibration_0: ["soc_calibration_0_num", "soc_calibration_0_v"],
+    soc_calibration_100: ["soc_calibration_100_num", "soc_calibration_100_v"],
+  };
+
+  function renderWritePanel(battery) {
+    if (!dom.writeBody) return;
+    captureWriteDrafts();
+    state.writeRenderedUid = battery && battery.bms_uid ? battery.bms_uid : "";
+    updateWriteTemplateMeta(battery);
+    updateWriteFileName();
+    clear(dom.writeBody);
+
+    if (!state.configTemplate) {
+      writeEmptyRow("Загрузите шаблон Liferych или JSON-файл конфига.");
+      loadConfigTemplate({ force: false });
+      return;
+    }
+
+    const params = templateParameters();
+    if (params.length === 0) {
+      writeEmptyRow("В шаблоне нет параметров для записи.");
+      return;
+    }
+
+    const skipDl = isRedDlSeries(battery);
+    const series = detectSeries(battery);
+    const bucket = writeDraftBucket(state.writeRenderedUid);
+
+    for (const param of params) {
+      const skipped = shouldSkipWriteParam(param, skipDl);
+      const row = el("tr", skipped ? "write-row skipped" : "write-row");
+      const nameCell = document.createElement("td");
+      appendText(nameCell, "div", "write-param-label", param.label || param.key);
+      appendText(nameCell, "div", "write-param-key", param.key);
+      row.append(nameCell);
+      appendText(row, "td", "mono", param.register || "—");
+      appendText(row, "td", "", formatExpectedDisplay(param, series));
+
+      const valueCell = document.createElement("td");
+      if (skipped) {
+        appendText(valueCell, "span", "write-skipped", "не записывается на DL");
+      } else {
+        const input = document.createElement("input");
+        input.type = "text";
+        input.inputMode = "decimal";
+        input.autocomplete = "off";
+        input.spellcheck = false;
+        input.setAttribute("data-write-key", param.key);
+        input.placeholder = param.unit ? String(param.unit) : "";
+        input.value = bucket[param.key] == null ? "" : String(bucket[param.key]);
+        input.addEventListener("input", () => {
+          writeDraftBucket(state.selectedUid)[param.key] = input.value;
+        });
+        valueCell.append(input);
+      }
+      row.append(valueCell);
+
+      const actionCell = document.createElement("td");
+      if (!skipped) {
+        const wrap = el("div", "write-action");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "write-action-button";
+        const command = latestWriteCommand(param.key);
+        const busy = command && (command.status === "pending" || command.status === "writing");
+        button.textContent = busy ? "В очереди" : "Записать";
+        button.disabled = Boolean(busy) || state.writeBusyKey === param.key || state.writeBusyKey === "*";
+        button.addEventListener("click", () => queueRemoteWrite(param));
+        wrap.append(button);
+        if (command) {
+          appendText(wrap, "span", `write-action-status ${command.status}`, formatWriteCommandStatus(command));
+        }
+        actionCell.append(wrap);
+      } else {
+        actionCell.textContent = skipped ? "—" : "";
+      }
+      row.append(actionCell);
+      dom.writeBody.append(row);
+    }
+  }
+
+  function writeEmptyRow(text) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 5;
+    cell.textContent = text;
+    row.append(cell);
+    dom.writeBody.append(row);
+  }
+
+  function captureWriteDrafts() {
+    if (!dom.writeBody) return;
+    const bucket = writeDraftBucket(state.writeRenderedUid);
+    for (const input of dom.writeBody.querySelectorAll("input[data-write-key]")) {
+      bucket[input.getAttribute("data-write-key")] = input.value;
+    }
+  }
+
+  function writeDraftBucket(uid) {
+    const key = uid || "_none";
+    if (!state.writeDrafts[key]) state.writeDrafts[key] = {};
+    return state.writeDrafts[key];
+  }
+
+  function latestWriteCommand(paramKey) {
+    return (state.writeCommands || []).find((item) => item.key === paramKey && item.status !== "superseded") || null;
+  }
+
+  function formatWriteCommandStatus(command) {
+    if (!command) return "";
+    if (command.status === "pending") return "ожидает приложение";
+    if (command.status === "writing") return "записывается…";
+    if (command.status === "done") {
+      return command.actual == null ? "записано" : `записано: ${formatWriteDraft(command.actual)}`;
+    }
+    if (command.status === "failed") return command.error ? `ошибка: ${command.error}` : "ошибка записи";
+    return command.status;
+  }
+
+  async function queueRemoteWrite(param, options) {
+    const silent = Boolean(options && options.silent);
+    const battery = getSelectedBattery();
+    if (!battery || !battery.bms_uid) {
+      if (!silent) showToast("Сначала выберите аккумулятор");
+      return false;
+    }
+    captureWriteDrafts();
+    const raw = writeDraftBucket(battery.bms_uid)[param.key];
+    const value = parseWriteNumber(raw);
+    if (value == null) {
+      if (!silent) showToast("Введите значение для записи");
+      return false;
+    }
+    if (!silent) {
+      state.writeBusyKey = param.key;
+      renderWritePanel(battery);
+    }
+    try {
+      const body = await apiSend(
+        "POST",
+        `/api/v1/batteries/${encodeURIComponent(battery.bms_uid)}/write-commands`,
+        { key: param.key, value },
+      );
+      if (body.command) {
+        state.writeCommands = [body.command, ...(state.writeCommands || []).filter((item) => item.id !== body.command.id)];
+      }
+      if (!silent) showToast("Задание в очереди. Подключите BMS в приложении.");
+      return true;
+    } catch (error) {
+      if (error && error.status === 401) {
+        state.apiKey = "";
+        localStorage.removeItem(API_KEY_STORAGE);
+        openKeyDialog(true);
+        return false;
+      }
+      if (!silent) {
+        showToast(error && error.message ? `Не удалось поставить в очередь: ${error.message}` : "Не удалось поставить в очередь");
+      }
+      return false;
+    } finally {
+      if (!silent) {
+        state.writeBusyKey = "";
+        renderWritePanel(getSelectedBattery());
+      }
+    }
+  }
+
+  async function queueAllRemoteWrites() {
+    const battery = getSelectedBattery();
+    if (!battery || !battery.bms_uid) {
+      showToast("Сначала выберите аккумулятор");
+      return;
+    }
+    captureWriteDrafts();
+    const skipDl = isRedDlSeries(battery);
+    const params = templateParameters().filter((param) => !shouldSkipWriteParam(param, skipDl));
+    const filled = params.filter((param) => parseWriteNumber(writeDraftBucket(battery.bms_uid)[param.key]) != null);
+    if (filled.length === 0) {
+      showToast("Нет заполненных значений для записи");
+      return;
+    }
+    state.writeBusyKey = "*";
+    renderWritePanel(battery);
+    let queued = 0;
+    let failed = 0;
+    try {
+      for (const param of filled) {
+        const ok = await queueRemoteWrite(param, { silent: true });
+        if (ok) queued += 1;
+        else failed += 1;
+      }
+    } finally {
+      state.writeBusyKey = "";
+      renderWritePanel(getSelectedBattery());
+    }
+    if (queued && !failed) {
+      showToast(`В очереди ${queued} параметров. Подключите BMS в приложении.`);
+    } else if (queued) {
+      showToast(`В очереди ${queued}, не удалось ${failed}`);
+    } else {
+      showToast("Не удалось поставить параметры в очередь");
+    }
+  }
+
+  function templateParameters() {
+    const template = state.configTemplate;
+    return template && Array.isArray(template.parameters) ? template.parameters.filter((item) => item && item.key) : [];
+  }
+
+  function shouldSkipWriteParam(param, skipDl) {
+    const enforcement = param && param.enforcement;
+    if (enforcement === "info" || enforcement === "informational") return true;
+    const skipFor = Array.isArray(param && param.skip_for) ? param.skip_for : [];
+    return Boolean(skipDl && skipFor.includes("dl_red"));
+  }
+
+  function detectSeries(battery) {
+    const check = battery && battery.config_check;
+    const fromCheck = check ? numberOrNull(check.series_count) : null;
+    if (fromCheck != null) return fromCheck;
+    const latest = state.history[0] || battery;
+    const count = sortedEntries(latest && latest.cells).length;
+    return count > 0 ? count : null;
+  }
+
+  function expectedFromParam(param, series) {
+    const bySeries = param && param.expected_by_series;
+    if (bySeries && typeof bySeries === "object" && series != null) {
+      const keyed = bySeries[String(series)];
+      if (keyed != null) return keyed;
+    }
+    return param ? param.expected : undefined;
+  }
+
+  function formatExpectedDisplay(param, series) {
+    const expected = expectedFromParam(param, series);
+    if (expected != null) return formatConfigValue(expected, param.unit);
+    if (param.expected_by_series && typeof param.expected_by_series === "object") {
+      return Object.entries(param.expected_by_series)
+        .map(([count, value]) => `${formatConfigValue(value, param.unit)} (${count}S)`)
+        .join(" / ");
+    }
+    return formatConfigValue(param.expected, param.unit);
+  }
+
+  function updateWriteTemplateMeta(battery) {
+    if (!dom.writeTemplateMeta) return;
+    const template = state.configTemplate;
+    if (!template) {
+      dom.writeTemplateMeta.textContent = "Шаблон не загружен";
+      return;
+    }
+    const series = detectSeries(battery);
+    const parts = [
+      template.version != null ? `Шаблон v${template.version}` : "Шаблон",
+      series != null ? `${series}S` : null,
+      isRedDlSeries(battery) ? "DL-серия" : null,
+    ].filter(Boolean);
+    dom.writeTemplateMeta.textContent = parts.join(" · ");
+  }
+
+  function updateWriteFileName() {
+    if (!dom.writeFileName) return;
+    dom.writeFileName.textContent = state.writeSourceName ? `Источник: ${state.writeSourceName}` : "";
+  }
+
+  function loadConfigTemplate(options) {
+    const force = Boolean(options && options.force);
+    if (state.configTemplate && !force) {
+      if (options && options.fill) fillWriteValuesFromTemplate();
+      return Promise.resolve(state.configTemplate);
+    }
+    if (state.templatePromise && !force) return state.templatePromise;
+
+    const request = (async () => {
+      try {
+        const body = await apiGet("/api/v1/config-template");
+        if (!body || !body.template || typeof body.template !== "object") {
+          throw new Error("empty template");
+        }
+        state.configTemplate = body.template;
+        const version = body.template.version != null ? ` v${body.template.version}` : "";
+        state.writeSourceName = `Шаблон Liferych${version}`;
+        updateWriteFileName();
+        if (options && options.fill) fillWriteValuesFromTemplate();
+        else renderWritePanel(getSelectedBattery());
+        if (force) showToast("Шаблон загружен");
+        return state.configTemplate;
+      } catch (error) {
+        if (error && error.name === "AbortError") return null;
+        showToast("Не удалось загрузить шаблон");
+        if (dom.writeTemplateMeta) dom.writeTemplateMeta.textContent = "Ошибка загрузки шаблона";
+        return null;
+      } finally {
+        if (state.templatePromise === request) state.templatePromise = null;
+      }
+    })();
+
+    state.templatePromise = request;
+    return request;
+  }
+
+  function fillWriteValuesFromTemplate() {
+    const params = templateParameters();
+    if (params.length === 0) {
+      showToast("Сначала загрузите шаблон");
+      return;
+    }
+    const battery = getSelectedBattery();
+    const skipDl = isRedDlSeries(battery);
+    const series = detectSeries(battery);
+    const bucket = writeDraftBucket(battery && battery.bms_uid);
+    let filled = 0;
+    let skippedSeries = 0;
+    for (const param of params) {
+      if (shouldSkipWriteParam(param, skipDl)) continue;
+      const expected = expectedFromParam(param, series);
+      if (expected == null) {
+        if (param.expected_by_series) skippedSeries += 1;
+        continue;
+      }
+      bucket[param.key] = formatWriteDraft(expected);
+      filled += 1;
+    }
+    renderWritePanel(battery);
+    if (filled === 0) {
+      showToast(skippedSeries ? "Нет серии АКБ, pack-пороги не подставлены" : "В шаблоне нет значений");
+      return;
+    }
+    showToast(skippedSeries ? `Подставлено ${filled}, серия АКБ не определена` : "Значения подставлены из шаблона");
+  }
+
+  async function handleWriteFileUpload(event) {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = "";
+    if (!file) return;
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch {
+      showToast("Не удалось разобрать JSON");
+      return;
+    }
+    await applyUploadedConfig(parsed, file.name);
+  }
+
+  async function applyUploadedConfig(parsed, fileName) {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      showToast("Файл не похож на конфиг");
+      return;
+    }
+
+    const templateCandidate = parsed.template && typeof parsed.template === "object" ? parsed.template : parsed;
+    const hasParams = Array.isArray(templateCandidate.parameters);
+    if (hasParams) {
+      state.configTemplate = templateCandidate;
+    } else if (!state.configTemplate) {
+      await loadConfigTemplate({ force: false });
+    }
+
+    const params = templateParameters();
+    if (params.length === 0) {
+      showToast("В файле нет параметров шаблона");
+      return;
+    }
+
+    const snapshotRoot = parsed.config && typeof parsed.config === "object" ? parsed.config : parsed;
+    const flat = flattenSnapshotValues(snapshotRoot);
+    const looksLikeSnapshot = Boolean(parsed.config) || Object.keys(flat).some((key) => /_num$|_v$|_c$|_a$/.test(key) || key === "sleep_time_s");
+    const battery = getSelectedBattery();
+    const skipDl = isRedDlSeries(battery);
+    const series = detectSeries(battery);
+    const bucket = writeDraftBucket(battery && battery.bms_uid);
+    let filled = 0;
+
+    if (looksLikeSnapshot) {
+      for (const param of params) {
+        if (shouldSkipWriteParam(param, skipDl)) continue;
+        const value = snapshotValueForKey(flat, param.key);
+        if (value == null) continue;
+        bucket[param.key] = formatWriteDraft(value);
+        filled += 1;
+      }
+    } else if (hasParams) {
+      for (const param of params) {
+        if (shouldSkipWriteParam(param, skipDl)) continue;
+        const expected = expectedFromParam(param, series);
+        if (expected == null) continue;
+        bucket[param.key] = formatWriteDraft(expected);
+        filled += 1;
+      }
+    }
+
+    state.writeSourceName = fileName;
+    updateWriteFileName();
+    renderWritePanel(battery);
+    showToast(filled ? `Загружено: ${fileName}` : `Файл принят, совпадений нет`);
+  }
+
+  function flattenSnapshotValues(root) {
+    const map = {};
+    function walk(node) {
+      if (!node || typeof node !== "object") return;
+      if (Array.isArray(node)) {
+        node.forEach(walk);
+        return;
+      }
+      for (const [key, value] of Object.entries(node)) {
+        if (value && typeof value === "object") walk(value);
+        else map[key] = value;
+      }
+    }
+    walk(root);
+    return map;
+  }
+
+  function snapshotValueForKey(flat, key) {
+    const aliases = [key, `${key}_num`, ...(WRITE_SNAPSHOT_ALIASES[key] || [])];
+    for (const alias of aliases) {
+      if (!(alias in flat)) continue;
+      const parsed = parseWriteNumber(flat[alias]);
+      if (parsed != null) return parsed;
+    }
+    return null;
+  }
+
+  function parseWriteNumber(value) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value !== "string") return null;
+    const match = value.replace(",", ".").match(/-?\d+(?:\.\d+)?/);
+    if (!match) return null;
+    const number = Number(match[0]);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function formatWriteDraft(value) {
+    const number = typeof value === "number" ? value : parseWriteNumber(value);
+    return number == null ? "" : String(number);
+  }
+
+  function downloadWritePlan() {
+    captureWriteDrafts();
+    const battery = getSelectedBattery();
+    const params = templateParameters();
+    if (params.length === 0) {
+      showToast("Нет параметров для задания");
+      return;
+    }
+    const skipDl = isRedDlSeries(battery);
+    const series = detectSeries(battery);
+    const bucket = writeDraftBucket(battery && battery.bms_uid);
+    const payload = {
+      kind: "liferych-write-plan",
+      created_at: new Date().toISOString(),
+      bms_uid: battery ? battery.bms_uid : "",
+      bluetooth_name: battery ? battery.bluetooth_name || battery.advertised_name || "" : "",
+      series_count: series,
+      template_id: state.configTemplate && state.configTemplate.id,
+      template_version: state.configTemplate && state.configTemplate.version,
+      source: state.writeSourceName || "template",
+      parameters: params.map((param) => {
+        const skipped = shouldSkipWriteParam(param, skipDl);
+        return {
+          key: param.key,
+          label: param.label,
+          register: param.register,
+          unit: param.unit,
+          expected: expectedFromParam(param, series) ?? null,
+          value: skipped ? null : parseWriteNumber(bucket[param.key]),
+          skipped,
+        };
+      }),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const slug = ((battery && battery.bms_uid) || "bms").replace(/[^\w.-]+/g, "_");
+    link.href = url;
+    link.download = `write-plan-${slug}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   }
 
   function drawHistoryChart() {
