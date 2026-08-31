@@ -52,6 +52,27 @@ function createApp({ database, apiKey }) {
   app.post("/api/v1/telemetry", receiveTelemetry);
   app.post("/api/upload.php", receiveTelemetry);
 
+  const receiveConfigCheck = (request, response) => {
+    const suppliedKey = request.get("x-api-key") || request.body?.api_key;
+    if (suppliedKey !== apiKey) {
+      return response.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const validationError = validateConfigCheck(request.body);
+    if (validationError) {
+      return response.status(400).json({ ok: false, error: validationError });
+    }
+
+    const payload = { ...request.body };
+    delete payload.api_key;
+
+    const checkId = database.insertConfigCheck(payload);
+    return response.status(201).json({ ok: true, check_id: checkId });
+  };
+
+  app.post("/api/v1/config-check", receiveConfigCheck);
+  app.post("/api/config_upload.php", receiveConfigCheck);
+
   const requireHeaderApiKey = (request, response, next) => {
     if (request.get("x-api-key") !== apiKey) {
       return response.status(401).json({ ok: false, error: "unauthorized" });
@@ -81,6 +102,28 @@ function createApp({ database, apiKey }) {
         ok: true,
         bms_uid: bmsUid,
         telemetry: database.listTelemetry(bmsUid, limit),
+      });
+    },
+  );
+
+  app.get(
+    "/api/v1/batteries/:bmsUid/config-checks",
+    requireHeaderApiKey,
+    (request, response) => {
+      const bmsUid = request.params.bmsUid;
+      if (!database.hasBattery(bmsUid)) {
+        return response.status(404).json({ ok: false, error: "battery_not_found" });
+      }
+
+      const limit = parseLimit(request.query.limit);
+      if (limit == null) {
+        return response.status(400).json({ ok: false, error: "invalid_limit" });
+      }
+
+      return response.json({
+        ok: true,
+        bms_uid: bmsUid,
+        config_checks: database.listConfigChecks(bmsUid, limit),
       });
     },
   );
@@ -138,6 +181,59 @@ function validateTelemetry(payload) {
   return null;
 }
 
+function validateConfigCheck(payload) {
+  if (!isPlainObject(payload)) return "payload_must_be_object";
+  if (typeof payload.bms_uid !== "string" || payload.bms_uid.trim().length === 0) {
+    return "invalid_bms_uid";
+  }
+  if (payload.bluetooth_name != null && typeof payload.bluetooth_name !== "string") {
+    return "invalid_bluetooth_name";
+  }
+  if (payload.bluetooth_address != null && typeof payload.bluetooth_address !== "string") {
+    return "invalid_bluetooth_address";
+  }
+  if (payload.config != null && !isPlainObject(payload.config)) return "invalid_config";
+  if (payload.raw != null && !isPlainObject(payload.raw)) return "invalid_raw";
+
+  const check = payload.template_check;
+  if (!isPlainObject(check)) return "invalid_template_check";
+  if (typeof check.template_id !== "string" || check.template_id.trim().length === 0) {
+    return "invalid_template_id";
+  }
+  if (!isNonNegativeInteger(check.template_version)) return "invalid_template_version";
+  if (!["ok", "mismatch", "incomplete"].includes(check.status)) return "invalid_status";
+  if (!isNonNegativeInteger(check.checked_at)) return "invalid_checked_at";
+  if (check.series_count !== null && !isNonNegativeInteger(check.series_count)) {
+    return "invalid_series_count";
+  }
+  if (!isNonNegativeInteger(check.mismatch_count)) return "invalid_mismatch_count";
+  if (!isNonNegativeInteger(check.missing_count)) return "invalid_missing_count";
+
+  for (const field of ["mismatches", "missing", "unverified"]) {
+    if (!Array.isArray(check[field])) return `invalid_${field}`;
+    for (const item of check[field]) {
+      if (!isConfigCheckItem(item)) return `invalid_${field}`;
+      if (field !== "mismatches" && typeof item.reason !== "string") {
+        return `invalid_${field}`;
+      }
+      if (item.unit != null && typeof item.unit !== "string") return `invalid_${field}`;
+      if (item.tolerance != null && !isFiniteNumber(item.tolerance)) {
+        return `invalid_${field}`;
+      }
+    }
+  }
+
+  return null;
+}
+
+function isConfigCheckItem(item) {
+  return isPlainObject(item)
+    && typeof item.key === "string"
+    && item.key.trim().length > 0
+    && typeof item.label === "string"
+    && item.label.trim().length > 0;
+}
+
 function parseLimit(value) {
   if (value === undefined) return 100;
   if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
@@ -147,6 +243,10 @@ function parseLimit(value) {
 
 function isFiniteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function isNonNegativeInteger(value) {
+  return Number.isSafeInteger(value) && value >= 0;
 }
 
 function isPlainObject(value) {

@@ -35,6 +35,10 @@
     batteryUid: document.getElementById("batteryUid"),
     batteryAddress: document.getElementById("batteryAddress"),
     lastSeen: document.getElementById("lastSeen"),
+    configCheck: document.getElementById("configCheck"),
+    configCheckStatus: document.getElementById("configCheckStatus"),
+    configCheckMeta: document.getElementById("configCheckMeta"),
+    configCheckDetails: document.getElementById("configCheckDetails"),
     socGauge: document.getElementById("socGauge"),
     socValue: document.getElementById("socValue"),
     remainingValue: document.getElementById("remainingValue"),
@@ -204,6 +208,8 @@
       const main = el("span", "battery-main");
       appendText(main, "span", "battery-name", displayName(battery));
       appendText(main, "span", "battery-uid", battery.bms_uid || "Без UID");
+      const configBadge = appendText(main, "span", "config-badge", configBadgeText(battery.config_check));
+      configBadge.classList.add(configStatusClass(battery.config_check));
 
       const side = el("span", "battery-side");
       appendText(side, "span", "battery-soc", formatPercent(battery.soc));
@@ -245,6 +251,7 @@
     dom.batteryAddress.textContent = battery.bluetooth_address || "адрес не указан";
     dom.lastSeen.textContent = `Последняя связь: ${formatDateTime(battery.last_seen_at)}`;
     setOnlinePill(battery);
+    renderConfigCheck(battery.config_check);
 
     const soc = numberOrNull(latest.soc);
     dom.socGauge.style.setProperty("--soc", String(clamp(soc || 0, 0, 100)));
@@ -259,6 +266,71 @@
     renderFeeds(latest);
     renderHistoryTable();
     drawHistoryChart();
+  }
+
+  function renderConfigCheck(check) {
+    clear(dom.configCheckMeta);
+    clear(dom.configCheckDetails);
+    dom.configCheck.classList.remove("ok", "mismatch", "incomplete", "unchecked");
+    const statusClass = configStatusClass(check);
+    dom.configCheck.classList.add(statusClass);
+    dom.configCheckStatus.className = `config-check-status ${statusClass}`;
+    dom.configCheckStatus.textContent = configBadgeText(check);
+
+    if (!check) {
+      appendText(dom.configCheckMeta, "span", "", "Результат проверки ещё не загружен.");
+      appendText(dom.configCheckDetails, "div", "config-empty", "Запустите проверку конфигурации в Android-приложении.");
+      return;
+    }
+
+    appendText(dom.configCheckMeta, "span", "", `Проверено: ${formatDateTime(check.checked_at)}`);
+    appendText(dom.configCheckMeta, "span", "", `Шаблон: ${check.template_id || "—"} v${check.template_version ?? "—"}`);
+    appendText(dom.configCheckMeta, "span", "", check.series_count == null ? "Серия: —" : `${check.series_count}S`);
+
+    const mismatches = Array.isArray(check.mismatches) ? check.mismatches : [];
+    const missing = Array.isArray(check.missing) ? check.missing : [];
+
+    renderConfigGroup(
+      "Отклонения",
+      mismatches,
+      "mismatch",
+      (item) => `Ожидалось: ${formatConfigValue(item.expected, item.unit)} · Фактически: ${formatConfigValue(item.actual, item.unit)}`,
+    );
+    renderConfigGroup(
+      "Нет данных",
+      missing,
+      "missing",
+      (item) => `Ожидалось: ${formatConfigValue(item.expected, item.unit)} · Нет данных${item.reason ? ` · ${item.reason}` : ""}`,
+    );
+
+    if (mismatches.length + missing.length === 0) {
+      appendText(dom.configCheckDetails, "div", "config-empty", "Отклонений не обнаружено.");
+    }
+  }
+
+  function renderConfigGroup(title, items, kind, describe) {
+    if (items.length === 0) return;
+    const group = el("section", `config-group ${kind}`);
+    appendText(group, "h4", "", `${title} · ${items.length}`);
+    for (const item of items) {
+      const row = el("div", "config-item");
+      appendText(row, "strong", "", item.label || item.key || "Параметр");
+      appendText(row, "span", "", describe(item));
+      group.append(row);
+    }
+    dom.configCheckDetails.append(group);
+  }
+
+  function configBadgeText(check) {
+    if (!check) return "Не проверялась";
+    if (check.status === "ok") return "Конфигурация OK";
+    if (check.status === "mismatch") return `${check.mismatch_count || 0} отклонений`;
+    return "Проверка неполная";
+  }
+
+  function configStatusClass(check) {
+    if (!check) return "unchecked";
+    return ["ok", "mismatch", "incomplete"].includes(check.status) ? check.status : "unchecked";
   }
 
   function renderMetrics(latest) {
@@ -588,6 +660,26 @@
       maximumFractionDigits: digits,
       minimumFractionDigits: digits,
     }).format(number);
+  }
+
+  function formatConfigValue(value, unit) {
+    let text;
+    if (value == null) {
+      text = "—";
+    } else if (typeof value === "number" && Number.isFinite(value)) {
+      text = formatNumber(value, value % 1 === 0 ? 0 : 3);
+    } else if (typeof value === "boolean") {
+      text = value ? "да" : "нет";
+    } else if (typeof value === "string") {
+      text = value;
+    } else {
+      try {
+        text = JSON.stringify(value);
+      } catch {
+        text = String(value);
+      }
+    }
+    return unit ? `${text} ${unit}` : text;
   }
 
   function formatPercent(value) {

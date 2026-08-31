@@ -55,7 +55,7 @@ private const val BLE_LOG_TAG = "LiferychBmsBle"
 
 private const val DEFAULT_ADMIN_SERVER_BASE_URL = "http://192.168.70.142:3000"
 private const val LOCAL_UPLOAD_PATH = "/api/upload.php"
-private const val SERVER_CONFIG_UPLOAD_URL = "http://dimond44.xsph.ru/api/config_upload.php"
+private const val LOCAL_CONFIG_UPLOAD_PATH = "/api/config_upload.php"
 private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_submit.php"
 private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
 private const val SERVER_WARRANTY_UPDATE_URL = "http://dimond44.xsph.ru/api/warranty_update.php"
@@ -113,6 +113,49 @@ data class ConfigReadRequest(
     val slave: Int,
     val start: Int,
     val count: Int
+)
+
+data class BmsConfigTemplate(
+    val id: String,
+    val version: Int,
+    val chemistry: String,
+    val supportedSeries: Set<Int>,
+    val parameters: List<BmsTemplateParameter>
+)
+
+data class BmsTemplateParameter(
+    val key: String,
+    val label: String,
+    val register: Int,
+    val scale: Double,
+    val offset: Double,
+    val unit: String,
+    val tolerance: Double,
+    val enforcement: String,
+    val expected: Double?,
+    val expectedBySeries: Map<Int, Double>,
+    val reason: String?
+)
+
+data class TemplateCheckItem(
+    val key: String,
+    val label: String,
+    val expected: Double?,
+    val actual: Double?,
+    val unit: String,
+    val tolerance: Double,
+    val reason: String? = null
+)
+
+data class TemplateCheckResult(
+    val templateId: String,
+    val templateVersion: Int,
+    val status: String,
+    val checkedAt: Long,
+    val seriesCount: Int?,
+    val mismatches: List<TemplateCheckItem> = emptyList(),
+    val missing: List<TemplateCheckItem> = emptyList(),
+    val unverified: List<TemplateCheckItem> = emptyList()
 )
 
 data class SavedBattery(
@@ -303,6 +346,8 @@ class MainActivity : ComponentActivity() {
     private var manageSection: String = "general"
     private var screenState: String = "splash"
     private var templateCheckShownForConnection: Boolean = false
+    private val templateChecksByBms: MutableMap<String, TemplateCheckResult> = mutableMapOf()
+    private var latestTemplateCheck: TemplateCheckResult? = null
     private var testSocWriteDoneForConnection: Boolean = false
     private val red = Color.rgb(255, 196, 0)
     private val redDark = Color.rgb(255, 183, 0)
@@ -1923,6 +1968,11 @@ class MainActivity : ComponentActivity() {
         if (!::manageContentLayout.isInitialized) return
         manageContentLayout.removeAllViews()
 
+        manageContentLayout.addView(
+            templateCheckCard(),
+            marginLp(-1, -2, 0, 0, 0, 10)
+        )
+
         manageContentLayout.addView(TextView(this).apply {
             text = when (manageSection) {
                 "general" -> "Основные параметры"
@@ -1999,7 +2049,7 @@ class MainActivity : ComponentActivity() {
             listOf(
                 "Тип батареи" to batteryTypeText(),
                 "Номинальная емкость" to nominalCapacityText(),
-                "Время ожидания сна" to regText(0x01C4, null, "S"),
+                "Время ожидания сна" to regText(0x0115, 0.1, "S"),
                 "Настройка SOC" to fmtPct(data.soc),
                 "Калибр. SOC 0" to regText(0x01C7, 1000.0, "V"),
                 "Калибр. SOC 100" to regText(0x0229, 1000.0, "V"),
@@ -2149,9 +2199,9 @@ class MainActivity : ComponentActivity() {
         manageContentLayout.addView(manageSectionCard(
             "4. Настройка балансировки",
             listOf(
-                "Напряжение включения балансировки" to regVoltageOneDecimal(0x01FA),
+                "Напряжение включения балансировки" to regVoltageOneDecimal(0x011A),
                 "Напряжение отключения балансировки" to regText(0x01FB, 1000.0, "V"),
-                "Перепад напряжения при открытии балансировки" to regText(0x0156, 1000.0, "V"),
+                "Перепад напряжения при открытии балансировки" to regText(0x011B, null, "mV"),
                 "Ток включения балансировки" to regCurrentOneDecimal(0x0151),
                 "Переключатель активной балансировки" to balanceSwitchText(0x0220)
             )
@@ -2173,7 +2223,7 @@ class MainActivity : ComponentActivity() {
             listOf(
                 "Тип батареи" to batteryTypeText(),
                 "Номинальная емкость" to nominalCapacityText(),
-                "Время ожидания сна" to regText(0x01C4, null, "S"),
+                "Время ожидания сна" to regText(0x0115, 0.1, "S"),
                 "Настройка SOC" to fmtPct(data.soc),
                 "Калибр. SOC 0" to regText(0x01C7, 1000.0, "V"),
                 "Калибр. SOC 100" to regText(0x0229, 1000.0, "V"),
@@ -2281,68 +2331,179 @@ class MainActivity : ComponentActivity() {
         return raw / scale
     }
 
-    private fun checkTemplateMismatches(): List<String> {
-        val errors = mutableListOf<String>()
-        fun checkV(label: String, addr: Int, expected: Double, tolerance: Double) {
-            val v = configNum(addr, 1000.0)
-            if (v == null) {
-                errors.add("$label: не прочитано")
-            } else if (kotlin.math.abs(v - expected) > tolerance) {
-                errors.add("$label: %.3f V, должно %.3f V".format(v, expected).replace(",", "."))
+    private fun loadBmsConfigTemplate(): BmsConfigTemplate {
+        val root = assets.open("bms_config_template.json")
+            .bufferedReader(Charsets.UTF_8)
+            .use { JSONObject(it.readText()) }
+        val templateId = root.getString("id")
+        val templateVersion = root.getInt("version")
+        val chemistry = root.getString("chemistry")
+        require(templateId.isNotBlank() && templateVersion > 0 && chemistry.isNotBlank())
+        val parametersJson = root.getJSONArray("parameters")
+        require(parametersJson.length() > 0)
+        val parameters = mutableListOf<BmsTemplateParameter>()
+        for (i in 0 until parametersJson.length()) {
+            val item = parametersJson.getJSONObject(i)
+            val registerText = item.getString("register")
+            val register = registerText.removePrefix("0x").removePrefix("0X").toInt(16)
+            val expectedBySeries = mutableMapOf<Int, Double>()
+            item.optJSONObject("expected_by_series")?.let { values ->
+                val keys = values.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    expectedBySeries[key.toInt()] = values.getDouble(key)
+                }
             }
-        }
-        fun checkPack(label: String, addr: Int, expected: Double, tolerance: Double) {
-            val raw = configRegisters[addr]
-            val v = raw?.let { it / 10.0 }
-            if (v == null) {
-                errors.add("$label: не прочитано")
-            } else if (kotlin.math.abs(v - expected) > tolerance) {
-                errors.add("$label: %.1f V, должно %.1f V".format(v, expected).replace(",", "."))
+            val enforcement = item.getString("enforcement")
+            require(enforcement == "required" || enforcement == "informational")
+            val scale = item.getDouble("scale")
+            require(scale != 0.0)
+            val tolerance = item.getDouble("tolerance")
+            require(tolerance >= 0.0)
+            val expected = if (item.has("expected") && !item.isNull("expected")) {
+                item.getDouble("expected")
+            } else {
+                null
             }
+            require(expected != null || expectedBySeries.isNotEmpty())
+            parameters += BmsTemplateParameter(
+                key = item.getString("key"),
+                label = item.getString("label"),
+                register = register,
+                scale = scale,
+                offset = item.optDouble("offset", 0.0),
+                unit = item.optString("unit", ""),
+                tolerance = tolerance,
+                enforcement = enforcement,
+                expected = expected,
+                expectedBySeries = expectedBySeries,
+                reason = item.optString("reason").takeIf { it.isNotBlank() }
+            )
         }
-        fun checkTemp(label: String, addr: Int, expected: Int, tolerance: Int) {
-            val raw = configRegisters[addr]
-            val v = raw?.let { it - 40 }
-            if (v == null) {
-                errors.add("$label: не прочитано")
-            } else if (kotlin.math.abs(v - expected) > tolerance) {
-                errors.add("$label: $v °C, должно $expected °C")
+        val supported = root.getJSONArray("supported_series")
+        require(supported.length() > 0)
+        return BmsConfigTemplate(
+            id = templateId,
+            version = templateVersion,
+            chemistry = chemistry,
+            supportedSeries = (0 until supported.length()).map { supported.getInt(it) }.toSet(),
+            parameters = parameters
+        )
+    }
+
+    private fun evaluateTemplateCheck(): TemplateCheckResult {
+        val checkedAt = System.currentTimeMillis()
+        val observedSeries = data.cellCount
+        val series = observedSeries?.takeIf { it == 4 || it == 8 }
+        return try {
+            val template = loadBmsConfigTemplate()
+            val mismatches = mutableListOf<TemplateCheckItem>()
+            val missing = mutableListOf<TemplateCheckItem>()
+            val unverified = mutableListOf<TemplateCheckItem>()
+
+            for (parameter in template.parameters) {
+                val expected = parameter.expected ?: series?.let { parameter.expectedBySeries[it] }
+                val raw = configRegisters[parameter.register]
+                val actual = raw?.let { (it / parameter.scale) + parameter.offset }
+
+                if (parameter.enforcement == "informational") {
+                    continue
+                }
+
+                if (parameter.expectedBySeries.isNotEmpty() && series == null) {
+                    missing += TemplateCheckItem(
+                        parameter.key,
+                        parameter.label,
+                        null,
+                        null,
+                        parameter.unit,
+                        parameter.tolerance,
+                        "unsupported_series"
+                    )
+                } else if (raw == null) {
+                    missing += TemplateCheckItem(
+                        parameter.key,
+                        parameter.label,
+                        expected,
+                        null,
+                        parameter.unit,
+                        parameter.tolerance,
+                        "register_missing"
+                    )
+                } else if (expected == null) {
+                    missing += TemplateCheckItem(
+                        parameter.key,
+                        parameter.label,
+                        null,
+                        null,
+                        parameter.unit,
+                        parameter.tolerance,
+                        "expected_value_missing"
+                    )
+                } else if (kotlin.math.abs(actual!! - expected) > parameter.tolerance) {
+                    mismatches += TemplateCheckItem(
+                        parameter.key,
+                        parameter.label,
+                        expected,
+                        actual,
+                        parameter.unit,
+                        parameter.tolerance
+                    )
+                }
             }
+
+            val status = when {
+                mismatches.isNotEmpty() -> "mismatch"
+                missing.isNotEmpty() || series == null || series !in template.supportedSeries -> "incomplete"
+                else -> "ok"
+            }
+            TemplateCheckResult(
+                template.id,
+                template.version,
+                status,
+                checkedAt,
+                observedSeries,
+                mismatches,
+                missing,
+                unverified
+            )
+        } catch (e: Exception) {
+            TemplateCheckResult(
+                templateId = "liferych-lfp-default",
+                templateVersion = 1,
+                status = "incomplete",
+                checkedAt = checkedAt,
+                seriesCount = observedSeries,
+                missing = listOf(
+                    TemplateCheckItem(
+                        key = "template_load_error",
+                        label = "Шаблон конфигурации",
+                        expected = null,
+                        actual = null,
+                        unit = "",
+                        tolerance = 0.0,
+                        reason = "template_load_error: ${(e.message ?: e.javaClass.simpleName).take(160)}"
+                    )
+                )
+            )
         }
+    }
 
-        val bms = bmsUid()
-        val isRedDl = bms.uppercase().startsWith("DL")
+    private fun setTemplateCheckResult(result: TemplateCheckResult) {
+        latestTemplateCheck = result
+        templateChecksByBms[bmsUid()] = result
+    }
 
-        if (!isRedDl) {
-            checkV("Калибр. SOC 0", 0x01C7, 2.50, 0.03)
-            checkV("Калибр. SOC 100", 0x0229, 3.65, 0.03)
-        }
-
-        if (data.chargeMos == false) errors.add("MOS зарядки: OFF")
-        if (data.dischargeMos == false) errors.add("MOS разрядки: OFF")
-
-        checkV("Защита ячейки high", 0x0131, 3.65, 0.03)
-        checkV("Защита ячейки low", 0x0135, 2.50, 0.03)
-
-        val series = data.cellCount ?: if ((data.voltage ?: 0.0) > 18.0) 8 else 4
-        checkPack("Общее перенапряжение", 0x0139, if (series >= 8) 29.2 else 14.6, 0.15)
-        checkPack("Общее пониженное напряжение", 0x013D, if (series >= 8) 20.0 else 10.0, 0.15)
-
-        checkTemp("Высокая температура зарядки", 0x014B, 65, 2)
-        checkTemp("Низкая температура зарядки", 0x014F, 2, 2)
-        checkTemp("Высокая температура разрядки", 0x0153, 70, 2)
-        checkTemp("Низкая температура разрядки", 0x0157, -35, 3)
-
-        if (!isRedDl) {
-            checkV("Балансировка старт", 0x01FA, 3.00, 0.05)
-            checkV("Балансировка стоп", 0x01FB, 3.80, 0.05)
-        }
-
-        if (localEvents.isNotEmpty()) {
-            errors.add("Есть активные предупреждения/ошибки BMS")
-        }
-
-        return errors
+    private fun setTemplateCheckChecking() {
+        setTemplateCheckResult(
+            TemplateCheckResult(
+                templateId = "liferych-lfp-default",
+                templateVersion = 1,
+                status = "checking",
+                checkedAt = 0L,
+                seriesCount = data.cellCount
+            )
+        )
     }
 
     private fun scheduleExactSocWriteTest() {
@@ -2710,26 +2871,116 @@ class MainActivity : ComponentActivity() {
         return frame
     }
 
-    private fun showTemplateCheckDialogIfNeeded() {
-        if (templateCheckShownForConnection) return
-        if (configReadInProgress) return
-        if (configRegisters.isEmpty()) return
-        templateCheckShownForConnection = true
+    private fun currentTemplateCheck(): TemplateCheckResult? = templateChecksByBms[bmsUid()]
 
-        val mismatches = checkTemplateMismatches()
-        if (mismatches.isEmpty()) {
-            AlertDialog.Builder(this)
-                .setTitle("АКБ готова к работе")
-                .setMessage("Настройки BMS соответствуют шаблону. Ошибок по проверке не найдено.")
-                .setPositiveButton("OK", null)
-                .show()
-        } else {
-            AlertDialog.Builder(this)
-                .setTitle("АКБ работает некорректно или внесены изменения!")
-                .setMessage(mismatches.take(8).joinToString("\\n") + if (mismatches.size > 8) "\\n..." else "")
-                .setPositiveButton("OK", null)
-                .show()
+    private fun formatTemplateNumber(value: Double?): String {
+        if (value == null) return "—"
+        return "%.3f".format(value).trimTrailingZeros().replace(",", ".")
+    }
+
+    private fun templateCheckCard(): LinearLayout {
+        val result = currentTemplateCheck()
+        val status = result?.status ?: "unknown"
+        val color = when (status) {
+            "ok" -> Color.rgb(28, 160, 55)
+            "mismatch" -> Color.rgb(211, 47, 47)
+            "incomplete" -> Color.rgb(224, 150, 0)
+            else -> Color.rgb(110, 118, 128)
         }
+        val title = when (status) {
+            "checking" -> "Проверка конфигурации…"
+            "ok" -> "Конфигурация соответствует шаблону"
+            "mismatch" -> "Есть отклонения конфигурации"
+            "incomplete" -> "Проверка конфигурации неполная"
+            else -> "Конфигурация ещё не проверена"
+        }
+        val checked = result?.checkedAt?.takeIf { it > 0L }?.let {
+            java.text.SimpleDateFormat("dd.MM.yyyy HH:mm:ss", java.util.Locale.getDefault())
+                .format(java.util.Date(it))
+        } ?: "—"
+        val counts = result?.let {
+            val counts = "Отклонений: ${it.mismatches.size}  •  Нет данных: ${it.missing.size}"
+        } ?: "Ожидается чтение настроек BMS"
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(11), dp(14), dp(11))
+            background = round(Color.argb(24, Color.red(color), Color.green(color), Color.blue(color)), dp(14), color, 1)
+            isClickable = true
+            isFocusable = true
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 15f
+                typeface = interFont(720)
+                setTextColor(color)
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = "Проверено: $checked\n$counts"
+                textSize = 12f
+                setTextColor(Color.rgb(75, 79, 84))
+                setPadding(0, dp(4), 0, 0)
+            })
+            setOnClickListener { showTemplateCheckDetails(currentTemplateCheck()) }
+        }
+    }
+
+    private fun templateCheckDetails(result: TemplateCheckResult?): String {
+        if (result == null) return "Результата ещё нет. Проверка запустится после чтения конфигурации BMS."
+        if (result.status == "checking") return "Чтение и проверка конфигурации выполняются."
+        val lines = mutableListOf<String>()
+        lines += "Серия: ${result.seriesCount?.let { "${it}S" } ?: "не определена"}"
+        lines += "Отклонений: ${result.mismatches.size}, нет данных: ${result.missing.size}"
+        if (result.mismatches.isNotEmpty()) {
+            lines += ""
+            lines += "Отклонения:"
+            result.mismatches.forEach {
+                lines += "• ${it.label}: ${formatTemplateNumber(it.actual)} ${it.unit}; ожидалось ${formatTemplateNumber(it.expected)} ${it.unit} ±${formatTemplateNumber(it.tolerance)}"
+            }
+        }
+        if (result.missing.isNotEmpty()) {
+            lines += ""
+            lines += "Нет данных:"
+            result.missing.forEach {
+                lines += "• ${it.label}: ${it.reason ?: "не прочитано"}; ожидалось ${formatTemplateNumber(it.expected)} ${it.unit}"
+            }
+        }
+        if (result.unverified.isNotEmpty()) {
+            lines += ""
+            lines += "Информационные (не влияют на статус):"
+            result.unverified.forEach {
+                lines += "• ${it.label}: ${formatTemplateNumber(it.actual)} ${it.unit}; ожидалось ${formatTemplateNumber(it.expected)} ${it.unit} (${it.reason ?: "mapping_unverified"})"
+            }
+        }
+        if (result.status == "ok") {
+            lines += ""
+            lines += "Все обязательные параметры соответствуют шаблону."
+        }
+        lines += ""
+        lines += "Проверка носит предупредительный характер и не блокирует работу BMS."
+        return lines.joinToString("\n")
+    }
+
+    private fun showTemplateCheckDetails(result: TemplateCheckResult?) {
+        val title = when (result?.status) {
+            "ok" -> "Конфигурация BMS: OK"
+            "mismatch" -> "Отклонения конфигурации BMS"
+            "incomplete" -> "Неполная проверка BMS"
+            "checking" -> "Проверка конфигурации BMS"
+            else -> "Конфигурация BMS"
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(templateCheckDetails(result))
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    private fun showTemplateCheckDialogIfNeeded() {
+        if (templateCheckShownForConnection || configReadInProgress) return
+        val result = currentTemplateCheck() ?: return
+        if (result.status !in setOf("ok", "mismatch", "incomplete")) return
+        templateCheckShownForConnection = true
+        showTemplateCheckDetails(result)
     }
 
 
@@ -4381,6 +4632,7 @@ class MainActivity : ComponentActivity() {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 configAutoReadStartedForConnection = false
                 templateCheckShownForConnection = false
+                setTemplateCheckChecking()
                 testSocWriteDoneForConnection = false
                 servicesDiscoveryStarted = false
                 negotiatedMtu = 23
@@ -4423,6 +4675,8 @@ class MainActivity : ComponentActivity() {
                 polling = false
                 pollLoopToken++
                 configAutoReadStartedForConnection = false
+                templateCheckShownForConnection = false
+                latestTemplateCheck = null
                 runOnUiThread {
                     selectedAddress?.let { address ->
                         deviceStatusViews[address]?.apply {
@@ -5319,6 +5573,7 @@ class MainActivity : ComponentActivity() {
         val ch = writeCharacteristic ?: return
 
         configReadInProgress = true
+        setTemplateCheckChecking()
         pollLoopToken++
         pendingRuntimeCommand = null
         activeConfigRead = null
@@ -5423,13 +5678,14 @@ class MainActivity : ComponentActivity() {
             if (configRegisters.isNotEmpty()) {
                 saveConfigCacheForCurrentBms()
             }
+            setTemplateCheckResult(evaluateTemplateCheck())
             rememberCurrentBmsState()
             refreshManageIfVisible()
 
             mainHandler.postDelayed({
                 rememberCurrentBmsState()
+                showTemplateCheckDialogIfNeeded()
                 uploadConfigSnapshot(force = true)
-                // Проверочное уведомление отключено. Запускаем тест записи SOC.
                 scheduleExactSocWriteTest()
             }, 1200)
 
@@ -5618,7 +5874,7 @@ class MainActivity : ComponentActivity() {
 
         thread {
             try {
-                val conn = (URL(SERVER_CONFIG_UPLOAD_URL).openConnection() as HttpURLConnection).apply {
+                val conn = (URL(adminServerUrl(LOCAL_CONFIG_UPLOAD_PATH)).openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     connectTimeout = 8000
                     readTimeout = 8000
@@ -5674,6 +5930,67 @@ class MainActivity : ComponentActivity() {
         rememberCurrentBmsState()
     }
 
+    private fun templateCheckUploadJson(): JSONObject {
+        val result = currentTemplateCheck()?.takeIf {
+            it.status == "ok" || it.status == "mismatch" || it.status == "incomplete"
+        } ?: TemplateCheckResult(
+            templateId = "liferych-lfp-default",
+            templateVersion = 1,
+            status = "incomplete",
+            checkedAt = System.currentTimeMillis(),
+            seriesCount = data.cellCount,
+            missing = listOf(
+                TemplateCheckItem(
+                    key = "template_check_unavailable",
+                    label = "Проверка конфигурации",
+                    expected = null,
+                    actual = null,
+                    unit = "",
+                    tolerance = 0.0,
+                    reason = "check_not_completed"
+                )
+            )
+        )
+
+        fun mismatchJson(item: TemplateCheckItem) = JSONObject().apply {
+            put("key", item.key)
+            put("label", item.label)
+            put("expected", item.expected ?: JSONObject.NULL)
+            put("actual", item.actual ?: JSONObject.NULL)
+            put("unit", item.unit)
+            put("tolerance", item.tolerance)
+        }
+        fun unavailableJson(item: TemplateCheckItem) = JSONObject().apply {
+            put("key", item.key)
+            put("label", item.label)
+            put("expected", item.expected ?: JSONObject.NULL)
+            put("actual", JSONObject.NULL)
+            put("unit", item.unit)
+            put("reason", item.reason ?: "register_missing")
+        }
+        fun unverifiedJson(item: TemplateCheckItem) = JSONObject().apply {
+            put("key", item.key)
+            put("label", item.label)
+            put("expected", item.expected ?: JSONObject.NULL)
+            put("actual", item.actual ?: JSONObject.NULL)
+            put("unit", item.unit)
+            put("reason", item.reason ?: "mapping_unverified")
+        }
+
+        return JSONObject().apply {
+            put("template_id", result.templateId)
+            put("template_version", result.templateVersion)
+            put("status", result.status)
+            put("checked_at", result.checkedAt)
+            put("series_count", result.seriesCount ?: JSONObject.NULL)
+            put("mismatch_count", result.mismatches.size)
+            put("missing_count", result.missing.size)
+            put("mismatches", JSONArray().apply { result.mismatches.forEach { put(mismatchJson(it)) } })
+            put("missing", JSONArray().apply { result.missing.forEach { put(unavailableJson(it)) } })
+            put("unverified", JSONArray().apply { result.unverified.forEach { put(unverifiedJson(it)) } })
+        }
+    }
+
     private fun buildConfigUploadJson(): JSONObject {
         ensureConfigForUpload()
 
@@ -5682,8 +5999,9 @@ class MainActivity : ComponentActivity() {
         obj.put("bms_uid", bmsUid())
         obj.put("bluetooth_name", selectedDeviceName)
         obj.put("bluetooth_address", selectedAddress ?: "")
-        obj.put("app_version", "1.0-v57-step-soc-write")
+        obj.put("app_version", "0.2.2-balance-regs")
         obj.put("read_status", lastConfigStatus)
+        obj.put("template_check", templateCheckUploadJson())
 
         val config = JSONObject()
 
@@ -5691,7 +6009,7 @@ class MainActivity : ComponentActivity() {
         general.put("Тип батареи", batteryTypeText())
         general.put("Номинальная емкость", nominalCapacityText())
         general.put("Источник емкости", nominalCapacitySource())
-        general.put("Время ожидания сна", regText(0x01C4, null, "S"))
+        general.put("Время ожидания сна", regText(0x0115, 0.1, "S"))
         general.put("Настройка SOC", currentSocTextForConfig())
         general.put("Калибр. SOC 0", regText(0x01C7, 1000.0, "V"))
         general.put("Калибр. SOC 100", regText(0x0229, 1000.0, "V"))
@@ -5704,7 +6022,8 @@ class MainActivity : ComponentActivity() {
         general.put("nominal_capacity_text", nominalCapacityText())
         general.put("capacity_source", nominalCapacitySource())
         general.put("daly_raw_capacity_registers", rawCapacityRegistersJson())
-        general.put("sleep_time_s", regText(0x01C4, null, "S"))
+        general.put("sleep_time_s", regText(0x0115, 0.1, "S"))
+        general.put("sleep_time_s_num", configRegScaled(0x0115, 0.1) ?: JSONObject.NULL)
         general.put("soc_percent", currentSocTextForConfig())
         general.put("soc_percent_num", data.soc ?: lastKnownSoc ?: JSONObject.NULL)
         general.put("soc_calibration_0_v", regText(0x01C7, 1000.0, "V"))
@@ -5775,26 +6094,23 @@ class MainActivity : ComponentActivity() {
 
         val balancing = JSONObject()
 
-        // Важно: используем те же регистры, что и во вкладке
-        // Управление → Настройка балансировки.
-        // Порог включения и порог отключения находятся в соседних
-        // регистрах 0x01FA/0x01FB. 0x0228 содержит другое значение (на этой
-        // BMS raw=5000), поэтому его нельзя использовать как напряжение.
-        balancing.put("Напряжение включения балансировки", regVoltageOneDecimal(0x01FA))
+        // Живые уставки балансировки: старт 0x011A (мВ), разность 0x011B (мВ).
+        // 0x0227 на этой BMS фиксированно 2.5 В, 0x01FA пустой, 0x0156 — чужой регистр (15).
+        balancing.put("Напряжение включения балансировки", regVoltageOneDecimal(0x011A))
         balancing.put("Напряжение отключения балансировки", regText(0x01FB, 1000.0, "V"))
-        balancing.put("Перепад напряжения при открытии балансировки", regText(0x0156, 1000.0, "V"))
+        balancing.put("Перепад напряжения при открытии балансировки", regText(0x011B, null, "mV"))
         balancing.put("Ток включения балансировки", regCurrentOneDecimal(0x0151))
         balancing.put("Переключатель активной балансировки", regSwitchText(0x0220))
 
-        balancing.put("balance_start_voltage_v", regVoltageOneDecimal(0x01FA))
+        balancing.put("balance_start_voltage_v", regVoltageOneDecimal(0x011A))
         balancing.put("balance_stop_voltage_v", regText(0x01FB, 1000.0, "V"))
-        balancing.put("balance_delta_v", regText(0x0156, 1000.0, "V"))
+        balancing.put("balance_delta_v", regText(0x011B, null, "mV"))
         balancing.put("balance_current_a", regCurrentOneDecimal(0x0151))
         balancing.put("active_balance_enabled", regSwitchText(0x0220))
 
-        balancing.put("balance_start_voltage_num", configRegScaled(0x01FA, 1000.0) ?: JSONObject.NULL)
+        balancing.put("balance_start_voltage_num", configRegScaled(0x011A, 1000.0) ?: JSONObject.NULL)
         balancing.put("balance_stop_voltage_num", configRegScaled(0x01FB, 1000.0) ?: JSONObject.NULL)
-        balancing.put("balance_delta_num", configRegScaled(0x0156, 1000.0) ?: JSONObject.NULL)
+        balancing.put("balance_delta_num", configRegScaled(0x011B) ?: JSONObject.NULL)
         balancing.put("balance_current_num", configRegScaled(0x0151, 1000.0) ?: JSONObject.NULL)
         balancing.put("active_balance_enabled_num", configRegisters[0x0220] ?: JSONObject.NULL)
         config.put("balancing", balancing)
@@ -5803,7 +6119,7 @@ class MainActivity : ComponentActivity() {
         cellParams.put("Тип батареи", batteryTypeText())
         cellParams.put("Номинальная емкость", nominalCapacityText())
         cellParams.put("Источник емкости", nominalCapacitySource())
-        cellParams.put("Время ожидания сна", regText(0x01C4, null, "S"))
+        cellParams.put("Время ожидания сна", regText(0x0115, 0.1, "S"))
         cellParams.put("Настройка SOC", currentSocTextForConfig())
         cellParams.put("Калибр. SOC 0", regText(0x01C7, 1000.0, "V"))
         cellParams.put("Калибр. SOC 100", regText(0x0229, 1000.0, "V"))
@@ -5817,7 +6133,7 @@ class MainActivity : ComponentActivity() {
         cellParams.put("nominal_capacity_ah", nominalCapacityAh() ?: JSONObject.NULL)
         cellParams.put("capacity_source", nominalCapacitySource())
         cellParams.put("daly_raw_capacity_registers", rawCapacityRegistersJson())
-        cellParams.put("sleep_time_s", regText(0x01C4, null, "S"))
+        cellParams.put("sleep_time_s", regText(0x0115, 0.1, "S"))
         cellParams.put("soc_percent", currentSocTextForConfig())
         cellParams.put("soc_calibration_0_v", regText(0x01C7, 1000.0, "V"))
         cellParams.put("soc_calibration_100_v", regText(0x0229, 1000.0, "V"))

@@ -49,6 +49,28 @@ function openDatabase(filename) {
 
     CREATE INDEX IF NOT EXISTS telemetry_bms_time_idx
       ON telemetry(bms_uid, received_at DESC);
+
+    CREATE TABLE IF NOT EXISTS config_checks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bms_uid TEXT NOT NULL,
+      received_at INTEGER NOT NULL,
+      checked_at INTEGER NOT NULL,
+      template_id TEXT NOT NULL,
+      template_version INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      series_count INTEGER,
+      mismatch_count INTEGER NOT NULL,
+      missing_count INTEGER NOT NULL,
+      mismatches_json TEXT NOT NULL,
+      missing_json TEXT NOT NULL,
+      unverified_json TEXT NOT NULL,
+      config_snapshot_json TEXT,
+      payload_json TEXT NOT NULL,
+      FOREIGN KEY (bms_uid) REFERENCES batteries(bms_uid) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS config_checks_bms_time_idx
+      ON config_checks(bms_uid, checked_at DESC);
   `);
 
   const upsertBattery = db.prepare(`
@@ -58,8 +80,8 @@ function openDatabase(filename) {
       @bms_uid, @bluetooth_name, @bluetooth_address, @received_at, @received_at
     )
     ON CONFLICT(bms_uid) DO UPDATE SET
-      bluetooth_name = excluded.bluetooth_name,
-      bluetooth_address = excluded.bluetooth_address,
+      bluetooth_name = COALESCE(excluded.bluetooth_name, batteries.bluetooth_name),
+      bluetooth_address = COALESCE(excluded.bluetooth_address, batteries.bluetooth_address),
       last_seen_at = excluded.last_seen_at
   `);
 
@@ -109,11 +131,55 @@ function openDatabase(filename) {
     return Number(insertTelemetryRow.run(row).lastInsertRowid);
   });
 
+  const insertConfigCheckRow = db.prepare(`
+    INSERT INTO config_checks (
+      bms_uid, received_at, checked_at, template_id, template_version, status,
+      series_count, mismatch_count, missing_count, mismatches_json, missing_json,
+      unverified_json, config_snapshot_json, payload_json
+    ) VALUES (
+      @bms_uid, @received_at, @checked_at, @template_id, @template_version, @status,
+      @series_count, @mismatch_count, @missing_count, @mismatches_json, @missing_json,
+      @unverified_json, @config_snapshot_json, @payload_json
+    )
+  `);
+
+  const saveConfigCheck = db.transaction((payload, receivedAt) => {
+    const check = payload.template_check;
+    const battery = {
+      bms_uid: payload.bms_uid,
+      bluetooth_name: payload.bluetooth_name ?? null,
+      bluetooth_address: payload.bluetooth_address ?? null,
+      received_at: receivedAt,
+    };
+    const row = {
+      ...battery,
+      checked_at: check.checked_at,
+      template_id: check.template_id,
+      template_version: check.template_version,
+      status: check.status,
+      series_count: check.series_count ?? null,
+      mismatch_count: check.mismatch_count,
+      missing_count: check.missing_count,
+      mismatches_json: JSON.stringify(check.mismatches),
+      missing_json: JSON.stringify(check.missing),
+      unverified_json: JSON.stringify(check.unverified),
+      config_snapshot_json: payload.config == null ? null : JSON.stringify(payload.config),
+      payload_json: JSON.stringify(payload),
+    };
+
+    upsertBattery.run(battery);
+    return Number(insertConfigCheckRow.run(row).lastInsertRowid);
+  });
+
   return {
     close: () => db.close(),
 
     insertTelemetry(payload, receivedAt = Date.now()) {
       return saveTelemetry(payload, receivedAt);
+    },
+
+    insertConfigCheck(payload, receivedAt = Date.now()) {
+      return saveConfigCheck(payload, receivedAt);
     },
 
     hasBattery(bmsUid) {
@@ -133,7 +199,19 @@ function openDatabase(filename) {
           t.voltage,
           t.current,
           t.soc,
-          t.errors_json
+          t.errors_json,
+          c.id AS config_check_id,
+          c.received_at AS config_received_at,
+          c.checked_at AS config_checked_at,
+          c.template_id,
+          c.template_version,
+          c.status AS config_status,
+          c.series_count,
+          c.mismatch_count,
+          c.missing_count,
+          c.mismatches_json,
+          c.missing_json,
+          c.unverified_json
         FROM batteries b
         LEFT JOIN telemetry t ON t.id = (
           SELECT latest.id
@@ -142,14 +220,50 @@ function openDatabase(filename) {
           ORDER BY latest.received_at DESC, latest.id DESC
           LIMIT 1
         )
+        LEFT JOIN config_checks c ON c.id = (
+          SELECT latest_check.id
+          FROM config_checks latest_check
+          WHERE latest_check.bms_uid = b.bms_uid
+          ORDER BY latest_check.checked_at DESC, latest_check.id DESC
+          LIMIT 1
+        )
         ORDER BY b.last_seen_at DESC
       `).all();
 
       return rows.map((row) => {
-        const { errors_json: errorsJson, ...battery } = row;
+        const {
+          errors_json: errorsJson,
+          config_check_id: configCheckId,
+          config_received_at: configReceivedAt,
+          config_checked_at: configCheckedAt,
+          template_id: templateId,
+          template_version: templateVersion,
+          config_status: configStatus,
+          series_count: seriesCount,
+          mismatch_count: mismatchCount,
+          missing_count: missingCount,
+          mismatches_json: mismatchesJson,
+          missing_json: missingJson,
+          unverified_json: unverifiedJson,
+          ...battery
+        } = row;
         return {
           ...battery,
           errors: parseJson(errorsJson, []),
+          config_check: configCheckId == null ? null : {
+            id: configCheckId,
+            received_at: configReceivedAt,
+            checked_at: configCheckedAt,
+            template_id: templateId,
+            template_version: templateVersion,
+            status: configStatus,
+            series_count: seriesCount,
+            mismatch_count: mismatchCount,
+            missing_count: missingCount,
+            mismatches: parseJson(mismatchesJson, []),
+            missing: parseJson(missingJson, []),
+            unverified: parseJson(unverifiedJson, []),
+          },
         };
       });
     },
@@ -165,6 +279,32 @@ function openDatabase(filename) {
         ...parseJson(row.payload_json, {}),
         id: row.id,
         received_at: row.received_at,
+      }));
+    },
+
+    listConfigChecks(bmsUid, limit) {
+      return db.prepare(`
+        SELECT
+          id, received_at, checked_at, template_id, template_version, status,
+          series_count, mismatch_count, missing_count, mismatches_json,
+          missing_json, unverified_json
+        FROM config_checks
+        WHERE bms_uid = ?
+        ORDER BY checked_at DESC, id DESC
+        LIMIT ?
+      `).all(bmsUid, limit).map((row) => ({
+        id: row.id,
+        received_at: row.received_at,
+        checked_at: row.checked_at,
+        template_id: row.template_id,
+        template_version: row.template_version,
+        status: row.status,
+        series_count: row.series_count,
+        mismatch_count: row.mismatch_count,
+        missing_count: row.missing_count,
+        mismatches: parseJson(row.mismatches_json, []),
+        missing: parseJson(row.missing_json, []),
+        unverified: parseJson(row.unverified_json, []),
       }));
     },
   };

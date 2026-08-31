@@ -99,6 +99,84 @@ test("GET возвращает батарею и историю без api_key",
   assert.deepEqual(historyBody.telemetry[0].cells, { 1: 3.275, 2: 3.281 });
 });
 
+test("POST проверки конфигурации сохраняет историю и возвращает последнюю", async () => {
+  const firstPayload = createConfigCheckPayload();
+  const firstResponse = await fetch(`${baseUrl}/api/config_upload.php`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(firstPayload),
+  });
+
+  assert.equal(firstResponse.status, 201);
+  assert.deepEqual(await firstResponse.json(), { ok: true, check_id: 1 });
+
+  const secondPayload = createConfigCheckPayload();
+  secondPayload.template_check = {
+    ...secondPayload.template_check,
+    template_version: 4,
+    status: "ok",
+    checked_at: firstPayload.template_check.checked_at + 1000,
+    mismatch_count: 0,
+    mismatches: [],
+  };
+  const secondResponse = await fetch(`${baseUrl}/api/v1/config-check`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": API_KEY },
+    body: JSON.stringify(secondPayload),
+  });
+
+  assert.equal(secondResponse.status, 201);
+  assert.deepEqual(await secondResponse.json(), { ok: true, check_id: 2 });
+
+  const headers = { "x-api-key": API_KEY };
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`, { headers });
+  const batteriesBody = await batteriesResponse.json();
+  const battery = batteriesBody.batteries.find((item) => item.bms_uid === firstPayload.bms_uid);
+
+  assert.equal(battery.bluetooth_name, "ConfigOnlyBMS");
+  assert.equal(battery.telemetry_id, null);
+  assert.equal(battery.config_check.id, 2);
+  assert.equal(battery.config_check.status, "ok");
+  assert.equal(battery.config_check.template_version, 4);
+
+  const historyResponse = await fetch(
+    `${baseUrl}/api/v1/batteries/${encodeURIComponent(firstPayload.bms_uid)}/config-checks?limit=10`,
+    { headers },
+  );
+  const historyBody = await historyResponse.json();
+
+  assert.equal(historyResponse.status, 200);
+  assert.equal(historyBody.config_checks.length, 2);
+  assert.deepEqual(historyBody.config_checks.map((check) => check.id), [2, 1]);
+  assert.equal(historyBody.config_checks[1].mismatches[0].actual, null);
+});
+
+test("POST проверки конфигурации отклоняет неверный ключ", async () => {
+  const payload = createConfigCheckPayload();
+  payload.api_key = "wrong";
+  const response = await fetch(`${baseUrl}/api/config_upload.php`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  assert.equal(response.status, 401);
+  assert.deepEqual(await response.json(), { ok: false, error: "unauthorized" });
+});
+
+test("POST проверки конфигурации валидирует вложенный результат", async () => {
+  const payload = createConfigCheckPayload();
+  payload.template_check.mismatches = {};
+  const response = await fetch(`${baseUrl}/api/v1/config-check`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": API_KEY },
+    body: JSON.stringify(payload),
+  });
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { ok: false, error: "invalid_mismatches" });
+});
+
 function createFullPayload() {
   return {
     api_key: API_KEY,
@@ -134,5 +212,55 @@ function createFullPayload() {
         local_time: "12:34:56",
       },
     ],
+  };
+}
+
+function createConfigCheckPayload() {
+  return {
+    api_key: API_KEY,
+    bms_uid: "config-only-bms",
+    bluetooth_name: "ConfigOnlyBMS",
+    bluetooth_address: "11:22:33:44:55:66",
+    config: { cell_count: 8, balance_start_v: 3.4 },
+    raw: { source: "settings" },
+    template_check: {
+      template_id: "liferych-8s",
+      template_version: 3,
+      status: "mismatch",
+      checked_at: 1_788_182_400_000,
+      series_count: 8,
+      mismatch_count: 1,
+      missing_count: 1,
+      mismatches: [
+        {
+          key: "balance_start_v",
+          label: "Старт балансировки",
+          expected: 3.45,
+          actual: null,
+          unit: "В",
+          tolerance: 0.01,
+        },
+      ],
+      missing: [
+        {
+          key: "sleep_timeout",
+          label: "Тайм-аут сна",
+          expected: 3600,
+          actual: null,
+          unit: "с",
+          reason: "register_unavailable",
+        },
+      ],
+      unverified: [
+        {
+          key: "capacity_ah",
+          label: "Ёмкость",
+          expected: 200,
+          actual: 200,
+          unit: "А·ч",
+          reason: "manual_confirmation",
+        },
+      ],
+    },
   };
 }

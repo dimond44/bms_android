@@ -1,0 +1,168 @@
+{
+  "id": "liferych-lfp-default",
+  "version": 3,
+  "chemistry": "LiFePO4",
+  "supported_series": [4, 8],
+  "parameters": [
+    {
+      "key": "sleep_timeout",
+      "label": "Время ожидания сна",
+      "register": "0x0115",
+      "scale": 0.1,
+      "offset": 0,
+      "unit": "s",
+      "tolerance": 0,
+      "enforcement": "required",
+      "expected": 3600
+    },
+    {
+      "key": "soc_calibration_0",
+      "label": "Калибровка SOC 0%",
+      "register": "0x01C7",
+      "scale": 1000,
+      "offset": 0,
+      "unit": "V",
+      "tolerance": 0.03,
+      "enforcement": "required",
+      "expected": 2.5
+    },
+    {
+      "key": "soc_calibration_100",
+      "label": "Калибровка SOC 100%",
+      "register": "0x0229",
+      "scale": 1000,
+      "offset": 0,
+      "unit": "V",
+      "tolerance": 0.03,
+      "enforcement": "required",
+      "expected": 3.65
+    },
+    {
+      "key": "cell_over_voltage",
+      "label": "Перенапряжение ячейки",
+      "register": "0x0131",
+      "scale": 1000,
+      "offset": 0,
+      "unit": "V",
+      "tolerance": 0.03,
+      "enforcement": "required",
+      "expected": 3.65
+    },
+    {
+      "key": "cell_under_voltage",
+      "label": "Пониженное напряжение ячейки",
+      "register": "0x0135",
+      "scale": 1000,
+      "offset": 0,
+      "unit": "V",
+      "tolerance": 0.03,
+      "enforcement": "required",
+      "expected": 2.5
+    },
+    {
+      "key": "pack_over_voltage",
+      "label": "Перенапряжение батареи",
+      "register": "0x0139",
+      "scale": 10,
+      "offset": 0,
+      "unit": "V",
+      "tolerance": 0.15,
+      "enforcement": "required",
+      "expected_by_series": {
+        "4": 14.6,
+        "8": 29.2
+      }
+    },
+    {
+      "key": "pack_under_voltage",
+      "label": "Пониженное напряжение батареи",
+      "register": "0x013D",
+      "scale": 10,
+      "offset": 0,
+      "unit": "V",
+      "tolerance": 0.15,
+      "enforcement": "required",
+      "expected_by_series": {
+        "4": 10,
+        "8": 20
+      }
+    },
+    {
+      "key": "charge_high_temp",
+      "label": "Высокая температура зарядки",
+      "register": "0x014B",
+      "scale": 1,
+      "offset": -40,
+      "unit": "°C",
+      "tolerance": 2,
+      "enforcement": "required",
+      "expected": 65
+    },
+    {
+      "key": "charge_low_temp",
+      "label": "Низкая температура зарядки",
+      "register": "0x014F",
+      "scale": 1,
+      "offset": -40,
+      "unit": "°C",
+      "tolerance": 2,
+      "enforcement": "required",
+      "expected": 2
+    },
+    {
+      "key": "discharge_high_temp",
+      "label": "Высокая температура разрядки",
+      "register": "0x0153",
+      "scale": 1,
+      "offset": -40,
+      "unit": "°C",
+      "tolerance": 2,
+      "enforcement": "required",
+      "expected": 70
+    },
+    {
+      "key": "discharge_low_temp",
+      "label": "Низкая температура разрядки",
+      "register": "0x0157",
+      "scale": 1,
+      "offset": -40,
+      "unit": "°C",
+      "tolerance": 3,
+      "enforcement": "required",
+      "expected": -35
+    },
+    {
+      "key": "balance_start_voltage",
+      "label": "Напряжение запуска балансировки",
+      "register": "0x011A",
+      "scale": 1000,
+      "offset": 0,
+      "unit": "V",
+      "tolerance": 0.05,
+      "enforcement": "required",
+      "expected": 3
+    },
+    {
+      "key": "balance_stop_voltage",
+      "label": "Напряжение остановки балансировки",
+      "register": "0x01FB",
+      "scale": 1000,
+      "offset": 0,
+      "unit": "V",
+      "tolerance": 0.05,
+      "enforcement": "required",
+      "expected": 3.8
+    },
+    {
+      "key": "balance_delta",
+      "label": "Разность напряжений для запуска балансировки",
+      "register": "0x011B",
+      "scale": 1,
+      "offset": 0,
+      "unit": "mV",
+      "tolerance": 0,
+      "enforcement": "required",
+      "expected": 10
+    }
+  ]
+}

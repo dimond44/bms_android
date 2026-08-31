@@ -82,6 +82,10 @@ h3 { margin-bottom: 0; font-size: 17px; }
 .battery-main { min-width: 0; }
 .battery-name { overflow: hidden; display: block; margin-bottom: 5px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
 .battery-uid { overflow: hidden; display: block; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.config-badge { display: inline-flex; max-width: 100%; margin-top: 8px; padding: 4px 7px; overflow: hidden; border-radius: 7px; background: var(--surface-2); color: var(--muted); font-size: 10px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.config-badge.ok { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
+.config-badge.mismatch { background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red); }
+.config-badge.incomplete { background: color-mix(in srgb, var(--yellow) 20%, transparent); color: color-mix(in srgb, var(--yellow-deep) 72%, var(--text)); }
 .battery-side { text-align: right; }
 .battery-soc { display: block; font-size: 17px; font-weight: 800; }
 .battery-status { display: inline-flex; align-items: center; gap: 5px; margin-top: 5px; color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
@@ -102,6 +106,26 @@ h3 { margin-bottom: 0; font-size: 17px; }
 .status-pill { padding: 5px 9px; border-radius: 20px; background: var(--surface-2); color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; }
 .status-pill.online { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
 .card { padding: 20px; border: 1px solid var(--line); border-radius: 17px; background: var(--surface); box-shadow: var(--shadow); }
+.config-check { position: relative; overflow: hidden; border-left: 5px solid var(--muted); }
+.config-check.ok { border-left-color: var(--green); }
+.config-check.mismatch { border-left-color: var(--red); }
+.config-check.incomplete { border-left-color: var(--yellow-deep); }
+.config-check-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.config-check-status { flex: 0 0 auto; padding: 7px 11px; border-radius: 20px; background: var(--surface-2); color: var(--muted); font-size: 11px; font-weight: 800; }
+.config-check-status.ok { background: color-mix(in srgb, var(--green) 14%, transparent); color: var(--green); }
+.config-check-status.mismatch { background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red); }
+.config-check-status.incomplete { background: color-mix(in srgb, var(--yellow) 20%, transparent); color: color-mix(in srgb, var(--yellow-deep) 72%, var(--text)); }
+.config-check-meta { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 14px; color: var(--muted); font-size: 11px; }
+.config-check-details { display: grid; gap: 10px; margin-top: 16px; }
+.config-group { display: grid; gap: 7px; padding: 13px; border-radius: 12px; background: var(--surface-2); }
+.config-group h4 { margin: 0 0 2px; font-size: 12px; }
+.config-group.mismatch { border-left: 3px solid var(--red); }
+.config-group.missing { border-left: 3px solid var(--yellow-deep); }
+.config-group.unverified { border-left: 3px solid var(--muted); }
+.config-item { display: grid; gap: 3px; padding-top: 8px; border-top: 1px solid var(--line); }
+.config-item strong { font-size: 12px; }
+.config-item span { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.config-empty { padding: 14px; border-radius: 10px; background: var(--surface-2); color: var(--muted); text-align: center; }
 .overview { display: grid; grid-template-columns: 270px 1fr; gap: 16px; }
 .soc-card { display: grid; place-items: center; }
 .soc-gauge { --soc: 0; position: relative; width: 180px; aspect-ratio: 1; display: grid; place-items: center; border-radius: 50%; background: conic-gradient(var(--yellow) calc(var(--soc) * 1%), var(--surface-2) 0); }
@@ -193,6 +217,7 @@ dialog input:focus { border-color: var(--yellow-deep); box-shadow: 0 0 0 3px rgb
   .metric { min-height: 105px; padding: 14px; }
   .metric-value { margin-top: 13px; font-size: 21px; }
   .battery-heading { padding: 7px 2px; }
+  .config-check-head { align-items: flex-start; flex-direction: column; }
   h2 { font-size: 22px; }
   .chart-wrap { height: 230px; }
   .history-card { padding: 16px 10px; }
