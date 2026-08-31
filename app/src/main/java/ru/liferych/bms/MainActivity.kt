@@ -53,7 +53,8 @@ private const val REQUEST_ADDRESS: Byte = 0x40
 private const val DATA_LEN: Byte = 0x08
 private const val BLE_LOG_TAG = "LiferychBmsBle"
 
-private const val SERVER_UPLOAD_URL = "http://dimond44.xsph.ru/api/upload.php"
+private const val DEFAULT_ADMIN_SERVER_BASE_URL = "http://192.168.70.142:3000"
+private const val LOCAL_UPLOAD_PATH = "/api/upload.php"
 private const val SERVER_CONFIG_UPLOAD_URL = "http://dimond44.xsph.ru/api/config_upload.php"
 private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_submit.php"
 private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
@@ -265,6 +266,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var configPrefs: SharedPreferences
     private val batteryPrefs by lazy {
         getSharedPreferences("saved_batteries", MODE_PRIVATE)
+    }
+    private val serverPrefs by lazy {
+        getSharedPreferences("admin_server_settings", MODE_PRIVATE)
     }
     private var bleDebugText: String = ""
     private val WARRANTY_MEDIA_REQUEST_CODE = 4501
@@ -3158,6 +3162,33 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
     }
 
+    private fun adminServerBaseUrl(): String {
+        return normalizeAdminServerBaseUrl(
+            serverPrefs.getString("base_url", DEFAULT_ADMIN_SERVER_BASE_URL).orEmpty()
+        )
+    }
+
+    private fun saveAdminServerBaseUrl(input: String) {
+        serverPrefs.edit()
+            .putString("base_url", normalizeAdminServerBaseUrl(input))
+            .apply()
+    }
+
+    private fun adminServerUrl(path: String): String {
+        return adminServerBaseUrl().trimEnd('/') + path
+    }
+
+    private fun normalizeAdminServerBaseUrl(input: String): String {
+        var value = input.trim()
+        if (value.isBlank()) value = DEFAULT_ADMIN_SERVER_BASE_URL
+        if (!value.startsWith("http://", ignoreCase = true) &&
+            !value.startsWith("https://", ignoreCase = true)
+        ) {
+            value = "http://$value"
+        }
+        return value.trimEnd('/')
+    }
+
     private fun showProfileScreen() {
         screenState = "profile"
         currentTab = "profile"
@@ -3233,6 +3264,17 @@ class MainActivity : ComponentActivity() {
         val phone = field("Номер телефона", prefs.getString("phone", "") ?: "", "+7 (___) ___-__-__")
         val email = field("Email", prefs.getString("email", "") ?: "", "name@example.ru")
         val birth = field("Дата рождения", prefs.getString("birth", "") ?: "", "ДД.ММ.ГГГГ")
+        val adminServerUrl = field(
+            "Адрес локальной админки",
+            adminServerBaseUrl(),
+            "http://192.168.70.142:3000"
+        )
+        profileCard.addView(TextView(this).apply {
+            text = "Телеметрия BMS будет отправляться на этот компьютер по адресу ${LOCAL_UPLOAD_PATH}. Если работаете с другого ПК, поменяйте IP и нажмите «Сохранить»."
+            textSize = 12f
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(0, dp(8), 0, 0)
+        })
         content.addView(profileCard)
         content.addView(TextView(this).apply {
             text = "СОХРАНИТЬ"
@@ -3246,7 +3288,8 @@ class MainActivity : ComponentActivity() {
                     .putString("phone", phone.text.toString())
                     .putString("email", email.text.toString())
                     .putString("birth", birth.text.toString()).apply()
-                toast("Профиль сохранён")
+                saveAdminServerBaseUrl(adminServerUrl.text.toString())
+                toast("Профиль и адрес админки сохранены")
             }
         }, marginLp(-1, dp(54), 0, 14, 0, 0))
         scroll.addView(content)
@@ -5208,7 +5251,7 @@ class MainActivity : ComponentActivity() {
             var statusMessage = ""
             var ok = false
             try {
-                val conn = (URL(SERVER_UPLOAD_URL).openConnection() as HttpURLConnection).apply {
+                val conn = (URL(adminServerUrl(LOCAL_UPLOAD_PATH)).openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     connectTimeout = 8000
                     readTimeout = 8000

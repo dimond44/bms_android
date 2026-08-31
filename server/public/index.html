@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>ЛИФЕРЫЧ BMS — админка</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="ЛИФЕРЫЧ BMS">
+        <span class="brand-mark">BMS</span>
+        <span>ЛИФЕРЫЧ <b>BMS</b></span>
+      </a>
+      <div class="topbar-actions">
+        <div class="server-state" id="serverState"><i></i><span>Подключение…</span></div>
+        <span class="updated" id="updatedAt">Ещё не обновлялось</span>
+        <button class="icon-button" id="refreshButton" type="button" title="Обновить" aria-label="Обновить">
+          <span class="refresh-icon">↻</span>
+        </button>
+        <button class="icon-button" id="themeButton" type="button" title="Сменить тему" aria-label="Сменить тему">☾</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <div class="sidebar-title">
+          <div><span class="eyebrow">Парк устройств</span><h1>Аккумуляторы</h1></div>
+          <span class="count" id="batteryCount">0</span>
+        </div>
+        <label class="search">
+          <span>⌕</span>
+          <input id="searchInput" type="search" placeholder="Имя, UID или адрес" autocomplete="off">
+        </label>
+        <div class="battery-list" id="batteryList" aria-live="polite">
+          <div class="list-message">Загрузка аккумуляторов…</div>
+        </div>
+      </aside>
+
+      <section class="content" id="content">
+        <div class="empty-state" id="emptyState">
+          <div class="empty-icon">⚡</div>
+          <h2>Выберите аккумулятор</h2>
+          <p>Данные телеметрии, состояние ячеек и история появятся здесь.</p>
+        </div>
+
+        <div class="dashboard hidden" id="dashboard">
+          <div class="battery-heading">
+            <div>
+              <div class="heading-line">
+                <h2 id="batteryName">Аккумулятор</h2>
+                <span class="status-pill" id="onlineStatus">—</span>
+              </div>
+              <p class="identity"><span id="batteryUid">—</span><span id="batteryAddress">—</span></p>
+              <p class="last-seen" id="lastSeen">—</p>
+            </div>
+          </div>
+
+          <section class="overview">
+            <article class="soc-card card">
+              <div class="soc-gauge" id="socGauge">
+                <div><strong id="socValue">—</strong><span>%</span><small>заряд</small></div>
+              </div>
+              <div class="soc-caption"><span>Осталось</span><strong id="remainingValue">—</strong></div>
+            </article>
+            <div class="metric-grid" id="metricGrid"></div>
+          </section>
+
+          <section class="two-column">
+            <article class="card">
+              <div class="section-title"><div><span class="eyebrow">Состояние</span><h3>MOS-ключи</h3></div></div>
+              <div class="mos-grid">
+                <div class="mos" id="chargeMos"><i></i><span>Заряд</span><strong>—</strong></div>
+                <div class="mos" id="dischargeMos"><i></i><span>Разряд</span><strong>—</strong></div>
+              </div>
+            </article>
+            <article class="card">
+              <div class="section-title"><div><span class="eyebrow">Датчики</span><h3>Температуры</h3></div><span class="section-meta" id="tempRange">—</span></div>
+              <div class="temperature-list" id="temperatureList"></div>
+            </article>
+          </section>
+
+          <article class="card">
+            <div class="section-title"><div><span class="eyebrow">Балансировка</span><h3>Напряжения ячеек</h3></div><span class="section-meta" id="cellRange">—</span></div>
+            <div class="cell-list" id="cellList"></div>
+          </article>
+
+          <article class="card chart-card">
+            <div class="section-title">
+              <div><span class="eyebrow">Динамика</span><h3>История показаний</h3></div>
+              <div class="legend"><span class="legend-soc"><i></i>SOC</span><span class="legend-voltage"><i></i>Напряжение</span></div>
+            </div>
+            <div class="chart-wrap"><canvas id="historyChart"></canvas><div id="chartEmpty" class="chart-empty hidden">Недостаточно данных для графика</div></div>
+          </article>
+
+          <section class="two-column alerts-grid">
+            <article class="card">
+              <div class="section-title"><div><span class="eyebrow">Диагностика</span><h3>Ошибки</h3></div><span class="count subtle" id="errorCount">0</span></div>
+              <div class="feed" id="errorList"></div>
+            </article>
+            <article class="card">
+              <div class="section-title"><div><span class="eyebrow">Журнал</span><h3>События</h3></div></div>
+              <div class="feed" id="eventList"></div>
+            </article>
+          </section>
+
+          <article class="card history-card">
+            <div class="section-title"><div><span class="eyebrow">Архив</span><h3>Последние записи</h3></div><span class="section-meta" id="historyCount">0 записей</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Время</th><th>SOC</th><th>Напряжение</th><th>Ток</th><th>Δ ячеек</th><th>Температура</th><th>Ошибки</th></tr></thead>
+                <tbody id="historyBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast hidden" id="toast" role="status"></div>
+
+    <dialog id="keyDialog">
+      <form method="dialog" id="keyForm">
+        <div class="dialog-mark">⚡</div>
+        <span class="eyebrow">Локальная авторизация</span>
+        <h2>Подключение к BMS</h2>
+        <p>Введите API-ключ локального сервера. Он сохранится только в этом браузере.</p>
+        <label>API-ключ<input id="keyInput" type="password" required autocomplete="current-password" value="change_me_api_key_2026"></label>
+        <p class="form-error hidden" id="keyError">Ключ не подходит. Проверьте значение и повторите.</p>
+        <button class="primary-button" type="submit">Подключиться</button>
+      </form>
+    </dialog>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
