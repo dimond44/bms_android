@@ -21,6 +21,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.TextUtils
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.widget.*
@@ -50,6 +51,7 @@ import kotlin.math.min
 private const val FRAME_START: Byte = 0xA5.toByte()
 private const val REQUEST_ADDRESS: Byte = 0x40
 private const val DATA_LEN: Byte = 0x08
+private const val BLE_LOG_TAG = "LiferychBmsBle"
 
 private const val SERVER_UPLOAD_URL = "http://dimond44.xsph.ru/api/upload.php"
 private const val SERVER_CONFIG_UPLOAD_URL = "http://dimond44.xsph.ru/api/config_upload.php"
@@ -96,8 +98,11 @@ data class DalyData(
     var tempCount: Int? = null,
     var chargerConnected: Boolean? = null,
     var loadConnected: Boolean? = null,
+    var cycles: Int? = null,
+    var lastUpdatedAt: Long = 0L,
     val cells: MutableMap<Int, Double> = sortedMapOf(),
     val temps: MutableMap<Int, Int> = sortedMapOf(),
+    val balancingCells: MutableSet<Int> = sortedSetOf(),
     val raw: MutableMap<String, String> = linkedMapOf(),
     val errors: MutableList<String> = mutableListOf()
 )
@@ -117,6 +122,143 @@ data class SavedBattery(
     val capacityAh: Double?,
     val lastSeenAt: Long
 )
+
+private class SectionSwipeScrollView(
+    context: Context,
+    private val onSectionSwipe: (direction: Int) -> Unit
+) : ScrollView(context) {
+    private var downX = 0f
+    private var downY = 0f
+
+    override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean {
+        when (event.actionMasked) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                downX = event.x
+                downY = event.y
+            }
+            android.view.MotionEvent.ACTION_UP -> {
+                val dx = event.x - downX
+                val dy = event.y - downY
+                val threshold = 72f * resources.displayMetrics.density
+                if (kotlin.math.abs(dx) >= threshold &&
+                    kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.35f
+                ) {
+                    onSectionSwipe(if (dx < 0f) 1 else -1)
+                }
+            }
+        }
+        return super.dispatchTouchEvent(event)
+    }
+}
+
+private class BatteryIconView(
+    context: Context,
+    private val iconColor: Int,
+    private val iconSizeDp: Float = 23f
+) : View(context) {
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = iconColor
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val scale = minOf(width.toFloat(), height.toFloat(), iconSizeDp * resources.displayMetrics.density) / 24f
+        val offsetX = (width - 24f * scale) / 2f
+        val offsetY = (height - 24f * scale) / 2f
+        fun x(value: Float) = offsetX + value * scale
+        fun y(value: Float) = offsetY + value * scale
+        stroke.strokeWidth = 1.8f * scale
+
+        canvas.drawRoundRect(
+            x(3.5f),
+            y(7f),
+            x(18f),
+            y(17f),
+            2f * scale,
+            2f * scale,
+            stroke
+        )
+        canvas.drawLine(x(19.5f), y(10f), x(19.5f), y(14f), stroke)
+        canvas.drawLine(x(9f), y(9.8f), x(9f), y(14.2f), stroke)
+        canvas.drawLine(x(6.8f), y(12f), x(11.2f), y(12f), stroke)
+    }
+}
+
+private class BluetoothIconView(
+    context: Context,
+    private val iconColor: Int
+) : View(context) {
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = iconColor
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val scale = minOf(width, height) / 24f
+        val offsetX = (width - 24f * scale) / 2f
+        val offsetY = (height - 24f * scale) / 2f
+        // Canvas scaling also scales the stroke, so keep it in SVG coordinates.
+        stroke.strokeWidth = 1.8f
+        canvas.save()
+        canvas.translate(offsetX, offsetY)
+        canvas.scale(scale, scale)
+        canvas.drawPath(Path().apply {
+            moveTo(12f, 3f)
+            lineTo(12f, 21f)
+            lineTo(18f, 15f)
+            lineTo(12f, 12f)
+            lineTo(18f, 9f)
+            close()
+            moveTo(6f, 7f)
+            lineTo(12f, 12f)
+            lineTo(6f, 17f)
+        }, stroke)
+        canvas.restore()
+    }
+}
+
+private class QrIconView(
+    context: Context,
+    private val iconColor: Int
+) : View(context) {
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = iconColor
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val scale = minOf(width, height) / 24f
+        val offsetX = (width - 24f * scale) / 2f
+        val offsetY = (height - 24f * scale) / 2f
+        // Canvas scaling also scales the stroke, so keep it in SVG coordinates.
+        stroke.strokeWidth = 1.8f
+        canvas.save()
+        canvas.translate(offsetX, offsetY)
+        canvas.scale(scale, scale)
+        canvas.drawRect(4f, 4f, 10f, 10f, stroke)
+        canvas.drawRect(14f, 4f, 20f, 10f, stroke)
+        canvas.drawRect(4f, 14f, 10f, 20f, stroke)
+        listOf(
+            floatArrayOf(16f, 14f, 17.5f, 14f),
+            floatArrayOf(14f, 16f, 16f, 16f),
+            floatArrayOf(18f, 16f, 20f, 16f),
+            floatArrayOf(14f, 18f, 15.5f, 18f),
+            floatArrayOf(17.5f, 18f, 20f, 18f),
+            floatArrayOf(18f, 14f, 18f, 15.5f),
+            floatArrayOf(20f, 18f, 20f, 20f)
+        ).forEach { canvas.drawLine(it[0], it[1], it[2], it[3], stroke) }
+        canvas.restore()
+    }
+}
 
 @androidx.annotation.OptIn(markerClass = [androidx.camera.core.ExperimentalGetImage::class])
 class MainActivity : ComponentActivity() {
@@ -197,6 +339,14 @@ class MainActivity : ComponentActivity() {
     private var lastKnownChargeMosTextText: String? = null
     private var lastKnownDischargeMosTextText: String? = null
     private var polling = false
+    private var pollLoopToken = 0
+    private var runtimeCommands: List<Int> = emptyList()
+    private var runtimeCommandIndex = 0
+    private var pendingRuntimeCommand: Int? = null
+    private var runtimeExpectedFrames = 1
+    private val runtimeReceivedGroups: MutableSet<Int> = mutableSetOf()
+    private var negotiatedMtu = 23
+    private var servicesDiscoveryStarted = false
     private var selectedAddress: String? = null
     private var selectedDeviceName: String = ""
     private var lastBatterySnapshotSavedAt: Long = 0L
@@ -254,6 +404,24 @@ class MainActivity : ComponentActivity() {
         bluetoothAdapter = manager.adapter
         requestBlePermissions()
         showSplashScreen()
+        val debugAddress = intent.getStringExtra("debug_connect_address")
+        val isDebuggable =
+            (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        if (isDebuggable && !debugAddress.isNullOrBlank() && hasBlePermissions()) {
+            val saved = loadSavedBatteries().firstOrNull { it.address == debugAddress }
+                ?: SavedBattery(
+                    address = debugAddress,
+                    bluetoothName = "Daly BMS",
+                    customName = "Daly BMS",
+                    soc = null,
+                    capacityAh = null,
+                    lastSeenAt = 0L
+                )
+            val displayName = saved.customName.ifBlank {
+                saved.bluetoothName.ifBlank { saved.address }
+            }
+            mainHandler.postDelayed({ connectSavedBattery(saved, displayName) }, 400)
+        }
     }
 
     private fun showSplashScreen() {
@@ -317,12 +485,10 @@ class MainActivity : ComponentActivity() {
                 startScan()
             }
         }
-        connect.addView(TextView(this).apply {
-            text = "ᛒ"
-            textSize = 25f
-            setTextColor(Color.rgb(16, 17, 20))
-            gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(dp(34), dp(42)))
+        connect.addView(
+            BluetoothIconView(this, Color.rgb(16, 17, 20)),
+            LinearLayout.LayoutParams(dp(34), dp(42))
+        )
         connect.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
@@ -353,12 +519,10 @@ class MainActivity : ComponentActivity() {
             isFocusable = true
             background = round(Color.rgb(251, 251, 252), dp(16), Color.rgb(202, 211, 220), 1)
             elevation = dp(3).toFloat()
-            addView(TextView(this@MainActivity).apply {
-                text = "▦"
-                textSize = 22f
-                setTextColor(Color.rgb(16, 17, 20))
-                gravity = Gravity.CENTER
-            }, LinearLayout.LayoutParams(dp(34), dp(40)))
+            addView(
+                QrIconView(this@MainActivity, Color.rgb(16, 17, 20)),
+                LinearLayout.LayoutParams(dp(34), dp(40))
+            )
             addView(TextView(this@MainActivity).apply {
                 text = "Проверить ячейку по QR-коду"
                 textSize = 15f
@@ -399,6 +563,10 @@ class MainActivity : ComponentActivity() {
             setTextColor(redDark)
             typeface = interFont(760)
             gravity = Gravity.CENTER
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Позвонить в Лиферыч"
+            setOnClickListener { dialPhone("+79320781011") }
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
@@ -410,8 +578,21 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(12), dp(16), dp(12), dp(16))
             background = round(Color.rgb(251, 251, 252), dp(18), Color.rgb(202, 211, 220), 1)
         }
-        listOf("TG", "MAX", "VK").forEach { label ->
-            val slot = FrameLayout(this)
+        listOf(
+            Triple("TG", "Telegram", "https://t.me/liferych"),
+            Triple(
+                "MAX",
+                "MAX",
+                "https://max.ru/u/f9LHodD0cOIwPdSddb5TLuiLTMRCIkIpTzgUzr_f2iEj89DXpt_Mh2zXvcc"
+            ),
+            Triple("VK", "ВКонтакте", "https://vk.ru/liferych")
+        ).forEach { (label, messengerName, url) ->
+            val slot = FrameLayout(this).apply {
+                isClickable = true
+                isFocusable = true
+                contentDescription = "Открыть $messengerName"
+                setOnClickListener { openExternalUrl(url) }
+            }
             slot.addView(TextView(this).apply {
                 text = label
                 gravity = Gravity.CENTER
@@ -809,11 +990,10 @@ class MainActivity : ComponentActivity() {
             ).apply { leftMargin = dp(10) })
         }
         top.addView(brand, LinearLayout.LayoutParams(0, dp(56), 1f))
-        top.addView(TextView(this).apply {
-            text = "+"
-            textSize = 28f
-            gravity = Gravity.CENTER
-            setTextColor(Color.rgb(16, 17, 20))
+        top.addView(BatteryIconView(this, Color.rgb(16, 17, 20)).apply {
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Добавить батарею"
             background = round(Color.rgb(246, 247, 249), dp(19), Color.rgb(223, 229, 235), 1)
             setOnClickListener {
                 disconnectGatt()
@@ -876,11 +1056,10 @@ class MainActivity : ComponentActivity() {
                 intArrayOf(Color.rgb(255, 217, 87), Color.rgb(255, 196, 0))
             ).apply { cornerRadius = dp(15).toFloat() }
             elevation = dp(4).toFloat()
-            addView(TextView(this@MainActivity).apply {
-                text = "+▣"
-                textSize = 21f
-                gravity = Gravity.CENTER
-                setTextColor(Color.rgb(16, 17, 20))
+            addView(BatteryIconView(
+                this@MainActivity,
+                Color.rgb(16, 17, 20)
+            ).apply {
                 background = round(Color.argb(120, 255, 255, 255), dp(11), Color.rgb(210, 180, 60), 1)
             }, LinearLayout.LayoutParams(dp(36), dp(36)))
             addView(TextView(this@MainActivity).apply {
@@ -1026,17 +1205,28 @@ class MainActivity : ComponentActivity() {
                 leftMargin = dp(12)
             })
 
-            addView(TextView(this@MainActivity).apply {
-                text = "♢\n›"
-                textSize = 22f
+            val linkColor = when {
+                isTest -> redDark
+                connected -> Color.rgb(31, 179, 90)
+                else -> Color.rgb(111, 119, 129)
+            }
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
-                setTextColor(
-                    when {
-                        isTest -> redDark
-                        connected -> Color.rgb(31, 179, 90)
-                        else -> Color.rgb(111, 119, 129)
-                    }
-                )
+                addView(BatteryIconView(this@MainActivity, linkColor, 17f).apply {
+                    background = round(
+                        Color.rgb(246, 247, 249),
+                        dp(10),
+                        Color.rgb(223, 229, 235),
+                        1
+                    )
+                }, LinearLayout.LayoutParams(dp(30), dp(30)))
+                addView(TextView(this@MainActivity).apply {
+                    text = "›"
+                    textSize = 22f
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.rgb(111, 119, 129))
+                }, LinearLayout.LayoutParams(dp(30), dp(24)))
             }, LinearLayout.LayoutParams(dp(34), -1))
 
             setOnClickListener {
@@ -1700,7 +1890,9 @@ class MainActivity : ComponentActivity() {
         fixedTabs.addView(manageTabs(), LinearLayout.LayoutParams(-1, dp(46)))
         root.addView(fixedTabs, LinearLayout.LayoutParams(-1, -2))
 
-        val scroll = ScrollView(this)
+        val scroll = SectionSwipeScrollView(this) { direction ->
+            switchManageSection(direction)
+        }
         manageContentLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(10), dp(16), dp(14))
@@ -1712,6 +1904,15 @@ class MainActivity : ComponentActivity() {
 
         setContentView(root)
         renderManageContent()
+    }
+
+    private fun switchManageSection(direction: Int) {
+        val sections = listOf("general", "voltage_current", "temperature", "balancing")
+        val currentIndex = sections.indexOf(manageSection).coerceAtLeast(0)
+        val nextIndex = (currentIndex + direction).coerceIn(sections.indices)
+        if (nextIndex == currentIndex) return
+        manageSection = sections[nextIndex]
+        showManageScreen()
     }
 
     private fun renderManageContent() {
@@ -1944,10 +2145,10 @@ class MainActivity : ComponentActivity() {
         manageContentLayout.addView(manageSectionCard(
             "4. Настройка балансировки",
             listOf(
-                "Напряжение включения балансировки" to regVoltageOneDecimal(0x0228),
+                "Напряжение включения балансировки" to regVoltageOneDecimal(0x01FA),
                 "Напряжение отключения балансировки" to regText(0x01FB, 1000.0, "V"),
                 "Перепад напряжения при открытии балансировки" to regText(0x0156, 1000.0, "V"),
-                "Ток включения балансировки" to regText(0x0151, 1000.0, "A"),
+                "Ток включения балансировки" to regCurrentOneDecimal(0x0151),
                 "Переключатель активной балансировки" to balanceSwitchText(0x0220)
             )
         ), marginLp(-1, -2, 0, 0, 0, 12))
@@ -2066,6 +2267,11 @@ class MainActivity : ComponentActivity() {
         return "%.1f V".format(raw / 1000.0).replace(",", ".")
     }
 
+    private fun regCurrentOneDecimal(addr: Int): String {
+        val raw = configRegisters[addr] ?: return readOnlyUnavailable()
+        return "%.1f A".format(raw / 1000.0).replace(",", ".")
+    }
+
     private fun configNum(addr: Int, scale: Double): Double? {
         val raw = configRegisters[addr] ?: return null
         return raw / scale
@@ -2124,7 +2330,7 @@ class MainActivity : ComponentActivity() {
         checkTemp("Низкая температура разрядки", 0x0157, -35, 3)
 
         if (!isRedDl) {
-            checkV("Балансировка старт", 0x0228, 3.00, 0.05)
+            checkV("Балансировка старт", 0x01FA, 3.00, 0.05)
             checkV("Балансировка стоп", 0x01FB, 3.80, 0.05)
         }
 
@@ -4114,6 +4320,7 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("MissingPermission")
     private fun disconnectGatt() {
         polling = false
+        pollLoopToken++
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
@@ -4124,10 +4331,16 @@ class MainActivity : ComponentActivity() {
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            Log.i(
+                BLE_LOG_TAG,
+                "connection address=${gatt.device.address} status=$status state=$newState"
+            )
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 configAutoReadStartedForConnection = false
                 templateCheckShownForConnection = false
                 testSocWriteDoneForConnection = false
+                servicesDiscoveryStarted = false
+                negotiatedMtu = 23
                 runOnUiThread {
                     if (::statusText.isInitialized) statusText.text = "Подключено. Читаю сервисы..."
                     selectedAddress?.let { address ->
@@ -4154,9 +4367,18 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-                gatt.discoverServices()
+                val mtuRequested =
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP &&
+                        gatt.requestMtu(247)
+                Log.i(BLE_LOG_TAG, "request MTU 247 started=$mtuRequested")
+                if (!mtuRequested) {
+                    discoverGattServicesOnce(gatt)
+                } else {
+                    mainHandler.postDelayed({ discoverGattServicesOnce(gatt) }, 1500)
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 polling = false
+                pollLoopToken++
                 configAutoReadStartedForConnection = false
                 runOnUiThread {
                     selectedAddress?.let { address ->
@@ -4191,7 +4413,23 @@ class MainActivity : ComponentActivity() {
         }
 
         @SuppressLint("MissingPermission")
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            negotiatedMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23
+            Log.i(BLE_LOG_TAG, "MTU changed mtu=$mtu status=$status")
+            discoverGattServicesOnce(gatt)
+        }
+
+        @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            Log.i(BLE_LOG_TAG, "services discovered status=$status count=${gatt.services.size}")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                runOnUiThread {
+                    toast("Не удалось прочитать BLE-сервисы: $status")
+                    showBatteriesScreen()
+                }
+                gatt.disconnect()
+                return
+            }
             detectCharacteristics(gatt)
 
             if (writeCharacteristic == null || notifyCharacteristic == null) {
@@ -4223,10 +4461,15 @@ class MainActivity : ComponentActivity() {
             }
             enableNotifications(gatt, notifyCharacteristic!!)
             polling = true
-            mainHandler.postDelayed({ pollOnce() }, 700)
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            Log.i(BLE_LOG_TAG, "CCCD write uuid=${descriptor.uuid} status=$status")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                polling = false
+                runOnUiThread { toast("BMS не разрешила получение данных: $status") }
+                return
+            }
             if (polling) {
                 if (!configAutoReadStartedForConnection) {
                     configAutoReadStartedForConnection = true
@@ -4245,12 +4488,22 @@ class MainActivity : ComponentActivity() {
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             val bytes = characteristic.value ?: return
+            Log.d(BLE_LOG_TAG, "notify ${characteristic.uuid}: ${bytesToHex(bytes)}")
             handleIncoming(bytes)
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+            Log.d(BLE_LOG_TAG, "notify ${characteristic.uuid}: ${bytesToHex(value)}")
             handleIncoming(value)
         }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun discoverGattServicesOnce(gatt: BluetoothGatt) {
+        if (servicesDiscoveryStarted || bluetoothGatt !== gatt) return
+        servicesDiscoveryStarted = true
+        val started = gatt.discoverServices()
+        Log.i(BLE_LOG_TAG, "discover services started=$started mtu=$negotiatedMtu")
     }
 
     private fun detectCharacteristics(gatt: BluetoothGatt) {
@@ -4288,15 +4541,34 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        for (uuid in preferredNotify) {
-            notifyCandidate = allChars.firstOrNull { it.uuid == uuid && canNotify(it) }
-            if (notifyCandidate != null) break
+        for (service in gatt.services) {
+            val chars = service.characteristics
+            val sameServiceNotify = preferredNotify.firstNotNullOfOrNull { uuid ->
+                chars.firstOrNull { it.uuid == uuid && canNotify(it) }
+            } ?: chars.firstOrNull { canNotify(it) }
+            val sameServiceWrite = preferredWrite.firstNotNullOfOrNull { uuid ->
+                chars.firstOrNull { it.uuid == uuid && canWrite(it) }
+            } ?: chars.firstOrNull { canWrite(it) }
+            if (sameServiceNotify != null && sameServiceWrite != null) {
+                notifyCandidate = sameServiceNotify
+                writeCandidate = sameServiceWrite
+                break
+            }
+        }
+
+        if (notifyCandidate == null) {
+            for (uuid in preferredNotify) {
+                notifyCandidate = allChars.firstOrNull { it.uuid == uuid && canNotify(it) }
+                if (notifyCandidate != null) break
+            }
         }
         if (notifyCandidate == null) notifyCandidate = allChars.firstOrNull { canNotify(it) }
 
-        for (uuid in preferredWrite) {
-            writeCandidate = allChars.firstOrNull { it.uuid == uuid && canWrite(it) }
-            if (writeCandidate != null) break
+        if (writeCandidate == null) {
+            for (uuid in preferredWrite) {
+                writeCandidate = allChars.firstOrNull { it.uuid == uuid && canWrite(it) }
+                if (writeCandidate != null) break
+            }
         }
         if (writeCandidate == null) writeCandidate = allChars.firstOrNull { canWrite(it) }
 
@@ -4314,39 +4586,76 @@ class MainActivity : ComponentActivity() {
             }
         }
         bleDebugText = sb.toString()
+        Log.i(BLE_LOG_TAG, bleDebugText)
     }
 
     @SuppressLint("MissingPermission")
     private fun enableNotifications(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-        gatt.setCharacteristicNotification(ch, true)
+        val localEnabled = gatt.setCharacteristicNotification(ch, true)
+        Log.i(BLE_LOG_TAG, "enable notifications uuid=${ch.uuid} local=$localEnabled")
         val descriptor = ch.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG)
         if (descriptor != null) {
-            descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            descriptor.value = if (
+                (ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0 &&
+                (ch.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) == 0
+            ) {
+                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            } else {
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            }
             gatt.writeDescriptor(descriptor)
+        } else {
+            Log.w(BLE_LOG_TAG, "CCCD descriptor is missing for ${ch.uuid}")
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun pollOnce() {
+        val token = ++pollLoopToken
+        mainHandler.post { pollOnce(token) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun pollOnce(token: Int) {
+        if (token != pollLoopToken) return
         if (!polling) return
         if (configReadInProgress) {
-            mainHandler.postDelayed({ pollOnce() }, 1000)
+            mainHandler.postDelayed({ pollOnce(token) }, 1000)
             return
         }
         val gatt = bluetoothGatt ?: return
         val ch = writeCharacteristic ?: return
-        val commands = listOf(0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98)
-        sendCommandQueue(gatt, ch, commands, 0)
+        runtimeCommands = listOf(0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98)
+        runtimeCommandIndex = 0
+        pendingRuntimeCommand = null
+        sendCurrentRuntimeCommand(gatt, ch, token)
     }
 
     @SuppressLint("MissingPermission")
-    private fun sendCommandQueue(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, commands: List<Int>, index: Int) {
+    private fun sendCurrentRuntimeCommand(
+        gatt: BluetoothGatt,
+        ch: BluetoothGattCharacteristic,
+        token: Int
+    ) {
+        if (token != pollLoopToken) return
         if (!polling) return
-        if (index >= commands.size) {
-            mainHandler.postDelayed({ pollOnce() }, 4000)
+        if (configReadInProgress) {
+            mainHandler.postDelayed({ pollOnce(token) }, 1000)
             return
         }
-        val frame = buildRequest(commands[index])
+        if (runtimeCommandIndex >= runtimeCommands.size) {
+            mainHandler.postDelayed({ pollOnce(token) }, 4000)
+            return
+        }
+        val command = runtimeCommands[runtimeCommandIndex]
+        pendingRuntimeCommand = command
+        runtimeReceivedGroups.clear()
+        runtimeExpectedFrames = when (command) {
+            0x95 -> ((data.cellCount ?: 1) + 2) / 3
+            0x96 -> ((data.tempCount ?: 1) + 6) / 7
+            else -> 1
+        }.coerceAtLeast(1)
+        val frame = buildRequest(command)
         val props = ch.properties
         ch.writeType = if ((props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
@@ -4354,19 +4663,71 @@ class MainActivity : ComponentActivity() {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         }
         ch.value = frame
-        gatt.writeCharacteristic(ch)
-        mainHandler.postDelayed({ sendCommandQueue(gatt, ch, commands, index + 1) }, 180)
+        val started = gatt.writeCharacteristic(ch)
+        Log.d(
+            BLE_LOG_TAG,
+            "request cmd=0x%02X write=$started uuid=${ch.uuid}: ${bytesToHex(frame)}"
+                .format(command)
+        )
+        if (!started) {
+            pendingRuntimeCommand = null
+            mainHandler.postDelayed({ sendCurrentRuntimeCommand(gatt, ch, token) }, 250)
+            return
+        }
+        mainHandler.postDelayed({
+            if (
+                token == pollLoopToken &&
+                pendingRuntimeCommand == command &&
+                runtimeCommandIndex < runtimeCommands.size
+            ) {
+                Log.w(BLE_LOG_TAG, "timeout waiting response cmd=0x%02X".format(command))
+                pendingRuntimeCommand = null
+                runtimeCommandIndex++
+                sendCurrentRuntimeCommand(gatt, ch, token)
+            }
+        }, 1800)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun completeRuntimeCommand(cmd: Int, payload: ByteArray) {
+        if (pendingRuntimeCommand != cmd) return
+        if (cmd == 0x95 || cmd == 0x96) {
+            runtimeReceivedGroups.add(payload[0].toInt() and 0xFF)
+            if (runtimeReceivedGroups.size < runtimeExpectedFrames) return
+        }
+        pendingRuntimeCommand = null
+        runtimeCommandIndex++
+        val token = pollLoopToken
+        val gatt = bluetoothGatt ?: return
+        val ch = writeCharacteristic ?: return
+        mainHandler.postDelayed({ sendCurrentRuntimeCommand(gatt, ch, token) }, 120)
     }
 
     private fun handleIncoming(bytes: ByteArray) {
-        // During configuration read original Daly app uses Modbus RTU over BLE (FFF2/FFF1).
-        // These frames do not start with A5, so route them to the Modbus parser.
-        if (configReadInProgress || activeConfigRead != null) {
+        if (bytes.isEmpty()) return
+        val startsWithDalyFrame = bytes[0] == FRAME_START
+        val hasPendingConfigFrame =
+            synchronized(configModbusBuffer) { configModbusBuffer.isNotEmpty() }
+        val startsWithModbusFrame =
+            bytes.size >= 2 &&
+                (bytes[1].toInt() and 0xFF) in setOf(0x03, 0x06, 0x10, 0x83, 0x86, 0x90)
+        // Runtime A5 frames can still arrive while a Modbus settings request is active.
+        // They must stay in the normal parser instead of poisoning the Modbus buffer.
+        if (
+            (configReadInProgress || activeConfigRead != null) &&
+            !startsWithDalyFrame &&
+            (startsWithModbusFrame || hasPendingConfigFrame)
+        ) {
             handleConfigModbusIncoming(bytes)
             runOnUiThread { updateDashboardUi() }
             return
         }
 
+        handleDalyIncoming(bytes)
+        runOnUiThread { updateDashboardUi() }
+    }
+
+    private fun handleDalyIncoming(bytes: ByteArray) {
         synchronized(rxBuffer) {
             for (b in bytes) rxBuffer.add(b)
             while (rxBuffer.size >= 13) {
@@ -4377,12 +4738,16 @@ class MainActivity : ComponentActivity() {
                 }
                 repeat(start) { rxBuffer.removeAt(0) }
                 if (rxBuffer.size < 13) break
-                val frame = ByteArray(13)
-                for (i in 0 until 13) frame[i] = rxBuffer.removeAt(0)
-                if (isValidFrame(frame)) parseFrame(frame)
+                val frame = ByteArray(13) { index -> rxBuffer[index] }
+                if (isValidFrame(frame)) {
+                    repeat(13) { rxBuffer.removeAt(0) }
+                    parseFrame(frame)
+                } else {
+                    Log.w(BLE_LOG_TAG, "invalid Daly frame: ${bytesToHex(frame)}")
+                    rxBuffer.removeAt(0)
+                }
             }
         }
-        runOnUiThread { updateDashboardUi() }
     }
 
     private fun parseFrame(frame: ByteArray) {
@@ -4416,6 +4781,7 @@ class MainActivity : ComponentActivity() {
                 data.tempCount = p[1].toInt() and 0xFF
                 data.chargerConnected = (p[2].toInt() and 0xFF) != 0
                 data.loadConnected = (p[3].toInt() and 0xFF) != 0
+                data.cycles = u16(p, 5)
             }
             0x95 -> {
                 val group = p[0].toInt() and 0xFF
@@ -4439,6 +4805,21 @@ class MainActivity : ComponentActivity() {
                     if (raw != 0x00 && raw != 0xFF) data.temps[tempNo] = raw - 40
                 }
             }
+            0x97 -> {
+                data.balancingCells.clear()
+                for (byteIndex in 0 until 6) {
+                    val mask = p[byteIndex].toInt() and 0xFF
+                    for (bit in 0..7) {
+                        if (((mask shr bit) and 1) != 0) {
+                            val cellNo = byteIndex * 8 + bit + 1
+                            val count = data.cellCount
+                            if (count == null || cellNo <= count) {
+                                data.balancingCells.add(cellNo)
+                            }
+                        }
+                    }
+                }
+            }
             0x98 -> {
                 data.errors.clear()
                 for (byteIndex in p.indices) {
@@ -4455,7 +4836,10 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        data.lastUpdatedAt = System.currentTimeMillis()
+        Log.d(BLE_LOG_TAG, "parsed cmd=0x%02X".format(cmd))
         updateDerived()
+        completeRuntimeCommand(cmd, p)
 
         if (cmd == 0x98) {
             onPollCompleted()
@@ -4507,15 +4891,24 @@ class MainActivity : ComponentActivity() {
             t1Text.text = "${t1?.toString() ?: "--"} °C"
             t2Text.text = "${t2?.toString() ?: "--"} °C"
         }
-        balanceValue.text = if (data.errors.isEmpty()) "Нормальный" else "Внимание"
+        balanceValue.text = when {
+            data.errors.isNotEmpty() -> "Внимание"
+            data.balancingCells.isNotEmpty() -> "Балансировка"
+            else -> "Нормальный"
+        }
         balanceValue.setTextColor(
-            if (data.errors.isEmpty()) Color.rgb(31, 179, 90) else Color.rgb(239, 83, 80)
+            when {
+                data.errors.isNotEmpty() -> Color.rgb(239, 83, 80)
+                data.balancingCells.isNotEmpty() -> Color.rgb(255, 153, 0)
+                else -> Color.rgb(31, 179, 90)
+            }
         )
         val device = selectedDeviceName.ifBlank { selectedAddress ?: "не выбрано" }
+        val cycles = data.cycles?.let { " · Циклов: $it" }.orEmpty()
         batteryInfoText.text = if (data.errors.isEmpty()) {
-            "✓  Нормальное состояние · Устройство: $device"
+            "✓  Нормальное состояние · Устройство: $device$cycles"
         } else {
-            "!  Требуется внимание · Устройство: $device"
+            "!  Требуется внимание · Устройство: $device$cycles"
         }
 
         renderCells()
@@ -4883,6 +5276,8 @@ class MainActivity : ComponentActivity() {
         val ch = writeCharacteristic ?: return
 
         configReadInProgress = true
+        pollLoopToken++
+        pendingRuntimeCommand = null
         activeConfigRead = null
         configModbusBuffer.clear()
 
@@ -5010,6 +5405,10 @@ class MainActivity : ComponentActivity() {
         ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         ch.value = frame
         val writeOk = gatt.writeCharacteristic(ch)
+        Log.d(
+            BLE_LOG_TAG,
+            "config request ${req.name} write=$writeOk uuid=${ch.uuid}: ${bytesToHex(frame)}"
+        )
         configRaw["write_${req.name}"] = if (writeOk) "ok" else "failed"
         refreshManageIfVisible()
 
@@ -5030,11 +5429,15 @@ class MainActivity : ComponentActivity() {
             while (true) {
                 if (configModbusBuffer.size < 5) return
 
-                // В HCI логе оригинального Daly: request slave = 0x81, response slave = 0x51.
-                // Поэтому ищем именно 0x51, а не 0x81.
+                // Different Daly firmware revisions answer as 0x51, echo 0x81,
+                // or expose another Modbus slave address. Detect a frame by its
+                // function byte and CRC later instead of hard-coding one address.
                 var startIndex = -1
-                for (i in configModbusBuffer.indices) {
-                    if ((configModbusBuffer[i].toInt() and 0xFF) == 0x51) {
+                val knownFunctions = setOf(0x03, 0x06, 0x10, 0x83, 0x86, 0x90)
+                for (i in 0 until configModbusBuffer.lastIndex) {
+                    val slave = configModbusBuffer[i].toInt() and 0xFF
+                    val function = configModbusBuffer[i + 1].toInt() and 0xFF
+                    if (slave != (FRAME_START.toInt() and 0xFF) && function in knownFunctions) {
                         startIndex = i
                         break
                     }
@@ -5331,21 +5734,22 @@ class MainActivity : ComponentActivity() {
 
         // Важно: используем те же регистры, что и во вкладке
         // Управление → Настройка балансировки.
-        // Ранее на сайт уходила старая карта 0x020A/0x020B/0x020C,
-        // поэтому появлялись неверные значения вроде 12.613 V.
-        balancing.put("Напряжение включения балансировки", regText(0x0228, 1000.0, "V"))
+        // Порог включения и порог отключения находятся в соседних
+        // регистрах 0x01FA/0x01FB. 0x0228 содержит другое значение (на этой
+        // BMS raw=5000), поэтому его нельзя использовать как напряжение.
+        balancing.put("Напряжение включения балансировки", regVoltageOneDecimal(0x01FA))
         balancing.put("Напряжение отключения балансировки", regText(0x01FB, 1000.0, "V"))
         balancing.put("Перепад напряжения при открытии балансировки", regText(0x0156, 1000.0, "V"))
-        balancing.put("Ток включения балансировки", regText(0x0151, 1000.0, "A"))
+        balancing.put("Ток включения балансировки", regCurrentOneDecimal(0x0151))
         balancing.put("Переключатель активной балансировки", regSwitchText(0x0220))
 
-        balancing.put("balance_start_voltage_v", regText(0x0228, 1000.0, "V"))
+        balancing.put("balance_start_voltage_v", regVoltageOneDecimal(0x01FA))
         balancing.put("balance_stop_voltage_v", regText(0x01FB, 1000.0, "V"))
         balancing.put("balance_delta_v", regText(0x0156, 1000.0, "V"))
-        balancing.put("balance_current_a", regText(0x0151, 1000.0, "A"))
+        balancing.put("balance_current_a", regCurrentOneDecimal(0x0151))
         balancing.put("active_balance_enabled", regSwitchText(0x0220))
 
-        balancing.put("balance_start_voltage_num", configRegScaled(0x0228, 1000.0) ?: JSONObject.NULL)
+        balancing.put("balance_start_voltage_num", configRegScaled(0x01FA, 1000.0) ?: JSONObject.NULL)
         balancing.put("balance_stop_voltage_num", configRegScaled(0x01FB, 1000.0) ?: JSONObject.NULL)
         balancing.put("balance_delta_num", configRegScaled(0x0156, 1000.0) ?: JSONObject.NULL)
         balancing.put("balance_current_num", configRegScaled(0x0151, 1000.0) ?: JSONObject.NULL)
@@ -5575,6 +5979,22 @@ class MainActivity : ComponentActivity() {
     private fun marginLp(w: Int, h: Int, l: Int, t: Int, r: Int, b: Int): LinearLayout.LayoutParams {
         return LinearLayout.LayoutParams(w, h).apply {
             setMargins(dp(l), dp(t), dp(r), dp(b))
+        }
+    }
+
+    private fun openExternalUrl(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: Exception) {
+            toast("Не найдено приложение для открытия ссылки")
+        }
+    }
+
+    private fun dialPhone(phone: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$phone")))
+        } catch (_: Exception) {
+            toast("Не удалось открыть приложение телефона")
         }
     }
 
