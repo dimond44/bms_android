@@ -1,21 +1,23 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const Database = require("better-sqlite3");
 
 function openDatabase(filename) {
   if (filename !== ":memory:") {
     fs.mkdirSync(path.dirname(filename), { recursive: true });
   }
 
-  const db = new Database(filename);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
+  const db = openSqlite(filename);
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS batteries (
       bms_uid TEXT PRIMARY KEY,
       bluetooth_name TEXT,
       bluetooth_address TEXT,
+      advertised_name TEXT,
+      hardware_family TEXT,
+      owner_name TEXT,
+      owner_phone TEXT,
+      owner_email TEXT,
       first_seen_at INTEGER NOT NULL,
       last_seen_at INTEGER NOT NULL
     );
@@ -73,15 +75,32 @@ function openDatabase(filename) {
       ON config_checks(bms_uid, checked_at DESC);
   `);
 
+  ensureColumn(db, "batteries", "advertised_name", "TEXT");
+  ensureColumn(db, "batteries", "hardware_family", "TEXT");
+  ensureColumn(db, "batteries", "owner_name", "TEXT");
+  ensureColumn(db, "batteries", "owner_phone", "TEXT");
+  ensureColumn(db, "batteries", "owner_email", "TEXT");
+
   const upsertBattery = db.prepare(`
     INSERT INTO batteries (
-      bms_uid, bluetooth_name, bluetooth_address, first_seen_at, last_seen_at
+      bms_uid, bluetooth_name, bluetooth_address, advertised_name, hardware_family,
+      owner_name, owner_phone, owner_email, first_seen_at, last_seen_at
     ) VALUES (
-      @bms_uid, @bluetooth_name, @bluetooth_address, @received_at, @received_at
+      @bms_uid, @bluetooth_name, @bluetooth_address, @advertised_name, @hardware_family,
+      @owner_name, @owner_phone, @owner_email, @received_at, @received_at
     )
     ON CONFLICT(bms_uid) DO UPDATE SET
       bluetooth_name = COALESCE(excluded.bluetooth_name, batteries.bluetooth_name),
       bluetooth_address = COALESCE(excluded.bluetooth_address, batteries.bluetooth_address),
+      advertised_name = COALESCE(excluded.advertised_name, batteries.advertised_name),
+      hardware_family = CASE
+        WHEN excluded.hardware_family = 'dl_red' THEN 'dl_red'
+        WHEN batteries.hardware_family IS NOT NULL THEN batteries.hardware_family
+        ELSE excluded.hardware_family
+      END,
+      owner_name = COALESCE(excluded.owner_name, batteries.owner_name),
+      owner_phone = COALESCE(excluded.owner_phone, batteries.owner_phone),
+      owner_email = COALESCE(excluded.owner_email, batteries.owner_email),
       last_seen_at = excluded.last_seen_at
   `);
 
@@ -101,9 +120,7 @@ function openDatabase(filename) {
 
   const saveTelemetry = db.transaction((payload, receivedAt) => {
     const row = {
-      bms_uid: payload.bms_uid,
-      bluetooth_name: payload.bluetooth_name ?? null,
-      bluetooth_address: payload.bluetooth_address ?? null,
+      ...batteryIdentity(payload),
       received_at: receivedAt,
       voltage: payload.voltage ?? null,
       current: payload.current ?? null,
@@ -146,9 +163,7 @@ function openDatabase(filename) {
   const saveConfigCheck = db.transaction((payload, receivedAt) => {
     const check = payload.template_check;
     const battery = {
-      bms_uid: payload.bms_uid,
-      bluetooth_name: payload.bluetooth_name ?? null,
-      bluetooth_address: payload.bluetooth_address ?? null,
+      ...batteryIdentity(payload),
       received_at: receivedAt,
     };
     const row = {
@@ -192,6 +207,11 @@ function openDatabase(filename) {
           b.bms_uid,
           b.bluetooth_name,
           b.bluetooth_address,
+          b.advertised_name,
+          b.hardware_family,
+          b.owner_name,
+          b.owner_phone,
+          b.owner_email,
           b.first_seen_at,
           b.last_seen_at,
           t.id AS telemetry_id,
@@ -310,6 +330,84 @@ function openDatabase(filename) {
   };
 }
 
+function openSqlite(filename) {
+  try {
+    const Database = require("better-sqlite3");
+    const db = new Database(filename);
+    db.pragma("journal_mode = WAL");
+    db.pragma("foreign_keys = ON");
+    return db;
+  } catch (_error) {
+    const { DatabaseSync } = require("node:sqlite");
+    const db = new DatabaseSync(filename);
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec("PRAGMA foreign_keys = ON;");
+    return wrapNodeSqlite(db);
+  }
+}
+
+function wrapNodeSqlite(db) {
+  return {
+    exec: (sql) => db.exec(sql),
+    close: () => db.close(),
+    prepare(sql) {
+      const stmt = db.prepare(sql);
+      return {
+        run(...args) {
+          const result = stmt.run(...normalizeSqliteArgs(args));
+          return {
+            lastInsertRowid: result.lastInsertRowid,
+            changes: result.changes,
+          };
+        },
+        get(...args) {
+          return stmt.get(...normalizeSqliteArgs(args));
+        },
+        all(...args) {
+          return stmt.all(...normalizeSqliteArgs(args));
+        },
+      };
+    },
+    transaction(fn) {
+      return (...args) => {
+        db.exec("BEGIN");
+        try {
+          const result = fn(...args);
+          db.exec("COMMIT");
+          return result;
+        } catch (error) {
+          try {
+            db.exec("ROLLBACK");
+          } catch (_rollbackError) {
+            // Ignore rollback errors after a failed transaction.
+          }
+          throw error;
+        }
+      };
+    },
+  };
+}
+
+function normalizeSqliteArgs(args) {
+  if (
+    args.length === 1 &&
+    args[0] &&
+    typeof args[0] === "object" &&
+    !Array.isArray(args[0])
+  ) {
+    const named = {};
+    for (const [key, value] of Object.entries(args[0])) {
+      named[
+        key.startsWith("@") || key.startsWith("$") || key.startsWith(":")
+          ? key
+          : `@${key}`
+      ] = value;
+    }
+    return [named];
+  }
+  return args;
+}
+
 function booleanToInteger(value) {
   if (value === true) return 1;
   if (value === false) return 0;
@@ -323,6 +421,51 @@ function parseJson(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function ensureColumn(db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (columns.some((row) => row.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+function emptyToNull(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed;
+}
+
+function looksLikeRedDlName(value) {
+  return typeof value === "string" && /^\s*DL/i.test(value);
+}
+
+function inferHardwareFamily(payload) {
+  const checkFamily = isPlainObject(payload?.template_check)
+    ? payload.template_check.hardware_family
+    : null;
+  if (payload?.hardware_family === "dl_red" || checkFamily === "dl_red") return "dl_red";
+  if (looksLikeRedDlName(payload?.advertised_name) || looksLikeRedDlName(payload?.bluetooth_name)) {
+    return "dl_red";
+  }
+  if (payload?.hardware_family === "standard" || checkFamily === "standard") return "standard";
+  return null;
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function batteryIdentity(payload) {
+  return {
+    bms_uid: payload.bms_uid,
+    bluetooth_name: payload.bluetooth_name ?? null,
+    bluetooth_address: payload.bluetooth_address ?? null,
+    advertised_name: emptyToNull(payload.advertised_name),
+    hardware_family: inferHardwareFamily(payload),
+    owner_name: emptyToNull(payload.owner_name),
+    owner_phone: emptyToNull(payload.owner_phone),
+    owner_email: emptyToNull(payload.owner_email),
+  };
 }
 
 module.exports = { openDatabase };

@@ -31,7 +31,7 @@
         </div>
         <label class="search">
           <span>⌕</span>
-          <input id="searchInput" type="search" placeholder="Имя, UID или адрес" autocomplete="off">
+          <input id="searchInput" type="search" placeholder="Имя, UID, владелец" autocomplete="off">
         </label>
         <div class="battery-list" id="batteryList" aria-live="polite">
           <div class="list-message">Загрузка аккумуляторов…</div>
@@ -50,82 +50,119 @@
             <div>
               <div class="heading-line">
                 <h2 id="batteryName">Аккумулятор</h2>
-                <span class="status-pill" id="onlineStatus">—</span>
+                <div class="heading-badges">
+                  <span class="hardware-badge hidden" id="hardwareBadge"></span>
+                  <span class="status-pill" id="onlineStatus">—</span>
+                </div>
               </div>
               <p class="identity"><span id="batteryUid">—</span><span id="batteryAddress">—</span></p>
               <p class="last-seen" id="lastSeen">—</p>
             </div>
           </div>
 
-          <article class="card config-check" id="configCheck">
-            <div class="config-check-head">
-              <div>
-                <span class="eyebrow">Контроль шаблона</span>
-                <h3>Проверка конфигурации BMS</h3>
-              </div>
-              <span class="config-check-status" id="configCheckStatus">Не проверялась</span>
+          <nav class="dash-tabs" id="dashTabs" role="tablist" aria-label="Разделы аккумулятора">
+            <button type="button" class="dash-tab" role="tab" data-tab="overview" aria-selected="true" aria-controls="tab-overview">Основное</button>
+            <button type="button" class="dash-tab" role="tab" data-tab="owner" aria-selected="false" aria-controls="tab-owner">Владелец АКБ и проверка шаблона</button>
+            <button type="button" class="dash-tab" role="tab" data-tab="balancing" aria-selected="false" aria-controls="tab-balancing">Балансировка</button>
+            <button type="button" class="dash-tab" role="tab" data-tab="dynamics" aria-selected="false" aria-controls="tab-dynamics">Динамика</button>
+            <button type="button" class="dash-tab" role="tab" data-tab="journal" aria-selected="false" aria-controls="tab-journal">Журнал и диагностика</button>
+            <button type="button" class="dash-tab" role="tab" data-tab="archive" aria-selected="false" aria-controls="tab-archive">Архив записей</button>
+          </nav>
+
+          <div class="dash-panels">
+            <div class="dash-panel" id="tab-overview" data-tab-panel="overview" role="tabpanel">
+              <section class="overview">
+                <article class="soc-card card">
+                  <div class="soc-gauge" id="socGauge">
+                    <div><strong id="socValue">—</strong><span>%</span><small>заряд</small></div>
+                  </div>
+                  <div class="soc-caption"><span>Осталось</span><strong id="remainingValue">—</strong></div>
+                </article>
+                <div class="metric-grid" id="metricGrid"></div>
+              </section>
+
+              <section class="two-column">
+                <article class="card">
+                  <div class="section-title"><div><span class="eyebrow">Состояние</span><h3>MOS-ключи</h3></div></div>
+                  <div class="mos-grid">
+                    <div class="mos" id="chargeMos"><i></i><span>Заряд</span><strong>—</strong></div>
+                    <div class="mos" id="dischargeMos"><i></i><span>Разряд</span><strong>—</strong></div>
+                  </div>
+                </article>
+                <article class="card">
+                  <div class="section-title"><div><span class="eyebrow">Датчики</span><h3>Температуры</h3></div><span class="section-meta" id="tempRange">—</span></div>
+                  <div class="temperature-list" id="temperatureList"></div>
+                </article>
+              </section>
             </div>
-            <div class="config-check-meta" id="configCheckMeta"></div>
-            <div class="config-check-details" id="configCheckDetails"></div>
-          </article>
 
-          <section class="overview">
-            <article class="soc-card card">
-              <div class="soc-gauge" id="socGauge">
-                <div><strong id="socValue">—</strong><span>%</span><small>заряд</small></div>
-              </div>
-              <div class="soc-caption"><span>Осталось</span><strong id="remainingValue">—</strong></div>
-            </article>
-            <div class="metric-grid" id="metricGrid"></div>
-          </section>
+            <div class="dash-panel hidden" id="tab-owner" data-tab-panel="owner" role="tabpanel">
+              <article class="card owner-card" id="ownerCard">
+                <span class="eyebrow">Владелец</span>
+                <strong id="ownerName">—</strong>
+                <p class="identity owner-contacts">
+                  <a id="ownerPhone">—</a>
+                  <a id="ownerEmail">—</a>
+                </p>
+                <p class="owner-empty hidden" id="ownerEmpty">Профиль ещё не приходил с приложения. Сохраните ФИО, телефон и почту и дождитесь отправки телеметрии.</p>
+              </article>
 
-          <section class="two-column">
-            <article class="card">
-              <div class="section-title"><div><span class="eyebrow">Состояние</span><h3>MOS-ключи</h3></div></div>
-              <div class="mos-grid">
-                <div class="mos" id="chargeMos"><i></i><span>Заряд</span><strong>—</strong></div>
-                <div class="mos" id="dischargeMos"><i></i><span>Разряд</span><strong>—</strong></div>
-              </div>
-            </article>
-            <article class="card">
-              <div class="section-title"><div><span class="eyebrow">Датчики</span><h3>Температуры</h3></div><span class="section-meta" id="tempRange">—</span></div>
-              <div class="temperature-list" id="temperatureList"></div>
-            </article>
-          </section>
-
-          <article class="card">
-            <div class="section-title"><div><span class="eyebrow">Балансировка</span><h3>Напряжения ячеек</h3></div><span class="section-meta" id="cellRange">—</span></div>
-            <div class="cell-list" id="cellList"></div>
-          </article>
-
-          <article class="card chart-card">
-            <div class="section-title">
-              <div><span class="eyebrow">Динамика</span><h3>История показаний</h3></div>
-              <div class="legend"><span class="legend-soc"><i></i>SOC</span><span class="legend-voltage"><i></i>Напряжение</span></div>
+              <article class="card config-check" id="configCheck">
+                <div class="config-check-head">
+                  <div>
+                    <span class="eyebrow">Контроль шаблона</span>
+                    <h3>Проверка конфигурации BMS</h3>
+                  </div>
+                  <span class="config-check-status" id="configCheckStatus">Не проверялась</span>
+                </div>
+                <div class="config-check-meta" id="configCheckMeta"></div>
+                <div class="config-check-details" id="configCheckDetails"></div>
+              </article>
             </div>
-            <div class="chart-wrap"><canvas id="historyChart"></canvas><div id="chartEmpty" class="chart-empty hidden">Недостаточно данных для графика</div></div>
-          </article>
 
-          <section class="two-column alerts-grid">
-            <article class="card">
-              <div class="section-title"><div><span class="eyebrow">Диагностика</span><h3>Ошибки</h3></div><span class="count subtle" id="errorCount">0</span></div>
-              <div class="feed" id="errorList"></div>
-            </article>
-            <article class="card">
-              <div class="section-title"><div><span class="eyebrow">Журнал</span><h3>События</h3></div></div>
-              <div class="feed" id="eventList"></div>
-            </article>
-          </section>
-
-          <article class="card history-card">
-            <div class="section-title"><div><span class="eyebrow">Архив</span><h3>Последние записи</h3></div><span class="section-meta" id="historyCount">0 записей</span></div>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Время</th><th>SOC</th><th>Напряжение</th><th>Ток</th><th>Δ ячеек</th><th>Температура</th><th>Ошибки</th></tr></thead>
-                <tbody id="historyBody"></tbody>
-              </table>
+            <div class="dash-panel hidden" id="tab-balancing" data-tab-panel="balancing" role="tabpanel">
+              <article class="card">
+                <div class="section-title"><div><span class="eyebrow">Балансировка</span><h3>Напряжения ячеек</h3></div></div>
+                <div class="cell-summary" id="cellSummary"></div>
+                <div class="cell-list" id="cellList"></div>
+              </article>
             </div>
-          </article>
+
+            <div class="dash-panel hidden" id="tab-dynamics" data-tab-panel="dynamics" role="tabpanel">
+              <article class="card chart-card">
+                <div class="section-title">
+                  <div><span class="eyebrow">Динамика</span><h3>История показаний</h3></div>
+                  <div class="legend"><span class="legend-soc"><i></i>SOC</span><span class="legend-voltage"><i></i>Напряжение</span></div>
+                </div>
+                <div class="chart-wrap"><canvas id="historyChart"></canvas><div id="chartEmpty" class="chart-empty hidden">Недостаточно данных для графика</div></div>
+              </article>
+            </div>
+
+            <div class="dash-panel hidden" id="tab-journal" data-tab-panel="journal" role="tabpanel">
+              <section class="two-column alerts-grid">
+                <article class="card">
+                  <div class="section-title"><div><span class="eyebrow">Диагностика</span><h3>Ошибки</h3></div><span class="count subtle" id="errorCount">0</span></div>
+                  <div class="feed" id="errorList"></div>
+                </article>
+                <article class="card">
+                  <div class="section-title"><div><span class="eyebrow">Журнал</span><h3>События</h3></div></div>
+                  <div class="feed" id="eventList"></div>
+                </article>
+              </section>
+            </div>
+
+            <div class="dash-panel hidden" id="tab-archive" data-tab-panel="archive" role="tabpanel">
+              <article class="card history-card">
+                <div class="section-title"><div><span class="eyebrow">Архив</span><h3>Последние записи</h3></div><span class="section-meta" id="historyCount">0 записей</span></div>
+                <div class="table-wrap">
+                  <table>
+                    <thead><tr><th>Время</th><th>SOC</th><th>Напряжение</th><th>Ток</th><th>Δ ячеек</th><th>Температура</th><th>Ошибки</th></tr></thead>
+                    <tbody id="historyBody"></tbody>
+                  </table>
+                </div>
+              </article>
+            </div>
+          </div>
         </div>
       </section>
     </main>

@@ -67,6 +67,15 @@ private const val CONFIG_AUTO_READ_DELAY_MS = 12000L
 private const val TEST_AUTO_WRITE_SOC_ON_CONNECT = false
 private const val TEST_SOC_PERCENT_ON_CONNECT = 90.0
 private const val TEST_SOC_REGISTER_ADDR = 0x0116
+private const val HARDWARE_FAMILY_STANDARD = "standard"
+private const val HARDWARE_FAMILY_DL_RED = "dl_red"
+private val DL_RED_SKIPPED_TEMPLATE_KEYS = setOf(
+    "soc_calibration_0",
+    "soc_calibration_100",
+    "balance_start_voltage",
+    "balance_stop_voltage",
+    "balance_delta"
+)
 private const val TEST_BATTERY_ADDRESS = "TEST_BATTERY_12V_105AH"
 
 private val DALY_CHAR_UUID_CANDIDATES = setOf(
@@ -134,7 +143,8 @@ data class BmsTemplateParameter(
     val enforcement: String,
     val expected: Double?,
     val expectedBySeries: Map<Int, Double>,
-    val reason: String?
+    val reason: String?,
+    val skipFor: Set<String> = emptySet()
 )
 
 data class TemplateCheckItem(
@@ -155,7 +165,8 @@ data class TemplateCheckResult(
     val seriesCount: Int?,
     val mismatches: List<TemplateCheckItem> = emptyList(),
     val missing: List<TemplateCheckItem> = emptyList(),
-    val unverified: List<TemplateCheckItem> = emptyList()
+    val unverified: List<TemplateCheckItem> = emptyList(),
+    val hardwareFamily: String = HARDWARE_FAMILY_STANDARD
 )
 
 data class SavedBattery(
@@ -2044,6 +2055,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderManageGeneral() {
+        addRedDlNoticeIfNeeded(
+            "Красная BMS DL-серии (старая): калибровка SOC 0 и SOC 100 не настраивается и не проверяется по шаблону."
+        )
         manageContentLayout.addView(manageSectionCard(
             "1. Основные параметры",
             listOf(
@@ -2051,8 +2065,8 @@ class MainActivity : ComponentActivity() {
                 "Номинальная емкость" to nominalCapacityText(),
                 "Время ожидания сна" to regText(0x0115, 0.1, "S"),
                 "Настройка SOC" to fmtPct(data.soc),
-                "Калибр. SOC 0" to regText(0x01C7, 1000.0, "V"),
-                "Калибр. SOC 100" to regText(0x0229, 1000.0, "V"),
+                "Калибр. SOC 0" to dlUnsupportedOr(regText(0x01C7, 1000.0, "V")),
+                "Калибр. SOC 100" to dlUnsupportedOr(regText(0x0229, 1000.0, "V")),
                 "Переключатель зарядки" to mosText(data.chargeMos),
                 "Переключатель разрядки" to mosText(data.dischargeMos),
                 "Изменить пароль настроек" to "только чтение",
@@ -2196,14 +2210,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderManageBalancing() {
+        addRedDlNoticeIfNeeded(
+            "У красной BMS DL-серии (старой) нет встроенного балансира. Настройки балансировки не проверяются."
+        )
         manageContentLayout.addView(manageSectionCard(
             "4. Настройка балансировки",
             listOf(
-                "Напряжение включения балансировки" to regVoltageOneDecimal(0x011A),
-                "Напряжение отключения балансировки" to regText(0x01FB, 1000.0, "V"),
-                "Перепад напряжения при открытии балансировки" to regText(0x011B, null, "mV"),
-                "Ток включения балансировки" to regCurrentOneDecimal(0x0151),
-                "Переключатель активной балансировки" to balanceSwitchText(0x0220)
+                "Напряжение включения балансировки" to dlUnsupportedOr(regVoltageOneDecimal(0x011A)),
+                "Напряжение отключения балансировки" to dlUnsupportedOr(regText(0x01FB, 1000.0, "V")),
+                "Перепад напряжения при открытии балансировки" to dlUnsupportedOr(regText(0x011B, null, "mV")),
+                "Ток включения балансировки" to dlUnsupportedOr(regCurrentOneDecimal(0x0151)),
+                "Переключатель активной балансировки" to dlUnsupportedOr(balanceSwitchText(0x0220))
             )
         ), marginLp(-1, -2, 0, 0, 0, 12))
 
@@ -2218,6 +2235,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderManageCellParameters() {
+        addRedDlNoticeIfNeeded(
+            "Красная BMS DL-серии (старая): калибровка SOC 0 и SOC 100 не настраивается и не проверяется по шаблону."
+        )
         manageContentLayout.addView(manageSectionCard(
             "5. Параметры элемента",
             listOf(
@@ -2225,8 +2245,8 @@ class MainActivity : ComponentActivity() {
                 "Номинальная емкость" to nominalCapacityText(),
                 "Время ожидания сна" to regText(0x0115, 0.1, "S"),
                 "Настройка SOC" to fmtPct(data.soc),
-                "Калибр. SOC 0" to regText(0x01C7, 1000.0, "V"),
-                "Калибр. SOC 100" to regText(0x0229, 1000.0, "V"),
+                "Калибр. SOC 0" to dlUnsupportedOr(regText(0x01C7, 1000.0, "V")),
+                "Калибр. SOC 100" to dlUnsupportedOr(regText(0x0229, 1000.0, "V")),
                 "Адрес подчиненной платы" to regText(0x020F, null, ""),
                 "Тип инвертора" to "не проверяется",
                 "Способ связи" to "не проверяется",
@@ -2366,6 +2386,13 @@ class MainActivity : ComponentActivity() {
                 null
             }
             require(expected != null || expectedBySeries.isNotEmpty())
+            val skipFor = buildSet {
+                val skipJson = item.optJSONArray("skip_for") ?: return@buildSet
+                for (j in 0 until skipJson.length()) {
+                    val family = skipJson.optString(j)
+                    if (family.isNotBlank()) add(family)
+                }
+            }
             parameters += BmsTemplateParameter(
                 key = item.getString("key"),
                 label = item.getString("label"),
@@ -2377,7 +2404,8 @@ class MainActivity : ComponentActivity() {
                 enforcement = enforcement,
                 expected = expected,
                 expectedBySeries = expectedBySeries,
-                reason = item.optString("reason").takeIf { it.isNotBlank() }
+                reason = item.optString("reason").takeIf { it.isNotBlank() },
+                skipFor = skipFor
             )
         }
         val supported = root.getJSONArray("supported_series")
@@ -2395,6 +2423,7 @@ class MainActivity : ComponentActivity() {
         val checkedAt = System.currentTimeMillis()
         val observedSeries = data.cellCount
         val series = observedSeries?.takeIf { it == 4 || it == 8 }
+        val hardwareFamily = currentHardwareFamily()
         return try {
             val template = loadBmsConfigTemplate()
             val mismatches = mutableListOf<TemplateCheckItem>()
@@ -2407,6 +2436,19 @@ class MainActivity : ComponentActivity() {
                 val actual = raw?.let { (it / parameter.scale) + parameter.offset }
 
                 if (parameter.enforcement == "informational") {
+                    continue
+                }
+
+                if (shouldSkipTemplateParameter(parameter, hardwareFamily)) {
+                    unverified += TemplateCheckItem(
+                        parameter.key,
+                        parameter.label,
+                        expected,
+                        actual,
+                        parameter.unit,
+                        parameter.tolerance,
+                        "not_applicable_$hardwareFamily"
+                    )
                     continue
                 }
 
@@ -2465,7 +2507,8 @@ class MainActivity : ComponentActivity() {
                 observedSeries,
                 mismatches,
                 missing,
-                unverified
+                unverified,
+                hardwareFamily
             )
         } catch (e: Exception) {
             TemplateCheckResult(
@@ -2484,7 +2527,8 @@ class MainActivity : ComponentActivity() {
                         tolerance = 0.0,
                         reason = "template_load_error: ${(e.message ?: e.javaClass.simpleName).take(160)}"
                     )
-                )
+                ),
+                hardwareFamily = hardwareFamily
             )
         }
     }
@@ -2501,7 +2545,8 @@ class MainActivity : ComponentActivity() {
                 templateVersion = 1,
                 status = "checking",
                 checkedAt = 0L,
-                seriesCount = data.cellCount
+                seriesCount = data.cellCount,
+                hardwareFamily = currentHardwareFamily()
             )
         )
     }
@@ -2899,8 +2944,13 @@ class MainActivity : ComponentActivity() {
                 .format(java.util.Date(it))
         } ?: "—"
         val counts = result?.let {
-            val counts = "Отклонений: ${it.mismatches.size}  •  Нет данных: ${it.missing.size}"
+            "Отклонений: ${it.mismatches.size}  •  Нет данных: ${it.missing.size}"
         } ?: "Ожидается чтение настроек BMS"
+        val familyLine = if (isRedDlBms() || result?.hardwareFamily == HARDWARE_FAMILY_DL_RED) {
+            "\nКрасная BMS DL-серия (старая)"
+        } else {
+            ""
+        }
 
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2915,7 +2965,7 @@ class MainActivity : ComponentActivity() {
                 setTextColor(color)
             })
             addView(TextView(this@MainActivity).apply {
-                text = "Проверено: $checked\n$counts"
+                text = "Проверено: $checked\n$counts$familyLine"
                 textSize = 12f
                 setTextColor(Color.rgb(75, 79, 84))
                 setPadding(0, dp(4), 0, 0)
@@ -2928,6 +2978,11 @@ class MainActivity : ComponentActivity() {
         if (result == null) return "Результата ещё нет. Проверка запустится после чтения конфигурации BMS."
         if (result.status == "checking") return "Чтение и проверка конфигурации выполняются."
         val lines = mutableListOf<String>()
+        if (result.hardwareFamily == HARDWARE_FAMILY_DL_RED || isRedDlBms()) {
+            lines += "Тип: красная BMS DL-серия (старая)"
+            lines += "Нет встроенного балансира; калибровка SOC 0 и SOC 100 не настраивается и не проверяется."
+            lines += ""
+        }
         lines += "Серия: ${result.seriesCount?.let { "${it}S" } ?: "не определена"}"
         lines += "Отклонений: ${result.mismatches.size}, нет данных: ${result.missing.size}"
         if (result.mismatches.isNotEmpty()) {
@@ -2944,10 +2999,11 @@ class MainActivity : ComponentActivity() {
                 lines += "• ${it.label}: ${it.reason ?: "не прочитано"}; ожидалось ${formatTemplateNumber(it.expected)} ${it.unit}"
             }
         }
-        if (result.unverified.isNotEmpty()) {
+        val informational = result.unverified.filter { it.reason?.startsWith("not_applicable") != true }
+        if (informational.isNotEmpty()) {
             lines += ""
             lines += "Информационные (не влияют на статус):"
-            result.unverified.forEach {
+            informational.forEach {
                 lines += "• ${it.label}: ${formatTemplateNumber(it.actual)} ${it.unit}; ожидалось ${formatTemplateNumber(it.expected)} ${it.unit} (${it.reason ?: "mapping_unverified"})"
             }
         }
@@ -5307,6 +5363,74 @@ class MainActivity : ComponentActivity() {
         return selectedAddress ?: "unknown_bms"
     }
 
+    private fun advertisedBluetoothName(): String {
+        val address = selectedAddress
+        if (!address.isNullOrBlank()) {
+            scanNames[address]?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+            loadSavedBatteries().firstOrNull { it.address == address }
+                ?.bluetoothName
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { return it }
+        }
+        return selectedDeviceName.trim()
+    }
+
+    private fun looksLikeRedDlName(name: String): Boolean {
+        return name.trim().startsWith("DL", ignoreCase = true)
+    }
+
+    private fun isRedDlBms(): Boolean {
+        return looksLikeRedDlName(advertisedBluetoothName()) || looksLikeRedDlName(selectedDeviceName)
+    }
+
+    private fun currentHardwareFamily(): String {
+        return if (isRedDlBms()) HARDWARE_FAMILY_DL_RED else HARDWARE_FAMILY_STANDARD
+    }
+
+    private fun shouldSkipTemplateParameter(parameter: BmsTemplateParameter, hardwareFamily: String): Boolean {
+        if (hardwareFamily in parameter.skipFor) return true
+        return hardwareFamily == HARDWARE_FAMILY_DL_RED && parameter.key in DL_RED_SKIPPED_TEMPLATE_KEYS
+    }
+
+    private fun dlUnsupportedOr(value: String): String {
+        return if (isRedDlBms()) "не настраивается" else value
+    }
+
+    private fun addRedDlNoticeIfNeeded(text: String) {
+        if (!isRedDlBms() || !::manageContentLayout.isInitialized) return
+        manageContentLayout.addView(
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(14), dp(11), dp(14), dp(11))
+                background = round(Color.rgb(255, 236, 236), dp(14), Color.rgb(196, 40, 40), 1)
+                addView(TextView(this@MainActivity).apply {
+                    this.text = text
+                    textSize = 13f
+                    setTextColor(Color.rgb(140, 30, 30))
+                })
+            },
+            marginLp(-1, -2, 0, 0, 0, 12)
+        )
+    }
+
+    private fun putHardwareIdentity(obj: JSONObject) {
+        val advertised = advertisedBluetoothName()
+        obj.put("advertised_name", advertised)
+        obj.put("hardware_family", currentHardwareFamily())
+        if (currentHardwareFamily() == HARDWARE_FAMILY_DL_RED) {
+            obj.put("hardware_label", "Красная BMS DL-серия (старая)")
+        }
+        putOwnerProfile(obj)
+    }
+
+    private fun putOwnerProfile(obj: JSONObject) {
+        val prefs = getSharedPreferences("user_profile", MODE_PRIVATE)
+        obj.put("owner_name", prefs.getString("name", "")?.trim().orEmpty())
+        obj.put("owner_phone", prefs.getString("phone", "")?.trim().orEmpty())
+        obj.put("owner_email", prefs.getString("email", "")?.trim().orEmpty())
+    }
+
     private fun addLocalEvent(text: String, detail: String = text) {
         // В пользовательском журнале показываем только события BMS.
         val serviceWords = listOf(
@@ -5949,7 +6073,8 @@ class MainActivity : ComponentActivity() {
                     tolerance = 0.0,
                     reason = "check_not_completed"
                 )
-            )
+            ),
+            hardwareFamily = currentHardwareFamily()
         )
 
         fun mismatchJson(item: TemplateCheckItem) = JSONObject().apply {
@@ -5988,6 +6113,10 @@ class MainActivity : ComponentActivity() {
             put("mismatches", JSONArray().apply { result.mismatches.forEach { put(mismatchJson(it)) } })
             put("missing", JSONArray().apply { result.missing.forEach { put(unavailableJson(it)) } })
             put("unverified", JSONArray().apply { result.unverified.forEach { put(unverifiedJson(it)) } })
+            put("hardware_family", result.hardwareFamily)
+            if (result.hardwareFamily == HARDWARE_FAMILY_DL_RED) {
+                put("hardware_label", "Красная BMS DL-серия (старая)")
+            }
         }
     }
 
@@ -5999,7 +6128,8 @@ class MainActivity : ComponentActivity() {
         obj.put("bms_uid", bmsUid())
         obj.put("bluetooth_name", selectedDeviceName)
         obj.put("bluetooth_address", selectedAddress ?: "")
-        obj.put("app_version", "0.2.2-balance-regs")
+        putHardwareIdentity(obj)
+        obj.put("app_version", "0.2.4-owner-profile")
         obj.put("read_status", lastConfigStatus)
         obj.put("template_check", templateCheckUploadJson())
 
@@ -6178,6 +6308,7 @@ class MainActivity : ComponentActivity() {
         obj.put("bms_uid", bmsUid())
         obj.put("bluetooth_name", selectedDeviceName)
         obj.put("bluetooth_address", selectedAddress ?: "")
+        putHardwareIdentity(obj)
         putNullable(obj, "voltage", data.voltage)
         putNullable(obj, "current", data.current)
         putNullable(obj, "soc", data.soc)

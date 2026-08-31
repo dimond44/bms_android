@@ -4,8 +4,18 @@
   const DEFAULT_API_KEY = "change_me_api_key_2026";
   const API_KEY_STORAGE = "liferych:bms:api-key";
   const THEME_STORAGE = "liferych:bms:theme";
+  const TAB_STORAGE = "liferych:bms:tab";
+  const DASH_TABS = ["overview", "owner", "balancing", "dynamics", "journal", "archive"];
   const REFRESH_INTERVAL_MS = 15000;
   const ONLINE_AFTER_MS = 45000;
+  const DL_RED_SKIPPED_KEYS = new Set([
+    "soc_calibration_0",
+    "soc_calibration_100",
+    "balance_start_voltage",
+    "balance_stop_voltage",
+    "balance_delta",
+  ]);
+  const RED_DL_LABEL = "Красная BMS DL-серия (старая)";
   const HISTORY_LIMIT = 100;
 
   const state = {
@@ -14,6 +24,7 @@
     history: [],
     selectedUid: localStorage.getItem("liferych:bms:selected") || "",
     search: "",
+    dashboardTab: localStorage.getItem(TAB_STORAGE) || "overview",
     refreshTimer: 0,
     abortController: null,
     requestId: 0,
@@ -31,10 +42,17 @@
     emptyState: document.getElementById("emptyState"),
     dashboard: document.getElementById("dashboard"),
     batteryName: document.getElementById("batteryName"),
+    hardwareBadge: document.getElementById("hardwareBadge"),
     onlineStatus: document.getElementById("onlineStatus"),
     batteryUid: document.getElementById("batteryUid"),
     batteryAddress: document.getElementById("batteryAddress"),
     lastSeen: document.getElementById("lastSeen"),
+    dashTabs: document.getElementById("dashTabs"),
+    ownerCard: document.getElementById("ownerCard"),
+    ownerName: document.getElementById("ownerName"),
+    ownerPhone: document.getElementById("ownerPhone"),
+    ownerEmail: document.getElementById("ownerEmail"),
+    ownerEmpty: document.getElementById("ownerEmpty"),
     configCheck: document.getElementById("configCheck"),
     configCheckStatus: document.getElementById("configCheckStatus"),
     configCheckMeta: document.getElementById("configCheckMeta"),
@@ -47,7 +65,7 @@
     dischargeMos: document.getElementById("dischargeMos"),
     tempRange: document.getElementById("tempRange"),
     temperatureList: document.getElementById("temperatureList"),
-    cellRange: document.getElementById("cellRange"),
+    cellSummary: document.getElementById("cellSummary"),
     cellList: document.getElementById("cellList"),
     historyChart: document.getElementById("historyChart"),
     chartEmpty: document.getElementById("chartEmpty"),
@@ -67,6 +85,14 @@
 
   function init() {
     applyTheme(localStorage.getItem(THEME_STORAGE) || "light");
+    setDashboardTab(state.dashboardTab, { persist: false, redraw: false });
+    if (dom.dashTabs) {
+      dom.dashTabs.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-tab]");
+        if (!button) return;
+        setDashboardTab(button.getAttribute("data-tab"));
+      });
+    }
     dom.refreshButton.addEventListener("click", () => refresh({ manual: true }));
     dom.themeButton.addEventListener("click", toggleTheme);
     dom.searchInput.addEventListener("input", () => {
@@ -188,8 +214,13 @@
     const batteries = state.batteries.filter((battery) => {
       const haystack = [
         battery.bluetooth_name,
+        battery.advertised_name,
         battery.bms_uid,
         battery.bluetooth_address,
+        battery.owner_name,
+        battery.owner_phone,
+        battery.owner_email,
+        isRedDlSeries(battery) ? RED_DL_LABEL : "",
       ].filter(Boolean).join(" ").toLowerCase();
       return haystack.includes(state.search);
     });
@@ -208,8 +239,15 @@
       const main = el("span", "battery-main");
       appendText(main, "span", "battery-name", displayName(battery));
       appendText(main, "span", "battery-uid", battery.bms_uid || "Без UID");
-      const configBadge = appendText(main, "span", "config-badge", configBadgeText(battery.config_check));
-      configBadge.classList.add(configStatusClass(battery.config_check));
+      if (textOrEmpty(battery.owner_name)) {
+        appendText(main, "span", "battery-owner", battery.owner_name.trim());
+      }
+      if (isRedDlSeries(battery)) {
+        appendText(main, "span", "family-badge", RED_DL_LABEL);
+      }
+      const check = visibleConfigCheck(battery);
+      const configBadge = appendText(main, "span", "config-badge", configBadgeText(check));
+      configBadge.classList.add(configStatusClass(check));
 
       const side = el("span", "battery-side");
       appendText(side, "span", "battery-soc", formatPercent(battery.soc));
@@ -247,11 +285,13 @@
     dom.dashboard.classList.remove("hidden");
 
     dom.batteryName.textContent = displayName(battery);
+    renderHardwareBadge(battery);
     dom.batteryUid.textContent = battery.bms_uid || "—";
     dom.batteryAddress.textContent = battery.bluetooth_address || "адрес не указан";
     dom.lastSeen.textContent = `Последняя связь: ${formatDateTime(battery.last_seen_at)}`;
+    renderOwner(battery);
     setOnlinePill(battery);
-    renderConfigCheck(battery.config_check);
+    renderConfigCheck(battery);
 
     const soc = numberOrNull(latest.soc);
     dom.socGauge.style.setProperty("--soc", String(clamp(soc || 0, 0, 100)));
@@ -268,7 +308,28 @@
     drawHistoryChart();
   }
 
-  function renderConfigCheck(check) {
+  function setDashboardTab(tabId, options) {
+    const nextTab = DASH_TABS.includes(tabId) ? tabId : "overview";
+    state.dashboardTab = nextTab;
+    if (!options || options.persist !== false) {
+      localStorage.setItem(TAB_STORAGE, nextTab);
+    }
+
+    document.querySelectorAll("[data-tab]").forEach((button) => {
+      const selected = button.getAttribute("data-tab") === nextTab;
+      button.setAttribute("aria-selected", selected ? "true" : "false");
+    });
+    document.querySelectorAll("[data-tab-panel]").forEach((panel) => {
+      panel.classList.toggle("hidden", panel.getAttribute("data-tab-panel") !== nextTab);
+    });
+
+    if ((!options || options.redraw !== false) && nextTab === "dynamics") {
+      window.requestAnimationFrame(() => drawHistoryChart());
+    }
+  }
+
+  function renderConfigCheck(battery) {
+    const check = visibleConfigCheck(battery);
     clear(dom.configCheckMeta);
     clear(dom.configCheckDetails);
     dom.configCheck.classList.remove("ok", "mismatch", "incomplete", "unchecked");
@@ -276,6 +337,16 @@
     dom.configCheck.classList.add(statusClass);
     dom.configCheckStatus.className = `config-check-status ${statusClass}`;
     dom.configCheckStatus.textContent = configBadgeText(check);
+
+    if (isRedDlSeries(battery)) {
+      appendText(dom.configCheckMeta, "span", "", RED_DL_LABEL);
+      appendText(
+        dom.configCheckMeta,
+        "span",
+        "",
+        "Нет встроенного балансира; калибровка SOC 0 и SOC 100 не проверяется.",
+      );
+    }
 
     if (!check) {
       appendText(dom.configCheckMeta, "span", "", "Результат проверки ещё не загружен.");
@@ -360,10 +431,11 @@
   }
 
   function renderCells(latest) {
+    clear(dom.cellSummary);
     clear(dom.cellList);
     const entries = sortedEntries(latest.cells);
     if (entries.length === 0) {
-      dom.cellRange.textContent = "нет данных";
+      appendText(dom.cellSummary, "div", "feed-empty", "нет данных");
       appendText(dom.cellList, "div", "feed-empty", "Нет данных по ячейкам.");
       return;
     }
@@ -371,23 +443,47 @@
     const values = entries.map((entry) => entry[1]);
     const min = Math.min(...values);
     const max = Math.max(...values);
-    const span = Math.max(max - min, 0.001);
-    dom.cellRange.textContent = `${formatVoltage(min)} — ${formatVoltage(max)}`;
+    const spread = numberOrNull(latest.cell_diff_v) ?? (max - min);
+    const series = entries.length;
+    const seriesLabel = series === 4 || series === 8 ? `${series}S` : `${series} эл.`;
+    const evenPack = min === max;
+
+    const packVoltage = numberOrNull(latest.voltage) ?? values.reduce((sum, value) => sum + value, 0);
+    const chips = [
+      ["Сборка", seriesLabel],
+      ["Напряжение АКБ", formatVoltage(packVoltage)],
+      ["Разброс Δ", formatMillivolts(spread, false)],
+      ["Мин. ячейка", formatVoltage(min)],
+      ["Макс. ячейка", formatVoltage(max)],
+    ];
+    for (const [label, value] of chips) {
+      const chip = el("div", "cell-chip");
+      appendText(chip, "span", "", label);
+      appendText(chip, "strong", "", value);
+      dom.cellSummary.append(chip);
+    }
 
     for (const [label, value] of entries) {
+      const isMin = !evenPack && value === min;
+      const isMax = !evenPack && value === max;
       const cell = el("div", "cell");
-      if (value === min) cell.classList.add("extreme-min");
-      if (value === max) cell.classList.add("extreme-max");
+      if (isMin) cell.classList.add("extreme-min");
+      if (isMax) cell.classList.add("extreme-max");
 
-      const head = el("div", "cell-head");
-      appendText(head, "span", "", `Ячейка ${label}`);
-      appendText(head, "strong", "", formatVoltage(value));
+      const top = el("div", "cell-top");
+      appendText(top, "span", "", `Ячейка ${label}`);
+      const tag = appendText(
+        top,
+        "span",
+        "cell-tag",
+        isMax ? "макс" : isMin ? "мин" : "норма",
+      );
+      if (isMin) tag.classList.add("min");
+      if (isMax) tag.classList.add("max");
 
-      const track = el("div", "cell-track");
-      const fill = el("div", "cell-fill");
-      fill.style.width = `${Math.round(((value - min) / span) * 72 + 28)}%`;
-      track.append(fill);
-      cell.append(head, track);
+      appendText(cell, "strong", "cell-voltage", formatVoltage(value));
+      appendText(cell, "span", "cell-delta", `Δ к мин ${formatMillivolts(value - min, true)}`);
+      cell.prepend(top);
       dom.cellList.append(cell);
     }
   }
@@ -470,7 +566,7 @@
 
   function drawHistoryChart() {
     const canvas = dom.historyChart;
-    if (!canvas) return;
+    if (!canvas || state.dashboardTab !== "dynamics") return;
 
     const points = state.history.slice().reverse().filter((item) => {
       return numberOrNull(item.soc) != null || numberOrNull(item.voltage) != null;
@@ -612,7 +708,97 @@
   }
 
   function displayName(battery) {
-    return battery.bluetooth_name || battery.bms_uid || "Аккумулятор";
+    return battery.bluetooth_name || battery.advertised_name || battery.bms_uid || "Аккумулятор";
+  }
+
+  function textOrEmpty(value) {
+    return typeof value === "string" ? value.trim() : "";
+  }
+
+  function renderOwner(battery) {
+    if (!dom.ownerCard) return;
+    const name = textOrEmpty(battery.owner_name);
+    const phone = textOrEmpty(battery.owner_phone);
+    const email = textOrEmpty(battery.owner_email);
+    const hasAny = Boolean(name || phone || email);
+    const contacts = dom.ownerPhone ? dom.ownerPhone.parentElement : null;
+
+    dom.ownerCard.classList.remove("hidden");
+    if (dom.ownerName) {
+      dom.ownerName.classList.toggle("hidden", !hasAny);
+      dom.ownerName.textContent = name || "Имя не указано";
+    }
+    if (contacts) contacts.classList.toggle("hidden", !hasAny);
+    if (dom.ownerEmpty) dom.ownerEmpty.classList.toggle("hidden", hasAny);
+    if (!hasAny) return;
+
+    setContactLink(dom.ownerPhone, phone, "tel:");
+    setContactLink(dom.ownerEmail, email, "mailto:");
+  }
+
+  function setContactLink(node, value, prefix) {
+    if (!node) return;
+    if (!value) {
+      node.textContent = "—";
+      node.removeAttribute("href");
+      return;
+    }
+    node.textContent = value;
+    const hrefValue = prefix === "tel:" ? value.replace(/[^\d+]/g, "") : value;
+    node.setAttribute("href", prefix + hrefValue);
+  }
+
+  function looksLikeRedDlName(value) {
+    return typeof value === "string" && /^\s*DL/i.test(value);
+  }
+
+  function isRedDlSeries(battery) {
+    if (!battery) return false;
+    if (battery.hardware_family === "dl_red") return true;
+    if (battery.config_check && battery.config_check.hardware_family === "dl_red") return true;
+    return [
+      battery.advertised_name,
+      battery.bluetooth_name,
+      battery.bms_uid,
+    ].some(looksLikeRedDlName);
+  }
+
+  function renderHardwareBadge(battery) {
+    if (!dom.hardwareBadge) return;
+    if (!isRedDlSeries(battery)) {
+      dom.hardwareBadge.classList.add("hidden");
+      dom.hardwareBadge.textContent = "";
+      return;
+    }
+    dom.hardwareBadge.classList.remove("hidden");
+    dom.hardwareBadge.textContent = RED_DL_LABEL;
+  }
+
+  function filterDlRedItems(items) {
+    return (Array.isArray(items) ? items : []).filter((item) => !DL_RED_SKIPPED_KEYS.has(item.key));
+  }
+
+  function visibleConfigCheck(battery) {
+    const check = battery && battery.config_check;
+    if (!check) return null;
+    if (!isRedDlSeries(battery)) return check;
+
+    const mismatches = filterDlRedItems(check.mismatches);
+    const missing = filterDlRedItems(check.missing);
+    let status = check.status;
+    if (status === "mismatch" && mismatches.length === 0) {
+      status = missing.length === 0 ? "ok" : "incomplete";
+    } else if (status === "incomplete" && missing.length === 0 && mismatches.length === 0) {
+      status = "ok";
+    }
+    return {
+      ...check,
+      status,
+      mismatches,
+      missing,
+      mismatch_count: mismatches.length,
+      missing_count: missing.length,
+    };
   }
 
   function isOnline(timestamp) {
@@ -690,6 +876,15 @@
   function formatVoltage(value) {
     const number = numberOrNull(value);
     return number == null ? "—" : `${formatNumber(number, 3)} В`;
+  }
+
+  function formatMillivolts(value, withSign) {
+    const number = numberOrNull(value);
+    if (number == null) return "—";
+    const mv = Math.round(number * 1000);
+    if (mv === 0) return "0 мВ";
+    const signed = withSign && mv > 0 ? `+${mv}` : String(mv);
+    return `${signed} мВ`;
   }
 
   function formatCurrent(value) {

@@ -11,8 +11,8 @@ android {
         applicationId = "ru.liferych.bms"
         minSdk = 23
         targetSdk = 35
-        versionCode = 62
-        versionName = "0.2.2-balance-regs"
+        versionCode = 64
+        versionName = "0.2.4-owner-profile"
     }
 
     sourceSets {

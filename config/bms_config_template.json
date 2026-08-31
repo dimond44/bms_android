@@ -1,6 +1,6 @@
 {
   "id": "liferych-lfp-default",
-  "version": 3,
+  "version": 4,
   "chemistry": "LiFePO4",
   "supported_series": [4, 8],
   "parameters": [
@@ -24,6 +24,7 @@
       "unit": "V",
       "tolerance": 0.03,
       "enforcement": "required",
+      "skip_for": ["dl_red"],
       "expected": 2.5
     },
     {
@@ -35,6 +36,7 @@
       "unit": "V",
       "tolerance": 0.03,
       "enforcement": "required",
+      "skip_for": ["dl_red"],
       "expected": 3.65
     },
     {
@@ -140,6 +142,7 @@
       "unit": "V",
       "tolerance": 0.05,
       "enforcement": "required",
+      "skip_for": ["dl_red"],
       "expected": 3
     },
     {
@@ -151,6 +154,7 @@
       "unit": "V",
       "tolerance": 0.05,
       "enforcement": "required",
+      "skip_for": ["dl_red"],
       "expected": 3.8
     },
     {
@@ -162,6 +166,7 @@
       "unit": "mV",
       "tolerance": 0,
       "enforcement": "required",
+      "skip_for": ["dl_red"],
       "expected": 10
     }
   ]

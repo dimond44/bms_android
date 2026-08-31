@@ -177,6 +177,17 @@ function validateTelemetry(payload) {
   if (payload.raw != null && !isPlainObject(payload.raw)) return "invalid_raw";
   if (payload.errors != null && !Array.isArray(payload.errors)) return "invalid_errors";
   if (payload.events != null && !Array.isArray(payload.events)) return "invalid_events";
+  if (payload.advertised_name != null && typeof payload.advertised_name !== "string") {
+    return "invalid_advertised_name";
+  }
+  if (payload.hardware_family != null && typeof payload.hardware_family !== "string") {
+    return "invalid_hardware_family";
+  }
+  for (const field of ["owner_name", "owner_phone", "owner_email"]) {
+    if (payload[field] != null && typeof payload[field] !== "string") {
+      return `invalid_${field}`;
+    }
+  }
 
   return null;
 }
@@ -188,6 +199,17 @@ function validateConfigCheck(payload) {
   }
   if (payload.bluetooth_name != null && typeof payload.bluetooth_name !== "string") {
     return "invalid_bluetooth_name";
+  }
+  if (payload.advertised_name != null && typeof payload.advertised_name !== "string") {
+    return "invalid_advertised_name";
+  }
+  if (payload.hardware_family != null && typeof payload.hardware_family !== "string") {
+    return "invalid_hardware_family";
+  }
+  for (const field of ["owner_name", "owner_phone", "owner_email"]) {
+    if (payload[field] != null && typeof payload[field] !== "string") {
+      return `invalid_${field}`;
+    }
   }
   if (payload.bluetooth_address != null && typeof payload.bluetooth_address !== "string") {
     return "invalid_bluetooth_address";
