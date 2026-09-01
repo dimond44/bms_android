@@ -62,7 +62,7 @@ private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_su
 private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
 private const val SERVER_WARRANTY_UPDATE_URL = "http://dimond44.xsph.ru/api/warranty_update.php"
 private const val SERVER_API_KEY = "change_me_api_key_2026"
-private const val APP_VERSION = "0.2.12-service"
+private const val APP_VERSION = "0.2.13-service"
 private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
 private const val CONFIG_UPLOAD_INTERVAL_MS = 300000L
@@ -2269,11 +2269,25 @@ class MainActivity : ComponentActivity() {
         val family = currentHardwareFamily()
         val queue = java.util.ArrayDeque<RemoteWriteCommand>()
         var id = 1
+        serviceWriteResults.clear()
+        serviceWriteCapacityAh = capacityAh
         for (parameter in template.parameters) {
             if (shouldSkipTemplateParameter(parameter, family)) continue
             val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
             val raw = Math.round((expected - parameter.offset) * parameter.scale).toInt()
             if (raw < 0 || raw > 0xFFFF) continue
+            if (registerMatchesExpected(parameter.register, expected, parameter.scale, parameter.offset, parameter.tolerance)) {
+                serviceWriteResults += ServiceWriteResult(
+                    key = parameter.key,
+                    label = parameter.label,
+                    expected = expected,
+                    actual = scaledRegisterValue(parameter.register, parameter.scale, parameter.offset),
+                    unit = parameter.unit,
+                    ok = true,
+                    error = null
+                )
+                continue
+            }
             queue.add(
                 RemoteWriteCommand(
                     id = id++,
@@ -2289,44 +2303,60 @@ class MainActivity : ComponentActivity() {
                 )
             )
         }
-        val milliAh = Math.round(capacityAh * 1000.0).toInt().coerceIn(0, 0x7FFFFFFF)
-        queue.add(
-            RemoteWriteCommand(
-                id = id++,
-                key = "nominal_capacity_lo",
+        if (capacityAlreadyMatches(capacityAh)) {
+            serviceWriteResults += ServiceWriteResult(
+                key = "nominal_capacity",
                 label = "Номинальная емкость",
-                register = 0x010A,
-                rawValue = milliAh and 0xFFFF,
-                value = (milliAh and 0xFFFF).toDouble(),
-                scale = 1.0,
-                offset = 0.0,
+                expected = capacityAh,
+                actual = currentNominalCapacityAh(),
                 unit = "Ah",
-                localOnly = true,
-                displayValue = capacityAh
+                ok = true,
+                error = null
             )
-        )
-        queue.add(
-            RemoteWriteCommand(
-                id = id,
-                key = "nominal_capacity_hi",
-                label = "Номинальная емкость",
-                register = 0x010B,
-                rawValue = milliAh ushr 16,
-                value = (milliAh ushr 16).toDouble(),
-                scale = 1.0,
-                offset = 0.0,
-                unit = "Ah",
-                localOnly = true,
-                displayValue = capacityAh
+        } else {
+            val milliAh = Math.round(capacityAh * 1000.0).toInt().coerceIn(0, 0x7FFFFFFF)
+            queue.add(
+                RemoteWriteCommand(
+                    id = id++,
+                    key = "nominal_capacity_lo",
+                    label = "Номинальная емкость",
+                    register = 0x010A,
+                    rawValue = milliAh and 0xFFFF,
+                    value = (milliAh and 0xFFFF).toDouble(),
+                    scale = 1.0,
+                    offset = 0.0,
+                    unit = "Ah",
+                    localOnly = true,
+                    displayValue = capacityAh
+                )
             )
-        )
+            queue.add(
+                RemoteWriteCommand(
+                    id = id,
+                    key = "nominal_capacity_hi",
+                    label = "Номинальная емкость",
+                    register = 0x010B,
+                    rawValue = milliAh ushr 16,
+                    value = (milliAh ushr 16).toDouble(),
+                    scale = 1.0,
+                    offset = 0.0,
+                    unit = "Ah",
+                    localOnly = true,
+                    displayValue = capacityAh
+                )
+            )
+        }
         if (queue.isEmpty()) {
-            toast("В шаблоне нет параметров для записи")
+            serviceWriteActive = false
+            uploadServiceReport()
+            showServiceScreen()
+            toast(
+                if (serviceWriteResults.isEmpty()) "В шаблоне нет параметров для записи"
+                else "Все параметры уже совпадают, запись не нужна"
+            )
             return
         }
-        serviceWriteResults.clear()
         serviceWriteQueue = queue
-        serviceWriteCapacityAh = capacityAh
         serviceWriteActive = true
         showServiceScreen()
         val first = serviceWriteQueue.poll()
@@ -5253,6 +5283,8 @@ class MainActivity : ComponentActivity() {
                 testSocWriteDoneForConnection = false
                 servicesDiscoveryStarted = false
                 negotiatedMtu = 23
+                data.cells.clear()
+                data.cellCount = null
                 runOnUiThread {
                     if (::statusText.isInitialized) statusText.text = "Подключено. Читаю сервисы..."
                     selectedAddress?.let { address ->
@@ -5699,6 +5731,7 @@ class MainActivity : ComponentActivity() {
                 data.chargerConnected = (p[2].toInt() and 0xFF) != 0
                 data.loadConnected = (p[3].toInt() and 0xFF) != 0
                 data.cycles = u16(p, 5)
+                pruneCellsToCount()
             }
             0x95 -> {
                 val group = p[0].toInt() and 0xFF
@@ -5763,7 +5796,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun pruneCellsToCount() {
+        val count = data.cellCount ?: return
+        val stale = data.cells.keys.filter { it < 1 || it > count }
+        if (stale.isEmpty()) return
+        for (key in stale) data.cells.remove(key)
+    }
+
     private fun updateDerived() {
+        pruneCellsToCount()
         if (hasTemperatureSensorError()) {
             data.temps.clear()
             data.minTemp = null
@@ -6020,6 +6061,49 @@ class MainActivity : ComponentActivity() {
         val lo = configRegisters[0x010A] ?: return null
         val hi = configRegisters[0x010B] ?: return null
         return ((hi shl 16) or (lo and 0xFFFF)).toDouble() / 1000.0
+    }
+
+    private fun scaledRegisterValue(register: Int, scale: Double, offset: Double): Double? {
+        val raw = configRegisters[register] ?: return null
+        return (raw.toDouble() / scale) + offset
+    }
+
+    private fun registerMatchesExpected(
+        register: Int,
+        expected: Double,
+        scale: Double,
+        offset: Double,
+        tolerance: Double
+    ): Boolean {
+        val raw = configRegisters[register] ?: return false
+        val expectedRaw = Math.round((expected - offset) * scale).toInt()
+        if (raw == expectedRaw) return true
+        val actual = (raw.toDouble() / scale) + offset
+        return kotlin.math.abs(actual - expected) <= tolerance
+    }
+
+    private fun currentNominalCapacityAh(): Double? {
+        reconstructedCapacityAh()?.let { return it }
+        val soc = data.soc
+        val rem = data.remainingAh
+        if (rem != null && rem > 0.0 && soc != null && soc >= 99.0) return rem
+        return data.estimatedFullAh
+    }
+
+    private fun capacityAlreadyMatches(targetAh: Double): Boolean {
+        val current = currentNominalCapacityAh() ?: return false
+        return kotlin.math.abs(current - targetAh) <= 0.6
+    }
+
+    private fun remoteWriteAlreadyMatches(command: RemoteWriteCommand): Boolean {
+        if (command.key == "nominal_capacity_lo" || command.key == "nominal_capacity_hi") {
+            val target = command.displayValue ?: serviceWriteCapacityAh ?: return false
+            return capacityAlreadyMatches(target)
+        }
+        val raw = configRegisters[command.register] ?: return false
+        if (raw == command.rawValue) return true
+        val actual = (raw.toDouble() / command.scale) + command.offset
+        return kotlin.math.abs(actual - command.value) <= 0.05
     }
 
     private fun advertisedBluetoothName(): String {
@@ -6385,6 +6469,7 @@ class MainActivity : ComponentActivity() {
             ConfigReadRequest("dl_settings_0151_0177", 0x81, 0x0151, 0x27),
             ConfigReadRequest("dl_settings_01C3_0212", 0x81, 0x01C3, 0x50),
             ConfigReadRequest("dl_balance_0220_022A", 0x81, 0x0220, 0x0B),
+            ConfigReadRequest("dl_soc100_0229", 0x81, 0x0229, 0x01),
             ConfigReadRequest("dl_comm_024B_024C", 0x81, 0x024B, 0x02)
         )
     }
@@ -6474,6 +6559,21 @@ class MainActivity : ComponentActivity() {
             if (command.localOnly) completeServiceWriteStep(command, false, null, "no_ble")
             return
         }
+        if (remoteWriteAlreadyMatches(command)) {
+            val actual = if (command.key == "nominal_capacity_hi" || command.key == "nominal_capacity_lo") {
+                currentNominalCapacityAh()
+            } else {
+                scaledRegisterValue(command.register, command.scale, command.offset)
+            }
+            toast("${command.label}: уже совпадает")
+            if (command.localOnly) {
+                completeServiceWriteStep(command, true, actual, null)
+            } else {
+                ackRemoteWrite(command, "done", actual, null)
+                mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 400)
+            }
+            return
+        }
 
         pendingRemoteWrite = command
         remoteWriteInProgress = true
@@ -6493,14 +6593,15 @@ class MainActivity : ComponentActivity() {
         val timeOk = writeBleFrame(timeFrame)
         configRaw["remote_write_time"] = if (timeOk) "ok" else "failed"
         mainHandler.postDelayed({
-            val writeOk = writeBleFrame(writeFrame)
-            configRaw["remote_write_reg"] = if (writeOk) "ok" else "failed"
-            if (!writeOk) {
-                failRemoteWrite("ble_write_failed")
-                return@postDelayed
-            }
+            val unlockOk = writeBleFrame(openFrame)
+            configRaw["remote_write_unlock"] = if (unlockOk) "ok" else "failed"
             mainHandler.postDelayed({
-                writeBleFrame(openFrame)
+                val writeOk = writeBleFrame(writeFrame)
+                configRaw["remote_write_reg"] = if (writeOk) "ok" else "failed"
+                if (!writeOk) {
+                    failRemoteWrite("ble_write_failed")
+                    return@postDelayed
+                }
                 mainHandler.postDelayed({
                     remoteWriteAwaitingVerify = true
                     startConfigReadIfNeeded(force = true)
@@ -6660,16 +6761,28 @@ class MainActivity : ComponentActivity() {
         configModbusBuffer.clear()
 
         // Ручное обновление: очищаем старые значения и читаем свежие.
-        // Автоматического перечитывания больше нет.
-        if (force) {
+        // После записи параметра не чистим карту — проверяем только записанный регистр.
+        if (force && !remoteWriteAwaitingVerify) {
             configRegisters.clear()
             configLoadedFromCache = false
         }
 
         configRaw.clear()
         configReadQueue.clear()
-        for (req in originalDalyConfigReadRequests()) {
-            configReadQueue.add(req)
+        val verifyCommand = pendingRemoteWrite.takeIf { remoteWriteAwaitingVerify }
+        if (verifyCommand != null) {
+            val slave = if (verifyCommand.register in DALY_SN_CODE_START..DALY_SN_CODE_END) {
+                0xD2
+            } else {
+                0x81
+            }
+            configReadQueue.add(
+                ConfigReadRequest("verify_${verifyCommand.key}", slave, verifyCommand.register, 1)
+            )
+        } else {
+            for (req in originalDalyConfigReadRequests()) {
+                configReadQueue.add(req)
+            }
         }
         lastConfigStatus = "auto_read_once_hci_exact_daly_registers"
         refreshManageIfVisible()
@@ -7279,6 +7392,7 @@ class MainActivity : ComponentActivity() {
         putNullable(obj, "remaining_ah", data.remainingAh)
         putNullable(obj, "estimated_full_ah", data.estimatedFullAh)
         putNullable(obj, "nominal_capacity_ah", nominalCapacityAh())
+        data.cellCount?.let { obj.put("cell_count", it) }
         obj.put("capacity_source", nominalCapacitySource())
         putNullable(obj, "cell_diff_v", data.cellDiffV)
         putNullable(obj, "min_cell_v", data.minCellV)

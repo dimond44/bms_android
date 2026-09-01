@@ -535,7 +535,7 @@
   function renderCells(latest) {
     clear(dom.cellSummary);
     clear(dom.cellList);
-    const entries = sortedEntries(latest.cells);
+    const entries = liveCellEntries(latest);
     if (entries.length === 0) {
       appendText(dom.cellSummary, "div", "feed-empty", "нет данных");
       appendText(dom.cellList, "div", "feed-empty", "Нет данных по ячейкам.");
@@ -959,12 +959,28 @@
   }
 
   function detectSeries(battery) {
+    const latest = { ...(battery || {}), ...(state.history[0] || {}) };
+    const live = liveCellEntries(latest).length;
+    if (live > 0) return live;
     const check = battery && battery.config_check;
     const fromCheck = check ? numberOrNull(check.series_count) : null;
     if (fromCheck != null) return fromCheck;
-    const latest = state.history[0] || battery;
-    const count = sortedEntries(latest && latest.cells).length;
-    return count > 0 ? count : null;
+    return null;
+  }
+
+  function liveCellEntries(latest) {
+    const entries = sortedEntries(latest && latest.cells);
+    if (entries.length === 0) return entries;
+    const declared = numberOrNull(latest && latest.cell_count);
+    const voltage = numberOrNull(latest && latest.voltage);
+    let limit = declared != null && declared >= 1 ? declared : null;
+    if (voltage != null && voltage < 18) limit = Math.min(limit ?? 4, 4);
+    else if (voltage != null && voltage < 36) limit = Math.min(limit ?? 8, 8);
+    if (limit == null || limit < 1) return entries;
+    return entries.filter(([key]) => {
+      const no = Number(key);
+      return Number.isFinite(no) && no >= 1 && no <= limit;
+    });
   }
 
   function expectedFromParam(param, series) {
