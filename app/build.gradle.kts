@@ -11,8 +11,29 @@ android {
         applicationId = "ru.liferych.bms"
         minSdk = 23
         targetSdk = 35
-        versionCode = 68
-        versionName = "0.2.8-name-cycles"
+        versionCode = 72
+        versionName = "0.2.12-service"
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    flavorDimensions += "role"
+    productFlavors {
+        create("user") {
+            dimension = "role"
+            isDefault = true
+            applicationId = "ru.liferych.bms"
+            resValue("string", "app_name", "ЛИФЕРЫЧ BMS")
+            buildConfigField("boolean", "IS_SERVICE", "false")
+        }
+        create("service") {
+            dimension = "role"
+            applicationId = "ru.liferych.bms.service"
+            resValue("string", "app_name", "ЛИФЕРЫЧ Сервис")
+            buildConfigField("boolean", "IS_SERVICE", "true")
+        }
     }
 
     sourceSets {

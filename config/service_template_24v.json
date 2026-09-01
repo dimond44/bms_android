@@ -1,8 +1,10 @@
 {
-  "id": "liferych-lfp-default",
-  "version": 4,
+  "id": "liferych-lfp-24v",
+  "version": 1,
   "chemistry": "LiFePO4",
-  "supported_series": [4, 8],
+  "series_count": 8,
+  "pack_voltage": 24,
+  "supported_series": [8],
   "parameters": [
     {
       "key": "sleep_timeout",
@@ -68,10 +70,7 @@
       "unit": "V",
       "tolerance": 0.15,
       "enforcement": "required",
-      "expected_by_series": {
-        "4": 14.6,
-        "8": 29.2
-      }
+      "expected": 29.2
     },
     {
       "key": "pack_under_voltage",
@@ -82,10 +81,7 @@
       "unit": "V",
       "tolerance": 0.15,
       "enforcement": "required",
-      "expected_by_series": {
-        "4": 10,
-        "8": 20
-      }
+      "expected": 20
     },
     {
       "key": "charge_high_temp",

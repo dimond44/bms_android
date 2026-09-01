@@ -57,11 +57,12 @@ private const val BLE_LOG_TAG = "LiferychBmsBle"
 private const val DEFAULT_ADMIN_SERVER_BASE_URL = "http://192.168.70.142:3000"
 private const val LOCAL_UPLOAD_PATH = "/api/upload.php"
 private const val LOCAL_CONFIG_UPLOAD_PATH = "/api/config_upload.php"
+private const val LOCAL_SERVICE_REPORT_PATH = "/api/v1/service-report"
 private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_submit.php"
 private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
 private const val SERVER_WARRANTY_UPDATE_URL = "http://dimond44.xsph.ru/api/warranty_update.php"
 private const val SERVER_API_KEY = "change_me_api_key_2026"
-private const val APP_VERSION = "0.2.8-name-cycles"
+private const val APP_VERSION = "0.2.12-service"
 private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
 private const val CONFIG_UPLOAD_INTERVAL_MS = 300000L
@@ -72,6 +73,9 @@ private const val TEST_SOC_PERCENT_ON_CONNECT = 90.0
 private const val TEST_SOC_REGISTER_ADDR = 0x0116
 private const val HARDWARE_FAMILY_STANDARD = "standard"
 private const val HARDWARE_FAMILY_DL_RED = "dl_red"
+private const val DALY_SN_CODE_START = 0x0057
+private const val DALY_SN_CODE_END = 0x005D
+private const val DALY_SN_CODE_COUNT = DALY_SN_CODE_END - DALY_SN_CODE_START + 1
 private val DL_RED_SKIPPED_TEMPLATE_KEYS = setOf(
     "soc_calibration_0",
     "soc_calibration_100",
@@ -136,7 +140,19 @@ data class RemoteWriteCommand(
     val value: Double,
     val scale: Double,
     val offset: Double,
-    val unit: String
+    val unit: String,
+    val localOnly: Boolean = false,
+    val displayValue: Double? = null
+)
+
+data class ServiceWriteResult(
+    val key: String,
+    val label: String,
+    val expected: Double?,
+    val actual: Double?,
+    val unit: String,
+    val ok: Boolean,
+    val error: String? = null
 )
 
 data class BmsConfigTemplate(
@@ -339,6 +355,9 @@ class MainActivity : ComponentActivity() {
     private val serverPrefs by lazy {
         getSharedPreferences("admin_server_settings", MODE_PRIVATE)
     }
+    private val servicePrefs by lazy {
+        getSharedPreferences("service_profile", MODE_PRIVATE)
+    }
     private var bleDebugText: String = ""
     private val WARRANTY_MEDIA_REQUEST_CODE = 4501
     private val PROFILE_AVATAR_REQUEST_CODE = 4502
@@ -414,6 +433,18 @@ class MainActivity : ComponentActivity() {
     private var remoteWriteAwaitingVerify: Boolean = false
     private var pendingRemoteWrite: RemoteWriteCommand? = null
     private var lastRemoteWritePollAt: Long = 0L
+    private var serviceTemplateKey: String = "12v"
+    private var serviceCapacityText: String = ""
+    private var serviceWriteQueue = java.util.ArrayDeque<RemoteWriteCommand>()
+    private val serviceWriteResults: MutableList<ServiceWriteResult> = mutableListOf()
+    private var serviceWriteActive: Boolean = false
+    private var serviceWriteCapacityAh: Double? = null
+    private var bluetoothIdValue: TextView? = null
+    private var bmsSnValue: TextView? = null
+    private var serviceStatusText: TextView? = null
+    private var serviceUploadStatusText: TextView? = null
+    private var dashboardUploadStatusText: TextView? = null
+    private var pendingFirstTelemetryUpload = false
     private val remoteWritePollRunnable = object : Runnable {
         override fun run() {
             if (bluetoothGatt == null || writeCharacteristic == null || !polling) return
@@ -557,6 +588,22 @@ class MainActivity : ComponentActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { topMargin = dp(18) }
         )
+        if (isServiceApp()) {
+            launchTop.addView(
+                TextView(this).apply {
+                    text = "СЕРВИС"
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.rgb(16, 17, 20))
+                    textSize = 14f
+                    letterSpacing = 0.18f
+                    typeface = interFont(760)
+                },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(8) }
+            )
+        }
 
         val connect = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1461,7 +1508,9 @@ class MainActivity : ComponentActivity() {
             if (address.isBlank()) continue
             result += SavedBattery(
                 address = address,
-                bluetoothName = item.optString("bluetooth_name"),
+                bluetoothName = sanitizeBleText(item.optString("bluetooth_name")).ifBlank {
+                    item.optString("bluetooth_name")
+                },
                 customName = item.optString("custom_name"),
                 soc = if (item.has("soc") && !item.isNull("soc")) item.optDouble("soc") else null,
                 capacityAh = if (item.has("capacity_ah") && !item.isNull("capacity_ah")) {
@@ -1496,9 +1545,9 @@ class MainActivity : ComponentActivity() {
         val current = loadSavedBatteries().toMutableList()
         val index = current.indexOfFirst { it.address == address }
         val previous = current.getOrNull(index)
-        val bluetoothName = scanNames[address]
-            ?: previous?.bluetoothName
-            ?: selectedDeviceName
+        val bluetoothName = sanitizeBleText(
+            scanNames[address] ?: previous?.bluetoothName ?: selectedDeviceName
+        ).ifBlank { selectedAddress.orEmpty() }
         val updated = SavedBattery(
             address = address,
             bluetoothName = bluetoothName,
@@ -1611,7 +1660,7 @@ class MainActivity : ComponentActivity() {
             "Bluetooth\nподключен"
         }
         val h = header(
-            "ЛИФЕРЫЧ BMS",
+            appBrandTitle(),
             selectedDeviceName.ifBlank { selectedAddress ?: "" },
             connectionLabel
         )
@@ -1732,6 +1781,35 @@ class MainActivity : ComponentActivity() {
         cycleCountValue = cyclesMetric.second
         metricRow3.addView(cyclesMetric.first, marginLp(0, -2, 4, 0, 0, 0).apply { weight = 1f })
         content.addView(metricRow3, marginLp(-1, -2, 0, 8, 0, 0))
+
+        val idRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btMetric = metricBox("ID", bluetoothId().ifBlank { "--" }, "Bluetooth ID", "MAC-адрес", 13f, true)
+        bluetoothIdValue = btMetric.second
+        idRow.addView(btMetric.first, marginLp(0, -2, 0, 0, 4, 0).apply { weight = 1f })
+        val snMetric = metricBox("SN", bmsSn().ifBlank { "--" }, "SN BMS", "Заводской номер", 13f, true)
+        bmsSnValue = snMetric.second
+        idRow.addView(snMetric.first, marginLp(0, -2, 4, 0, 0, 0).apply { weight = 1f })
+        content.addView(idRow, marginLp(-1, -2, 0, 8, 0, 0))
+
+        if (isServiceApp()) {
+            dashboardUploadStatusText = TextView(this).apply {
+                text = currentUploadStatusText()
+                textSize = 12f
+                setTextColor(Color.rgb(90, 90, 90))
+            }
+            content.addView(dashboardUploadStatusText, marginLp(-1, -2, 0, 0, 0, 8))
+            content.addView(TextView(this).apply {
+                text = "ОТПРАВИТЬ НА СЕРВЕР"
+                gravity = Gravity.CENTER
+                textSize = 14f
+                typeface = interFont(760)
+                setTextColor(Color.rgb(16, 17, 20))
+                background = round(red, dp(14), Color.TRANSPARENT, 0)
+                setOnClickListener { uploadCurrentData(force = true) }
+            }, marginLp(-1, dp(48), 0, 0, 0, 8))
+        } else {
+            dashboardUploadStatusText = null
+        }
 
         batteryInfoText = TextView(this).apply { visibility = View.GONE }
 
@@ -1936,6 +2014,8 @@ class MainActivity : ComponentActivity() {
             setOnClickListener {
                 if (text.contains("Главная")) {
                     showBatteriesScreen()
+                } else if (text.contains("Сервис")) {
+                    showServiceScreen()
                 } else if (text.contains("Управление") || text.contains("Настройки")) {
                     showManageScreen()
                 } else if (text.contains("Журнал")) {
@@ -1943,9 +2023,13 @@ class MainActivity : ComponentActivity() {
                 } else if (text.contains("Поддержка") || text.contains("Техподдержка")) {
                     showSupportScreen()
                 } else if (text.contains("Профиль")) {
-                    val loggedIn = getSharedPreferences("user_profile", MODE_PRIVATE)
-                        .getBoolean("logged_in", false)
-                    if (loggedIn) showProfileScreen() else showAuthScreen()
+                    if (isServiceApp()) {
+                        showProfileScreen()
+                    } else {
+                        val loggedIn = getSharedPreferences("user_profile", MODE_PRIVATE)
+                            .getBoolean("logged_in", false)
+                        if (loggedIn) showProfileScreen() else showAuthScreen()
+                    }
                 }
             }
         }, LinearLayout.LayoutParams(0, -1, 1f))
@@ -1958,13 +2042,372 @@ class MainActivity : ComponentActivity() {
             setPadding(0, dp(8), 0, dp(8))
             elevation = dp(8).toFloat()
             navItem(this, "⌂\nГлавная", selectedTab == "main")
-            navItem(this, "≡\nЖурнал", selectedTab == "journal")
-            navItem(this, "⚙\nНастройки", selectedTab == "manage")
-            navItem(this, "☎\nПоддержка", selectedTab == "support")
-            navItem(this, "●\nПрофиль", selectedTab == "profile")
+            if (isServiceApp()) {
+                navItem(this, "⚙\nСервис", selectedTab == "service")
+                navItem(this, "●\nПрофиль", selectedTab == "profile")
+            } else {
+                navItem(this, "≡\nЖурнал", selectedTab == "journal")
+                navItem(this, "⚙\nНастройки", selectedTab == "manage")
+                navItem(this, "☎\nПоддержка", selectedTab == "support")
+                navItem(this, "●\nПрофиль", selectedTab == "profile")
+            }
         }
     }
 
+
+    private fun showServiceScreen() {
+        if (!isServiceApp()) {
+            showBatteriesScreen()
+            return
+        }
+        screenState = "service"
+        currentTab = "service"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+        root.addView(
+            header(
+                "Сервис BMS",
+                selectedDeviceName.ifBlank { selectedAddress ?: "нет подключения" },
+                if (bluetoothGatt != null) "Bluetooth\nподключен" else "Нет BLE"
+            )
+        )
+
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(16))
+        }
+
+        val assembler = assemblerName()
+        content.addView(TextView(this).apply {
+            text = if (assembler.isBlank()) {
+                "Имя сборщика не указано. Телеметрия на сервер всё равно уходит. Имя нужно только для записи шаблона."
+            } else {
+                "Сборщик: $assembler"
+            }
+            textSize = 14f
+            typeface = interFont(700)
+            setTextColor(if (assembler.isBlank()) Color.rgb(140, 90, 20) else Color.rgb(16, 17, 20))
+        }, marginLp(-1, -2, 0, 0, 0, 10))
+
+        val serverCard = card()
+        serverCard.addView(sectionTitle("Сервер", adminServerBaseUrl()))
+        serviceUploadStatusText = TextView(this).apply {
+            text = currentUploadStatusText()
+            textSize = 13f
+            setTextColor(Color.rgb(50, 50, 50))
+        }
+        serverCard.addView(serviceUploadStatusText, marginLp(-1, -2, 0, 0, 0, 10))
+        val serverRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        serverRow.addView(TextView(this).apply {
+            text = "Проверить связь"
+            gravity = Gravity.CENTER
+            textSize = 14f
+            typeface = interFont(740)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(Color.WHITE, dp(12), Color.rgb(223, 229, 235), 1)
+            setOnClickListener { pingAdminServer() }
+        }, LinearLayout.LayoutParams(0, dp(48), 1f))
+        serverRow.addView(TextView(this).apply {
+            text = "Отправить сейчас"
+            gravity = Gravity.CENTER
+            textSize = 14f
+            typeface = interFont(740)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(red, dp(12), Color.TRANSPARENT, 0)
+            setOnClickListener { uploadCurrentData(force = true) }
+        }, marginLp(0, dp(48), 8, 0, 0, 0).apply { weight = 1f })
+        serverCard.addView(serverRow)
+        content.addView(serverCard, marginLp(-1, -2, 0, 0, 0, 12))
+
+        val idCard = card()
+        idCard.addView(sectionTitle("Идентификация BMS", ""))
+        idCard.addView(TextView(this).apply {
+            text = "Bluetooth ID: ${bluetoothId().ifBlank { "—" }}\nSN: ${bmsSn().ifBlank { "—" }}"
+            textSize = 14f
+            setTextColor(Color.rgb(50, 50, 50))
+        })
+        content.addView(idCard, marginLp(-1, -2, 0, 0, 0, 12))
+
+        val templateCard = card()
+        templateCard.addView(sectionTitle("Шаблон настроек", "12В или 24В"))
+        val tplRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun templateButton(key: String, title: String): TextView {
+            val selected = serviceTemplateKey == key
+            return TextView(this).apply {
+                text = title
+                gravity = Gravity.CENTER
+                textSize = 15f
+                typeface = interFont(740)
+                setTextColor(if (selected) Color.rgb(16, 17, 20) else Color.rgb(90, 90, 90))
+                background = round(if (selected) red else Color.WHITE, dp(12), Color.rgb(223, 229, 235), 1)
+                setOnClickListener {
+                    serviceTemplateKey = key
+                    showServiceScreen()
+                }
+            }
+        }
+        tplRow.addView(templateButton("12v", "12В · 4S"), LinearLayout.LayoutParams(0, dp(48), 1f))
+        tplRow.addView(templateButton("24v", "24В · 8S"), marginLp(0, dp(48), 8, 0, 0, 0).apply { weight = 1f })
+        templateCard.addView(tplRow, marginLp(-1, -2, 0, 0, 0, 10))
+        templateCard.addView(TextView(this).apply {
+            text = "Ёмкость, А·ч"
+            textSize = 12f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(111, 119, 129))
+        })
+        val capacityEdit = EditText(this).apply {
+            setText(serviceCapacityText)
+            hint = "например 105"
+            textSize = 16f
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setSingleLine(true)
+            setPadding(dp(12), 0, dp(12), 0)
+            background = round(Color.rgb(246, 247, 249), dp(12), Color.rgb(223, 229, 235), 1)
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    serviceCapacityText = s?.toString().orEmpty()
+                }
+            })
+        }
+        templateCard.addView(capacityEdit, LinearLayout.LayoutParams(-1, dp(52)))
+        content.addView(templateCard, marginLp(-1, -2, 0, 0, 0, 12))
+
+        content.addView(TextView(this).apply {
+            text = if (serviceWriteActive) "Идёт запись…" else "ЗАПИСАТЬ ШАБЛОН"
+            gravity = Gravity.CENTER
+            textSize = 15f
+            typeface = interFont(760)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(red, dp(14), Color.TRANSPARENT, 0)
+            isEnabled = !serviceWriteActive
+            alpha = if (serviceWriteActive) 0.6f else 1f
+            setOnClickListener { startServiceTemplateWrite() }
+        }, marginLp(-1, dp(54), 0, 0, 0, 10))
+
+        serviceStatusText = TextView(this).apply {
+            text = when {
+                serviceWriteActive -> "Запись параметров в BMS…"
+                serviceWriteResults.isNotEmpty() -> serviceWriteSummaryText()
+                else -> "После записи здесь появится список того, что ушло в BMS."
+            }
+            textSize = 13f
+            setTextColor(Color.rgb(90, 90, 90))
+        }
+        content.addView(serviceStatusText, marginLp(-1, -2, 0, 0, 0, 12))
+
+        if (serviceWriteResults.isNotEmpty()) {
+            val resultCard = card()
+            resultCard.addView(sectionTitle("Что записалось", serviceWriteSummaryText()))
+            for (item in serviceWriteResults) {
+                val line = "${if (item.ok) "✓" else "✗"}  ${item.label}: ${formatTemplateNumber(item.expected)} → ${formatTemplateNumber(item.actual)} ${item.unit}".trim()
+                resultCard.addView(TextView(this).apply {
+                    text = if (item.error.isNullOrBlank()) line else "$line\n${item.error}"
+                    textSize = 13f
+                    setTextColor(if (item.ok) Color.rgb(28, 160, 55) else Color.rgb(196, 40, 40))
+                    setPadding(0, dp(4), 0, dp(4))
+                })
+            }
+            content.addView(resultCard, marginLp(-1, -2, 0, 0, 0, 12))
+        }
+
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(fixedBottomNav("service"), LinearLayout.LayoutParams(-1, dp(70)))
+        setContentView(root)
+    }
+
+    private fun serviceWriteSummaryText(): String {
+        val ok = serviceWriteResults.count { it.ok }
+        return "Успешно $ok из ${serviceWriteResults.size}"
+    }
+
+    private fun startServiceTemplateWrite() {
+        if (!isServiceApp() || serviceWriteActive) return
+        if (assemblerName().isBlank()) {
+            toast("Сначала укажите имя сборщика в профиле")
+            return
+        }
+        val capacity = serviceCapacityText.replace(",", ".").trim().toDoubleOrNull()
+        if (capacity == null || capacity < 1.0 || capacity > 2000.0) {
+            toast("Введите ёмкость АКБ в А·ч")
+            return
+        }
+        if (bluetoothGatt == null || writeCharacteristic == null) {
+            toast("Подключите BMS по Bluetooth")
+            return
+        }
+        val series = if (serviceTemplateKey == "24v") 8 else 4
+        val cells = data.cellCount
+        val proceed = {
+            enqueueServiceTemplateWrites(capacity, series)
+        }
+        if (cells != null && cells != series) {
+            AlertDialog.Builder(this)
+                .setTitle("Проверьте шаблон")
+                .setMessage("BMS показывает $cells ячеек, выбран шаблон ${series}S (${if (series == 4) "12В" else "24В"}). Продолжить запись?")
+                .setNegativeButton("Отмена", null)
+                .setPositiveButton("Записать") { _, _ -> proceed() }
+                .show()
+        } else {
+            proceed()
+        }
+    }
+
+    private fun enqueueServiceTemplateWrites(capacityAh: Double, series: Int) {
+        val fileName = if (serviceTemplateKey == "24v") "service_template_24v.json" else "service_template_12v.json"
+        val template = try {
+            loadBmsConfigTemplate(fileName)
+        } catch (e: Exception) {
+            toast("Не удалось загрузить шаблон: ${e.message ?: e.javaClass.simpleName}")
+            return
+        }
+        val family = currentHardwareFamily()
+        val queue = java.util.ArrayDeque<RemoteWriteCommand>()
+        var id = 1
+        for (parameter in template.parameters) {
+            if (shouldSkipTemplateParameter(parameter, family)) continue
+            val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
+            val raw = Math.round((expected - parameter.offset) * parameter.scale).toInt()
+            if (raw < 0 || raw > 0xFFFF) continue
+            queue.add(
+                RemoteWriteCommand(
+                    id = id++,
+                    key = parameter.key,
+                    label = parameter.label,
+                    register = parameter.register,
+                    rawValue = raw,
+                    value = expected,
+                    scale = parameter.scale,
+                    offset = parameter.offset,
+                    unit = parameter.unit,
+                    localOnly = true
+                )
+            )
+        }
+        val milliAh = Math.round(capacityAh * 1000.0).toInt().coerceIn(0, 0x7FFFFFFF)
+        queue.add(
+            RemoteWriteCommand(
+                id = id++,
+                key = "nominal_capacity_lo",
+                label = "Номинальная емкость",
+                register = 0x010A,
+                rawValue = milliAh and 0xFFFF,
+                value = (milliAh and 0xFFFF).toDouble(),
+                scale = 1.0,
+                offset = 0.0,
+                unit = "Ah",
+                localOnly = true,
+                displayValue = capacityAh
+            )
+        )
+        queue.add(
+            RemoteWriteCommand(
+                id = id,
+                key = "nominal_capacity_hi",
+                label = "Номинальная емкость",
+                register = 0x010B,
+                rawValue = milliAh ushr 16,
+                value = (milliAh ushr 16).toDouble(),
+                scale = 1.0,
+                offset = 0.0,
+                unit = "Ah",
+                localOnly = true,
+                displayValue = capacityAh
+            )
+        )
+        if (queue.isEmpty()) {
+            toast("В шаблоне нет параметров для записи")
+            return
+        }
+        serviceWriteResults.clear()
+        serviceWriteQueue = queue
+        serviceWriteCapacityAh = capacityAh
+        serviceWriteActive = true
+        showServiceScreen()
+        val first = serviceWriteQueue.poll()
+        if (first != null) startRemoteWrite(first)
+    }
+
+    private fun completeServiceWriteStep(
+        command: RemoteWriteCommand,
+        ok: Boolean,
+        actual: Double?,
+        error: String?
+    ) {
+        if (command.key != "nominal_capacity_lo") {
+            val expected = command.displayValue ?: command.value
+            val actualShown = if (command.key == "nominal_capacity_hi") reconstructedCapacityAh() else actual
+            val resultOk = if (command.key == "nominal_capacity_hi") {
+                val exp = serviceWriteCapacityAh
+                actualShown != null && exp != null && kotlin.math.abs(actualShown - exp) <= 0.6
+            } else {
+                ok
+            }
+            serviceWriteResults += ServiceWriteResult(
+                key = if (command.key == "nominal_capacity_hi") "nominal_capacity" else command.key,
+                label = command.label,
+                expected = expected,
+                actual = actualShown,
+                unit = command.unit,
+                ok = resultOk,
+                error = if (resultOk) null else error
+            )
+        }
+        val next = serviceWriteQueue.poll()
+        if (next != null) {
+            serviceStatusText?.text = "Запись: ${next.label}"
+            mainHandler.postDelayed({ startRemoteWrite(next) }, 450)
+        } else {
+            serviceWriteActive = false
+            uploadServiceReport()
+            showServiceScreen()
+            toast(serviceWriteSummaryText())
+        }
+    }
+
+    private fun uploadServiceReport() {
+        val items = JSONArray()
+        for (item in serviceWriteResults) {
+            items.put(JSONObject().apply {
+                put("key", item.key)
+                put("label", item.label)
+                if (item.expected != null && item.expected.isFinite()) put("expected", item.expected)
+                if (item.actual != null && item.actual.isFinite()) put("actual", item.actual)
+                put("unit", item.unit)
+                put("ok", item.ok)
+                if (!item.error.isNullOrBlank()) put("error", item.error)
+            })
+        }
+        val failed = serviceWriteResults.count { !it.ok }
+        val status = when {
+            serviceWriteResults.isEmpty() || failed == serviceWriteResults.size -> "failed"
+            failed == 0 -> "ok"
+            else -> "partial"
+        }
+        val body = JSONObject().apply {
+            put("api_key", SERVER_API_KEY)
+            put("bms_uid", bmsUid())
+            put("bluetooth_name", selectedDeviceName)
+            put("bluetooth_address", selectedAddress ?: "")
+            put("bluetooth_id", bluetoothId())
+            put("bms_sn", bmsSn())
+            put("source", "service")
+            put("assembler_name", assemblerName())
+            put("template_id", if (serviceTemplateKey == "24v") "liferych-lfp-24v" else "liferych-lfp-12v")
+            serviceWriteCapacityAh?.let { put("capacity_ah", it) }
+            put("written_at", System.currentTimeMillis())
+            put("status", status)
+            put("items", items)
+        }
+        thread {
+            adminJsonRequest("POST", LOCAL_SERVICE_REPORT_PATH, body)
+        }
+    }
 
     private fun showManageScreen() {
         if (configRegisters.isEmpty() && !configReadInProgress) loadCachedConfigForCurrentBms()
@@ -2387,8 +2830,8 @@ class MainActivity : ComponentActivity() {
         return raw / scale
     }
 
-    private fun loadBmsConfigTemplate(): BmsConfigTemplate {
-        val root = assets.open("bms_config_template.json")
+    private fun loadBmsConfigTemplate(fileName: String = "bms_config_template.json"): BmsConfigTemplate {
+        val root = assets.open(fileName)
             .bufferedReader(Charsets.UTF_8)
             .use { JSONObject(it.readText()) }
         val templateId = root.getString("id")
@@ -2982,11 +3425,6 @@ class MainActivity : ComponentActivity() {
         val counts = result?.let {
             "Отклонений: ${it.mismatches.size}  •  Нет данных: ${it.missing.size}"
         } ?: "Ожидается чтение настроек BMS"
-        val familyLine = if (isRedDlBms() || result?.hardwareFamily == HARDWARE_FAMILY_DL_RED) {
-            "\nКрасная BMS DL-серия (старая)"
-        } else {
-            ""
-        }
 
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -3001,7 +3439,7 @@ class MainActivity : ComponentActivity() {
                 setTextColor(color)
             })
             addView(TextView(this@MainActivity).apply {
-                text = "Проверено: $checked\n$counts$familyLine"
+                text = "Проверено: $checked\n$counts"
                 textSize = 12f
                 setTextColor(Color.rgb(75, 79, 84))
                 setPadding(0, dp(4), 0, 0)
@@ -3014,11 +3452,6 @@ class MainActivity : ComponentActivity() {
         if (result == null) return "Результата ещё нет. Проверка запустится после чтения конфигурации BMS."
         if (result.status == "checking") return "Чтение и проверка конфигурации выполняются."
         val lines = mutableListOf<String>()
-        if (result.hardwareFamily == HARDWARE_FAMILY_DL_RED || isRedDlBms()) {
-            lines += "Тип: красная BMS DL-серия (старая)"
-            lines += "Нет встроенного балансира; калибровка SOC 0 и SOC 100 не настраивается и не проверяется."
-            lines += ""
-        }
         lines += "Серия: ${result.seriesCount?.let { "${it}S" } ?: "не определена"}"
         lines += "Отклонений: ${result.mismatches.size}, нет данных: ${result.missing.size}"
         if (result.mismatches.isNotEmpty()) {
@@ -3533,6 +3966,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showProfileScreen() {
+        if (isServiceApp()) {
+            showServiceProfileScreen()
+            return
+        }
         screenState = "profile"
         currentTab = "profile"
         val prefs = getSharedPreferences("user_profile", MODE_PRIVATE)
@@ -3633,6 +4070,92 @@ class MainActivity : ComponentActivity() {
                     .putString("birth", birth.text.toString()).apply()
                 saveAdminServerBaseUrl(adminServerUrl.text.toString())
                 toast("Профиль и адрес админки сохранены")
+            }
+        }, marginLp(-1, dp(54), 0, 14, 0, 0))
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(fixedBottomNav("profile"), LinearLayout.LayoutParams(-1, dp(70)))
+        setContentView(root)
+    }
+
+    private fun showServiceProfileScreen() {
+        screenState = "profile"
+        currentTab = "profile"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+        root.addView(header("Профиль сборщика", "", ""))
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(18), dp(16), dp(18))
+        }
+        content.addView(TextView(this).apply {
+            text = "Сервис"
+            textSize = 22f
+            typeface = interFont(750)
+            setTextColor(Color.rgb(16, 17, 20))
+        }, marginLp(-1, -2, 0, 4, 0, 14))
+
+        val profileCard = card()
+        profileCard.addView(TextView(this).apply {
+            text = "Имя сборщика"
+            textSize = 12f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(0, 0, 0, dp(5))
+        })
+        val name = EditText(this).apply {
+            setText(assemblerName())
+            hint = "Фамилия Имя"
+            textSize = 15f
+            setSingleLine(true)
+            setPadding(dp(12), 0, dp(12), 0)
+            background = round(Color.rgb(246, 247, 249), dp(12), Color.rgb(223, 229, 235), 1)
+        }
+        profileCard.addView(name, LinearLayout.LayoutParams(-1, dp(52)))
+        profileCard.addView(TextView(this).apply {
+            text = "Адрес локальной админки"
+            textSize = 12f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(0, dp(12), 0, dp(5))
+        })
+        val adminServerUrl = EditText(this).apply {
+            setText(adminServerBaseUrl())
+            hint = "http://192.168.70.142:3000"
+            textSize = 15f
+            setSingleLine(true)
+            setPadding(dp(12), 0, dp(12), 0)
+            background = round(Color.rgb(246, 247, 249), dp(12), Color.rgb(223, 229, 235), 1)
+        }
+        profileCard.addView(adminServerUrl, LinearLayout.LayoutParams(-1, dp(52)))
+        profileCard.addView(TextView(this).apply {
+            text = "Телеметрия уходит на этот компьютер даже без имени сборщика. Имя нужно только когда записываете шаблон 12В/24В."
+            textSize = 12f
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(0, dp(8), 0, 0)
+        })
+        content.addView(profileCard)
+        content.addView(TextView(this).apply {
+            text = "СОХРАНИТЬ"
+            gravity = Gravity.CENTER
+            textSize = 15f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(red, dp(14), Color.TRANSPARENT, 0)
+            setOnClickListener {
+                val assembler = name.text.toString().trim()
+                servicePrefs.edit().putString("assembler_name", assembler).apply()
+                saveAdminServerBaseUrl(adminServerUrl.text.toString())
+                toast(
+                    if (assembler.isBlank()) {
+                        "Адрес сохранён. Имя сборщика нужно только для записи шаблона."
+                    } else {
+                        "Профиль сборщика сохранён"
+                    }
+                )
             }
         }, marginLp(-1, dp(54), 0, 14, 0, 0))
         scroll.addView(content)
@@ -4536,7 +5059,7 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("MissingPermission")
     private fun normalBleName(result: ScanResult): String? {
         val name = result.scanRecord?.deviceName ?: result.device?.name
-        val cleaned = name?.trim().orEmpty()
+        val cleaned = sanitizeBleText(name)
         if (cleaned.isBlank()) return null
         val bad = cleaned.equals("unknown", true) ||
             cleaned.equals("n/a", true) ||
@@ -4723,6 +5246,7 @@ class MainActivity : ComponentActivity() {
                 "connection address=${gatt.device.address} status=$status state=$newState"
             )
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                pendingFirstTelemetryUpload = true
                 configAutoReadStartedForConnection = false
                 templateCheckShownForConnection = false
                 setTemplateCheckChecking()
@@ -4765,6 +5289,7 @@ class MainActivity : ComponentActivity() {
                     mainHandler.postDelayed({ discoverGattServicesOnce(gatt) }, 1500)
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                pendingFirstTelemetryUpload = false
                 polling = false
                 pollLoopToken++
                 resetRemoteWriteState()
@@ -5297,6 +5822,8 @@ class MainActivity : ComponentActivity() {
         )
         val device = selectedDeviceName.ifBlank { selectedAddress ?: "не выбрано" }
         if (::deviceNameValue.isInitialized) deviceNameValue.text = device
+        bluetoothIdValue?.text = bluetoothId().ifBlank { "--" }
+        bmsSnValue?.text = bmsSn().ifBlank { "--" }
         if (::cycleCountValue.isInitialized) {
             cycleCountValue.text = data.cycles?.toString() ?: "--"
         }
@@ -5397,45 +5924,123 @@ class MainActivity : ComponentActivity() {
     private fun onPollCompleted() {
         rememberCurrentBmsState()
         detectAndStoreEvents()
-        uploadCurrentData(force = false)
+        val forceFirst = isServiceApp() && pendingFirstTelemetryUpload
+        if (forceFirst) pendingFirstTelemetryUpload = false
+        uploadCurrentData(force = forceFirst)
         // Конфиг BMS больше не читаем автоматически на каждом цикле опроса.
         // Он читается только вручную кнопкой «Обновить конфиг BMS» и сохраняется в память приложения.
     }
 
     private fun bmsUid(): String {
-        val name = selectedDeviceName.trim()
-        if (name.isNotBlank() && name != "Unknown") return name
+        val name = sanitizeBleText(selectedDeviceName)
+        if (name.isNotBlank() && !name.equals("Unknown", true)) return name
         return selectedAddress ?: "unknown_bms"
+    }
+
+    private fun sanitizeBleText(value: String?): String {
+        if (value.isNullOrEmpty()) return ""
+        val cut = value.indexOf('\u0000')
+        val head = if (cut >= 0) value.substring(0, cut) else value
+        return buildString(head.length) {
+            for (ch in head) {
+                val code = ch.code
+                if (code in 32..126 || ch.isLetterOrDigit()) append(ch)
+            }
+        }.trim()
+    }
+
+    private fun isServiceApp(): Boolean = BuildConfig.IS_SERVICE
+
+    private fun appBrandTitle(): String {
+        return if (isServiceApp()) "ЛИФЕРЫЧ Сервис" else "ЛИФЕРЫЧ BMS"
+    }
+
+    private fun bluetoothId(): String = selectedAddress.orEmpty()
+
+    private fun identityPrefs() = getSharedPreferences("bms_identity", MODE_PRIVATE)
+
+    private fun bmsSn(): String {
+        val live = factorySerialFromRegisters()
+        if (live.isNotBlank()) {
+            rememberFactorySerial()
+            return live
+        }
+        return cachedFactorySerial()
+    }
+
+    private fun cachedFactorySerial(): String {
+        val address = selectedAddress ?: return ""
+        return identityPrefs().getString("sn_$address", "")?.trim().orEmpty()
+    }
+
+    private fun rememberFactorySerial() {
+        val sn = factorySerialFromRegisters()
+        val address = selectedAddress
+        if (sn.isBlank() || address.isNullOrBlank()) return
+        identityPrefs().edit().putString("sn_$address", sn).apply()
+    }
+
+    private fun factorySerialFromRegisters(): String {
+        if (configRegisters.isEmpty()) return ""
+        val sn = decodeDalySnCode(swapBytes = false).ifBlank { decodeDalySnCode(swapBytes = true) }
+        return if (isValidBmsSn(sn)) sn else ""
+    }
+
+    // Daly SN Code: Modbus 0xD2, holding 0x0057–0x005D, 7 registers / 14 ASCII bytes.
+    private fun decodeDalySnCode(swapBytes: Boolean): String {
+        if ((DALY_SN_CODE_START..DALY_SN_CODE_END).any { it !in configRegisters }) return ""
+        return buildString {
+            for (addr in DALY_SN_CODE_START..DALY_SN_CODE_END) {
+                val value = configRegisters[addr] ?: return ""
+                val hi = (value shr 8) and 0xFF
+                val lo = value and 0xFF
+                val first = if (swapBytes) lo else hi
+                val second = if (swapBytes) hi else lo
+                for (b in intArrayOf(first, second)) {
+                    if (b == 0) return@buildString
+                    if (b !in 32..126) return ""
+                    append(b.toChar())
+                }
+            }
+        }.trim()
+    }
+
+    private fun isValidBmsSn(sn: String): Boolean {
+        val value = sn.trim()
+        if (value.length !in 8..20) return false
+        if (value.startsWith("DL", ignoreCase = true)) return false
+        return value.all { it.isLetterOrDigit() } && value.any { it.isLetter() } && value.any { it.isDigit() }
+    }
+
+    private fun assemblerName(): String {
+        return servicePrefs.getString("assembler_name", "")?.trim().orEmpty()
+    }
+
+    private fun reconstructedCapacityAh(): Double? {
+        val lo = configRegisters[0x010A] ?: return null
+        val hi = configRegisters[0x010B] ?: return null
+        return ((hi shl 16) or (lo and 0xFFFF)).toDouble() / 1000.0
     }
 
     private fun advertisedBluetoothName(): String {
         val address = selectedAddress
         if (!address.isNullOrBlank()) {
-            scanNames[address]?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+            sanitizeBleText(scanNames[address]).takeIf { it.isNotBlank() }?.let { return it }
             loadSavedBatteries().firstOrNull { it.address == address }
                 ?.bluetoothName
-                ?.trim()
+                ?.let { sanitizeBleText(it) }
                 ?.takeIf { it.isNotBlank() }
                 ?.let { return it }
         }
-        return selectedDeviceName.trim()
+        return sanitizeBleText(selectedDeviceName)
     }
 
-    private fun looksLikeRedDlName(name: String): Boolean {
-        return name.trim().startsWith("DL", ignoreCase = true)
-    }
+    private fun isRedDlBms(): Boolean = false
 
-    private fun isRedDlBms(): Boolean {
-        return looksLikeRedDlName(advertisedBluetoothName()) || looksLikeRedDlName(selectedDeviceName)
-    }
-
-    private fun currentHardwareFamily(): String {
-        return if (isRedDlBms()) HARDWARE_FAMILY_DL_RED else HARDWARE_FAMILY_STANDARD
-    }
+    private fun currentHardwareFamily(): String = HARDWARE_FAMILY_STANDARD
 
     private fun shouldSkipTemplateParameter(parameter: BmsTemplateParameter, hardwareFamily: String): Boolean {
-        if (hardwareFamily in parameter.skipFor) return true
-        return hardwareFamily == HARDWARE_FAMILY_DL_RED && parameter.key in DL_RED_SKIPPED_TEMPLATE_KEYS
+        return hardwareFamily in parameter.skipFor
     }
 
     private fun dlUnsupportedOr(value: String): String {
@@ -5463,9 +6068,10 @@ class MainActivity : ComponentActivity() {
         val advertised = advertisedBluetoothName()
         obj.put("advertised_name", advertised)
         obj.put("hardware_family", currentHardwareFamily())
-        if (currentHardwareFamily() == HARDWARE_FAMILY_DL_RED) {
-            obj.put("hardware_label", "Красная BMS DL-серия (старая)")
-        }
+        obj.put("bluetooth_id", bluetoothId())
+        obj.put("bms_sn", bmsSn())
+        obj.put("source", if (isServiceApp()) "service" else "user")
+        if (isServiceApp()) obj.put("assembler_name", assemblerName())
         putOwnerProfile(obj)
     }
 
@@ -5659,6 +6265,52 @@ class MainActivity : ComponentActivity() {
         return lines.joinToString("\n")
     }
 
+    private fun currentUploadStatusText(): String {
+        return "$lastUploadStatus\n${adminServerBaseUrl()}$LOCAL_UPLOAD_PATH"
+    }
+
+    private fun refreshUploadStatusUi() {
+        runOnUiThread {
+            val text = currentUploadStatusText()
+            dashboardUploadStatusText?.text = text
+            serviceUploadStatusText?.text = text
+        }
+    }
+
+    private fun pingAdminServer() {
+        lastUploadStatus = "Проверка связи..."
+        refreshUploadStatusUi()
+        thread {
+            val url = adminServerUrl("/health")
+            val message = try {
+                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 5000
+                    readTimeout = 5000
+                }
+                val code = conn.responseCode
+                val body = try {
+                    conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
+                } catch (_: Exception) {
+                    conn.errorStream?.bufferedReader(Charsets.UTF_8)?.readText().orEmpty()
+                }
+                conn.disconnect()
+                if (code == 200 && body.contains("\"ok\":true")) {
+                    "Связь с сервером есть"
+                } else {
+                    "Сервер ответил HTTP $code"
+                }
+            } catch (e: Exception) {
+                "Нет связи с ${adminServerBaseUrl()}: ${e.message ?: e.toString()}. Телефон и ПК должны быть в одной Wi‑Fi сети."
+            }
+            lastUploadStatus = message
+            runOnUiThread {
+                refreshUploadStatusUi()
+                toast(lastUploadStatus)
+            }
+        }
+    }
+
     private fun uploadCurrentData(force: Boolean) {
         if (uploading) return
         if (data.voltage == null && data.soc == null && !force) return
@@ -5669,6 +6321,7 @@ class MainActivity : ComponentActivity() {
         val payload = buildUploadJson()
         uploading = true
         lastUploadStatus = "Отправка..."
+        refreshUploadStatusUi()
 
         thread {
             var statusMessage = ""
@@ -5709,7 +6362,8 @@ class MainActivity : ComponentActivity() {
                 uploading = false
                 lastUploadStatus = statusMessage
                 runOnUiThread {
-                    if (force) toast(lastUploadStatus)
+                    refreshUploadStatusUi()
+                    if (force || (isServiceApp() && !ok)) toast(lastUploadStatus)
                     if (screenState == "journal") showJournalScreen()
                 }
             }
@@ -5722,6 +6376,8 @@ class MainActivity : ComponentActivity() {
         // Важно: запрос начинается с 0x81, а ответ BMS начинается с 0x51.
         // CRC — обычный Modbus Low/High.
         return listOf(
+            // SN Code — публичный Modbus 0xD2, регистры 0x0057–0x005D (ASCII).
+            ConfigReadRequest("dl_sn_0057_005D", 0xD2, DALY_SN_CODE_START, DALY_SN_CODE_COUNT),
             // Читаем только регистры настроек, которые реально используются в приложении и на сайте.
             // Runtime-блоки 0x0000/0x0041 читаются обычными быстрыми командами A5 0x90-0x98,
             // поэтому здесь они не нужны и только замедляют подключение.
@@ -5741,6 +6397,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startRemoteWritePolling() {
+        if (isServiceApp()) return
         mainHandler.removeCallbacks(remoteWritePollRunnable)
         mainHandler.postDelayed(remoteWritePollRunnable, 1500)
     }
@@ -5750,6 +6407,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun fetchAndApplyRemoteWrites(force: Boolean = false) {
+        if (isServiceApp()) return
         if (remoteWriteInProgress || configReadInProgress) return
         val uid = bmsUid()
         if (bluetoothGatt == null || writeCharacteristic == null) return
@@ -5806,11 +6464,14 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun startRemoteWrite(command: RemoteWriteCommand) {
-        if (remoteWriteInProgress || configReadInProgress) return
-        if (bluetoothGatt == null || writeCharacteristic == null) return
-        if (command.key in DL_RED_SKIPPED_TEMPLATE_KEYS && isRedDlBms()) {
-            ackRemoteWrite(command, "failed", null, "skipped_for_dl_red")
-            mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 250)
+        if (remoteWriteInProgress || configReadInProgress) {
+            if (command.localOnly) {
+                mainHandler.postDelayed({ startRemoteWrite(command) }, 350)
+            }
+            return
+        }
+        if (bluetoothGatt == null || writeCharacteristic == null) {
+            if (command.localOnly) completeServiceWriteStep(command, false, null, "no_ble")
             return
         }
 
@@ -5818,8 +6479,9 @@ class MainActivity : ComponentActivity() {
         remoteWriteInProgress = true
         remoteWriteAwaitingVerify = false
         pollLoopToken++
-        toast("Запись с сайта: ${command.label} = ${formatTemplateNumber(command.value)} ${command.unit}".trim())
-        ackRemoteWrite(command, "writing", null, null)
+        val prefix = if (command.localOnly) "Запись" else "Запись с сайта"
+        toast("$prefix: ${command.label} = ${formatTemplateNumber(command.displayValue ?: command.value)} ${command.unit}".trim())
+        if (!command.localOnly) ackRemoteWrite(command, "writing", null, null)
 
         val timeFrame = buildDalyTimeFrame()
         val writeFrame = buildModbusWriteSingleRequest(0x81, command.register, command.rawValue)
@@ -5887,6 +6549,14 @@ class MainActivity : ComponentActivity() {
         } else {
             "NOT_CONFIRMED raw=${raw ?: "null"} actual=${actual ?: "null"} expected_raw=${command.rawValue}"
         }
+        if (command.localOnly) {
+            pendingRemoteWrite = null
+            remoteWriteInProgress = false
+            rememberCurrentBmsState()
+            completeServiceWriteStep(command, ok, actual, if (ok) null else "not_confirmed")
+            mainHandler.postDelayed({ pollOnce() }, 400)
+            return
+        }
         ackRemoteWrite(
             command,
             if (ok) "done" else "failed",
@@ -5911,13 +6581,22 @@ class MainActivity : ComponentActivity() {
         remoteWriteAwaitingVerify = false
         remoteWriteInProgress = false
         pendingRemoteWrite = null
-        if (command != null) ackRemoteWrite(command, "failed", null, reason)
+        if (command != null) {
+            if (command.localOnly) {
+                completeServiceWriteStep(command, false, null, reason)
+            } else {
+                ackRemoteWrite(command, "failed", null, reason)
+            }
+        }
         toast("Не удалось записать параметр: $reason")
         mainHandler.postDelayed({ pollOnce() }, 400)
-        mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 800)
+        if (command == null || !command.localOnly) {
+            mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 800)
+        }
     }
 
     private fun ackRemoteWrite(command: RemoteWriteCommand, status: String, actual: Double?, error: String?) {
+        if (command.localOnly || command.id <= 0) return
         val uid = bmsUid()
         thread {
             val encoded = URLEncoder.encode(uid, "UTF-8")
@@ -6077,11 +6756,14 @@ class MainActivity : ComponentActivity() {
                 "ok_original_daly_modbus_registers"
             }
             if (configRegisters.isNotEmpty()) {
+                rememberFactorySerial()
                 saveConfigCacheForCurrentBms()
             }
             setTemplateCheckResult(evaluateTemplateCheck())
             rememberCurrentBmsState()
             refreshManageIfVisible()
+            runOnUiThread { updateDashboardUi() }
+            uploadCurrentData(force = true)
 
             if (remoteWriteAwaitingVerify) {
                 finishRemoteWriteVerification()
@@ -6397,9 +7079,6 @@ class MainActivity : ComponentActivity() {
             put("missing", JSONArray().apply { result.missing.forEach { put(unavailableJson(it)) } })
             put("unverified", JSONArray().apply { result.unverified.forEach { put(unverifiedJson(it)) } })
             put("hardware_family", result.hardwareFamily)
-            if (result.hardwareFamily == HARDWARE_FAMILY_DL_RED) {
-                put("hardware_label", "Красная BMS DL-серия (старая)")
-            }
         }
     }
 
@@ -6421,6 +7100,8 @@ class MainActivity : ComponentActivity() {
         val general = JSONObject()
         general.put("Тип батареи", batteryTypeText())
         general.put("Номинальная емкость", nominalCapacityText())
+        general.put("Серийный номер", bmsSn().ifBlank { "не прочитан" })
+        general.put("Bluetooth ID", bluetoothId().ifBlank { "не указан" })
         general.put("Источник емкости", nominalCapacitySource())
         general.put("Время ожидания сна", regText(0x0115, 0.1, "S"))
         general.put("Настройка SOC", currentSocTextForConfig())

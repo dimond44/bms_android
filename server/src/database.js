@@ -95,6 +95,24 @@ function openDatabase(filename) {
 
     CREATE INDEX IF NOT EXISTS write_commands_bms_status_idx
       ON write_commands(bms_uid, status, id);
+
+    CREATE TABLE IF NOT EXISTS service_reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bms_uid TEXT NOT NULL,
+      bms_sn TEXT,
+      bluetooth_id TEXT,
+      assembler_name TEXT NOT NULL,
+      template_id TEXT NOT NULL,
+      capacity_ah REAL,
+      written_at INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      items_json TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      FOREIGN KEY (bms_uid) REFERENCES batteries(bms_uid) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS service_reports_bms_time_idx
+      ON service_reports(bms_uid, written_at DESC);
   `);
 
   ensureColumn(db, "batteries", "advertised_name", "TEXT");
@@ -102,27 +120,39 @@ function openDatabase(filename) {
   ensureColumn(db, "batteries", "owner_name", "TEXT");
   ensureColumn(db, "batteries", "owner_phone", "TEXT");
   ensureColumn(db, "batteries", "owner_email", "TEXT");
+  ensureColumn(db, "batteries", "last_source", "TEXT");
+  ensureColumn(db, "batteries", "assembler_name", "TEXT");
+  ensureColumn(db, "batteries", "bms_sn", "TEXT");
+  ensureColumn(db, "batteries", "bluetooth_id", "TEXT");
+
+  repairBatteryIdentities(db);
+  db.exec(`
+    UPDATE batteries SET hardware_family = 'standard' WHERE hardware_family = 'dl_red';
+    UPDATE batteries SET bms_sn = NULL WHERE bms_sn LIKE 'DL-%';
+  `);
 
   const upsertBattery = db.prepare(`
     INSERT INTO batteries (
       bms_uid, bluetooth_name, bluetooth_address, advertised_name, hardware_family,
-      owner_name, owner_phone, owner_email, first_seen_at, last_seen_at
+      owner_name, owner_phone, owner_email, last_source, assembler_name, bms_sn,
+      bluetooth_id, first_seen_at, last_seen_at
     ) VALUES (
       @bms_uid, @bluetooth_name, @bluetooth_address, @advertised_name, @hardware_family,
-      @owner_name, @owner_phone, @owner_email, @received_at, @received_at
+      @owner_name, @owner_phone, @owner_email, @last_source, @assembler_name, @bms_sn,
+      @bluetooth_id, @received_at, @received_at
     )
     ON CONFLICT(bms_uid) DO UPDATE SET
       bluetooth_name = COALESCE(excluded.bluetooth_name, batteries.bluetooth_name),
       bluetooth_address = COALESCE(excluded.bluetooth_address, batteries.bluetooth_address),
       advertised_name = COALESCE(excluded.advertised_name, batteries.advertised_name),
-      hardware_family = CASE
-        WHEN excluded.hardware_family = 'dl_red' THEN 'dl_red'
-        WHEN batteries.hardware_family IS NOT NULL THEN batteries.hardware_family
-        ELSE excluded.hardware_family
-      END,
+      hardware_family = COALESCE(excluded.hardware_family, batteries.hardware_family),
       owner_name = COALESCE(excluded.owner_name, batteries.owner_name),
       owner_phone = COALESCE(excluded.owner_phone, batteries.owner_phone),
       owner_email = COALESCE(excluded.owner_email, batteries.owner_email),
+      last_source = COALESCE(excluded.last_source, batteries.last_source),
+      assembler_name = COALESCE(excluded.assembler_name, batteries.assembler_name),
+      bms_sn = COALESCE(excluded.bms_sn, batteries.bms_sn),
+      bluetooth_id = COALESCE(excluded.bluetooth_id, batteries.bluetooth_id),
       last_seen_at = excluded.last_seen_at
   `);
 
@@ -208,15 +238,52 @@ function openDatabase(filename) {
     return Number(insertConfigCheckRow.run(row).lastInsertRowid);
   });
 
+  const insertServiceReportRow = db.prepare(`
+    INSERT INTO service_reports (
+      bms_uid, bms_sn, bluetooth_id, assembler_name, template_id, capacity_ah,
+      written_at, status, items_json, payload_json
+    ) VALUES (
+      @bms_uid, @bms_sn, @bluetooth_id, @assembler_name, @template_id, @capacity_ah,
+      @written_at, @status, @items_json, @payload_json
+    )
+  `);
+
+  const saveServiceReport = db.transaction((payload, receivedAt) => {
+    const writtenAt = isSafeTimestamp(payload.written_at) ? payload.written_at : receivedAt;
+    const battery = {
+      ...batteryIdentity(payload),
+      received_at: receivedAt,
+      last_source: "service",
+    };
+    upsertBattery.run(battery);
+    const row = {
+      bms_uid: payload.bms_uid,
+      bms_sn: emptyToNull(payload.bms_sn),
+      bluetooth_id: emptyToNull(payload.bluetooth_id) ?? emptyToNull(payload.bluetooth_address),
+      assembler_name: payload.assembler_name.trim(),
+      template_id: payload.template_id.trim(),
+      capacity_ah: payload.capacity_ah ?? null,
+      written_at: writtenAt,
+      status: payload.status,
+      items_json: JSON.stringify(payload.items ?? []),
+      payload_json: JSON.stringify(payload),
+    };
+    return Number(insertServiceReportRow.run(row).lastInsertRowid);
+  });
+
   return {
     close: () => db.close(),
 
     insertTelemetry(payload, receivedAt = Date.now()) {
-      return saveTelemetry(payload, receivedAt);
+      return saveTelemetry(normalizePayload(payload), receivedAt);
     },
 
     insertConfigCheck(payload, receivedAt = Date.now()) {
-      return saveConfigCheck(payload, receivedAt);
+      return saveConfigCheck(normalizePayload(payload), receivedAt);
+    },
+
+    insertServiceReport(payload, receivedAt = Date.now()) {
+      return saveServiceReport(normalizePayload(payload), receivedAt);
     },
 
     enqueueWriteCommand(command, receivedAt = Date.now()) {
@@ -340,6 +407,10 @@ function openDatabase(filename) {
           b.owner_name,
           b.owner_phone,
           b.owner_email,
+          b.last_source,
+          b.assembler_name,
+          b.bms_sn,
+          b.bluetooth_id,
           b.first_seen_at,
           b.last_seen_at,
           t.id AS telemetry_id,
@@ -371,7 +442,15 @@ function openDatabase(filename) {
           c.missing_count,
           c.mismatches_json,
           c.missing_json,
-          c.unverified_json
+          c.unverified_json,
+          s.id AS service_report_id,
+          s.written_at AS service_written_at,
+          s.assembler_name AS service_assembler_name,
+          s.template_id AS service_template_id,
+          s.capacity_ah AS service_capacity_ah,
+          s.status AS service_status,
+          s.bms_sn AS service_bms_sn,
+          s.bluetooth_id AS service_bluetooth_id
         FROM batteries b
         LEFT JOIN telemetry t ON t.id = (
           SELECT latest.id
@@ -385,6 +464,13 @@ function openDatabase(filename) {
           FROM config_checks latest_check
           WHERE latest_check.bms_uid = b.bms_uid
           ORDER BY latest_check.checked_at DESC, latest_check.id DESC
+          LIMIT 1
+        )
+        LEFT JOIN service_reports s ON s.id = (
+          SELECT latest_service.id
+          FROM service_reports latest_service
+          WHERE latest_service.bms_uid = b.bms_uid
+          ORDER BY latest_service.written_at DESC, latest_service.id DESC
           LIMIT 1
         )
         ORDER BY b.last_seen_at DESC
@@ -409,6 +495,14 @@ function openDatabase(filename) {
           mismatches_json: mismatchesJson,
           missing_json: missingJson,
           unverified_json: unverifiedJson,
+          service_report_id: serviceReportId,
+          service_written_at: serviceWrittenAt,
+          service_assembler_name: serviceAssemblerName,
+          service_template_id: serviceTemplateId,
+          service_capacity_ah: serviceCapacityAh,
+          service_status: serviceStatus,
+          service_bms_sn: serviceBmsSn,
+          service_bluetooth_id: serviceBluetoothId,
           ...battery
         } = row;
         return {
@@ -431,6 +525,16 @@ function openDatabase(filename) {
             mismatches: parseJson(mismatchesJson, []),
             missing: parseJson(missingJson, []),
             unverified: parseJson(unverifiedJson, []),
+          },
+          service_report: serviceReportId == null ? null : {
+            id: serviceReportId,
+            written_at: serviceWrittenAt,
+            assembler_name: serviceAssemblerName,
+            template_id: serviceTemplateId,
+            capacity_ah: serviceCapacityAh,
+            status: serviceStatus,
+            bms_sn: serviceBmsSn,
+            bluetooth_id: serviceBluetoothId,
           },
         };
       });
@@ -473,6 +577,29 @@ function openDatabase(filename) {
         mismatches: parseJson(row.mismatches_json, []),
         missing: parseJson(row.missing_json, []),
         unverified: parseJson(row.unverified_json, []),
+      }));
+    },
+
+    listServiceReports(bmsUid, limit) {
+      return db.prepare(`
+        SELECT
+          id, bms_uid, bms_sn, bluetooth_id, assembler_name, template_id,
+          capacity_ah, written_at, status, items_json
+        FROM service_reports
+        WHERE bms_uid = ?
+        ORDER BY written_at DESC, id DESC
+        LIMIT ?
+      `).all(bmsUid, limit).map((row) => ({
+        id: row.id,
+        bms_uid: row.bms_uid,
+        bms_sn: row.bms_sn,
+        bluetooth_id: row.bluetooth_id,
+        assembler_name: row.assembler_name,
+        template_id: row.template_id,
+        capacity_ah: row.capacity_ah,
+        written_at: row.written_at,
+        status: row.status,
+        items: parseJson(row.items_json, []),
       }));
     },
   };
@@ -609,20 +736,93 @@ function emptyToNull(value) {
   return trimmed.length === 0 ? null : trimmed;
 }
 
-function looksLikeRedDlName(value) {
-  return typeof value === "string" && /^\s*DL/i.test(value);
+function sanitizeIdentity(value) {
+  if (typeof value !== "string") return null;
+  const cut = value.indexOf("\0");
+  const text = (cut >= 0 ? value.slice(0, cut) : value)
+    .replace(/[\u0000-\u001F\u007F]/g, "")
+    .trim();
+  return text.length > 0 ? text : null;
 }
 
-function inferHardwareFamily(payload) {
-  const checkFamily = isPlainObject(payload?.template_check)
-    ? payload.template_check.hardware_family
-    : null;
-  if (payload?.hardware_family === "dl_red" || checkFamily === "dl_red") return "dl_red";
-  if (looksLikeRedDlName(payload?.advertised_name) || looksLikeRedDlName(payload?.bluetooth_name)) {
-    return "dl_red";
+function normalizePayload(payload) {
+  if (!isPlainObject(payload)) return payload;
+  const next = { ...payload };
+  const uid = sanitizeIdentity(payload.bms_uid);
+  if (uid) next.bms_uid = uid;
+  for (const field of [
+    "bluetooth_name",
+    "advertised_name",
+    "bms_sn",
+    "bluetooth_id",
+    "bluetooth_address",
+    "assembler_name",
+  ]) {
+    if (typeof next[field] === "string") {
+      next[field] = sanitizeIdentity(next[field]) ?? "";
+    }
   }
-  if (payload?.hardware_family === "standard" || checkFamily === "standard") return "standard";
-  return null;
+  if (typeof next.bms_sn === "string" && /^DL-/i.test(next.bms_sn)) {
+    next.bms_sn = "";
+  }
+  return next;
+}
+
+function repairBatteryIdentities(db) {
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    const rename = db.transaction(() => {
+    const rows = db.prepare("SELECT bms_uid FROM batteries").all();
+    for (const row of rows) {
+      const clean = sanitizeIdentity(row.bms_uid);
+      if (!clean || clean === row.bms_uid) continue;
+      const clash = db.prepare("SELECT bms_uid FROM batteries WHERE bms_uid = ?").get(clean);
+      const childTables = ["telemetry", "config_checks", "write_commands", "service_reports"];
+      if (clash) {
+        for (const table of childTables) {
+          db.prepare(`UPDATE ${table} SET bms_uid = ? WHERE bms_uid = ?`).run(clean, row.bms_uid);
+        }
+        db.prepare("DELETE FROM batteries WHERE bms_uid = ?").run(row.bms_uid);
+      } else {
+        db.prepare("UPDATE batteries SET bms_uid = ? WHERE bms_uid = ?").run(clean, row.bms_uid);
+        for (const table of childTables) {
+          db.prepare(`UPDATE ${table} SET bms_uid = ? WHERE bms_uid = ?`).run(clean, row.bms_uid);
+        }
+      }
+    }
+
+    const batteries = db.prepare(`
+      SELECT bms_uid, bluetooth_name, advertised_name, bms_sn, assembler_name, bluetooth_id
+      FROM batteries
+    `).all();
+    const updateBattery = db.prepare(`
+      UPDATE batteries
+      SET bluetooth_name = @bluetooth_name,
+          advertised_name = @advertised_name,
+          bms_sn = @bms_sn,
+          assembler_name = @assembler_name,
+          bluetooth_id = @bluetooth_id
+      WHERE bms_uid = @bms_uid
+    `);
+    for (const battery of batteries) {
+      updateBattery.run({
+        bms_uid: battery.bms_uid,
+        bluetooth_name: sanitizeIdentity(battery.bluetooth_name),
+        advertised_name: sanitizeIdentity(battery.advertised_name),
+        bms_sn: sanitizeIdentity(battery.bms_sn),
+        assembler_name: sanitizeIdentity(battery.assembler_name),
+        bluetooth_id: sanitizeIdentity(battery.bluetooth_id),
+      });
+    }
+  });
+    rename();
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+function inferHardwareFamily(_payload) {
+  return "standard";
 }
 
 function isPlainObject(value) {
@@ -631,15 +831,23 @@ function isPlainObject(value) {
 
 function batteryIdentity(payload) {
   return {
-    bms_uid: payload.bms_uid,
-    bluetooth_name: payload.bluetooth_name ?? null,
-    bluetooth_address: payload.bluetooth_address ?? null,
-    advertised_name: emptyToNull(payload.advertised_name),
+    bms_uid: sanitizeIdentity(payload.bms_uid) || payload.bms_uid,
+    bluetooth_name: sanitizeIdentity(payload.bluetooth_name) ?? payload.bluetooth_name ?? null,
+    bluetooth_address: emptyToNull(payload.bluetooth_address),
+    advertised_name: sanitizeIdentity(payload.advertised_name),
     hardware_family: inferHardwareFamily(payload),
     owner_name: emptyToNull(payload.owner_name),
     owner_phone: emptyToNull(payload.owner_phone),
     owner_email: emptyToNull(payload.owner_email),
+    last_source: payload.source === "service" ? "service" : payload.source === "user" ? "user" : null,
+    assembler_name: sanitizeIdentity(payload.assembler_name),
+    bms_sn: sanitizeIdentity(payload.bms_sn),
+    bluetooth_id: sanitizeIdentity(payload.bluetooth_id) ?? emptyToNull(payload.bluetooth_address),
   };
+}
+
+function isSafeTimestamp(value) {
+  return Number.isSafeInteger(value) && value > 0;
 }
 
 module.exports = { openDatabase };

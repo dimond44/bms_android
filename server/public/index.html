@@ -55,7 +55,7 @@
                   <span class="status-pill" id="onlineStatus">—</span>
                 </div>
               </div>
-              <p class="identity"><span id="batteryUid">—</span><span id="batteryAddress">—</span></p>
+              <p class="identity"><span id="batteryUid">—</span><span id="batterySn">—</span><span id="batteryAddress">—</span></p>
               <p class="last-seen" id="lastSeen">—</p>
             </div>
           </div>
@@ -68,6 +68,7 @@
             <button type="button" class="dash-tab" role="tab" data-tab="journal" aria-selected="false" aria-controls="tab-journal">Журнал и диагностика</button>
             <button type="button" class="dash-tab" role="tab" data-tab="archive" aria-selected="false" aria-controls="tab-archive">Архив записей</button>
             <button type="button" class="dash-tab" role="tab" data-tab="write" aria-selected="false" aria-controls="tab-write">Запись параметров</button>
+            <button type="button" class="dash-tab" role="tab" data-tab="service" aria-selected="false" aria-controls="tab-service">Сервис</button>
           </nav>
 
           <div class="dash-panels">
@@ -173,7 +174,7 @@
                   </div>
                   <span class="section-meta" id="writeTemplateMeta">Шаблон не загружен</span>
                 </div>
-                <p class="write-note">Подставьте значения из шаблона или введите вручную и нажмите «Записать». Задания уходят в очередь, Android-приложение записывает их в BMS по Bluetooth при подключении. Для красной DL-серии калибровка SOC и балансировка не записываются.</p>
+                <p class="write-note">Подставьте значения из шаблона или введите вручную и нажмите «Записать». Задания уходят в очередь, Android-приложение записывает их в BMS по Bluetooth при подключении. Калибровка SOC и балансировка записываются и проверяются.</p>
                 <div class="write-toolbar">
                   <label class="write-file">
                     <input id="writeFileInput" type="file" accept=".json,application/json">
@@ -201,6 +202,36 @@
                 </div>
               </article>
             </div>
+
+            <div class="dash-panel hidden" id="tab-service" data-tab-panel="service" role="tabpanel">
+              <article class="card service-card">
+                <div class="section-title">
+                  <div>
+                    <span class="eyebrow">Сборка</span>
+                    <h3>Сервисные записи</h3>
+                  </div>
+                  <span class="section-meta" id="serviceCount">Нет записей</span>
+                </div>
+                <p class="write-note">Сборщик, SN и Bluetooth ID приходят вместе с телеметрией. Таблица ниже заполняется после записи шаблона 12В/24В в сервисном приложении.</p>
+                <div id="serviceLatest" class="service-latest"></div>
+                <div class="table-wrap">
+                  <table class="service-table">
+                    <thead>
+                      <tr>
+                        <th>Дата</th>
+                        <th>Сборщик</th>
+                        <th>Шаблон</th>
+                        <th>Ёмкость</th>
+                        <th>SN</th>
+                        <th>Bluetooth ID</th>
+                        <th>Итог</th>
+                      </tr>
+                    </thead>
+                    <tbody id="serviceBody"></tbody>
+                  </table>
+                </div>
+              </article>
+            </div>
           </div>
         </div>
       </section>
@@ -220,6 +251,6 @@
       </form>
     </dialog>
 
-    <script src="/app.js" defer></script>
+    <script src="/app.js?v=20260901e" defer></script>
   </body>
 </html>

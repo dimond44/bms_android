@@ -44,6 +44,7 @@ test("GET / возвращает web-админку", async () => {
   assert.match(body, /Запись параметров/);
   assert.match(body, /Записать/);
   assert.match(body, /Архив записей/);
+  assert.match(body, /Сервис/);
 });
 
 test("GET /api/v1/config-template отдаёт шаблон и требует ключ", async () => {
@@ -95,8 +96,7 @@ test("POST принимает полный Android payload через совме
 });
 
 test("GET возвращает батарею и историю без api_key", async () => {
-  const headers = { "x-api-key": API_KEY };
-  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`, { headers });
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
   const batteriesBody = await batteriesResponse.json();
 
   assert.equal(batteriesResponse.status, 200);
@@ -110,7 +110,6 @@ test("GET возвращает батарею и историю без api_key",
 
   const historyResponse = await fetch(
     `${baseUrl}/api/v1/batteries/${encodeURIComponent("daly-AA:BB:CC:DD:EE:FF")}/telemetry?limit=10`,
-    { headers },
   );
   const historyBody = await historyResponse.json();
 
@@ -173,12 +172,14 @@ test("POST проверки конфигурации сохраняет исто
   assert.equal(historyBody.config_checks[1].mismatches[0].actual, null);
 });
 
-test("DL-серия помечается как красная BMS даже с пользовательским именем", async () => {
+test("Имя Bluetooth DL не помечает батарею как старую красную серию", async () => {
   const payload = createFullPayload();
   payload.bms_uid = "garage-battery";
   payload.bluetooth_name = "Гараж";
   payload.advertised_name = "DL-40D63C3223A2";
-  payload.hardware_family = "dl_red";
+  payload.hardware_family = "standard";
+  payload.bms_sn = "224LG2504150001";
+  payload.bluetooth_id = "D2:1A:07:12:2C:C4";
 
   const response = await fetch(`${baseUrl}/api/v1/telemetry`, {
     method: "POST",
@@ -196,7 +197,9 @@ test("DL-серия помечается как красная BMS даже с �
 
   assert.equal(battery.bluetooth_name, "Гараж");
   assert.equal(battery.advertised_name, "DL-40D63C3223A2");
-  assert.equal(battery.hardware_family, "dl_red");
+  assert.equal(battery.hardware_family, "standard");
+  assert.equal(battery.bms_sn, "224LG2504150001");
+  assert.equal(battery.bluetooth_id, "D2:1A:07:12:2C:C4");
 });
 
 test("Профиль владельца сохраняется из телеметрии", async () => {
@@ -224,7 +227,7 @@ test("Профиль владельца сохраняется из телеме
   assert.equal(battery.owner_email, "ivan@example.ru");
 });
 
-test("Имя Bluetooth DL определяет hardware_family без явного поля", async () => {
+test("Имя Bluetooth DL не определяет hardware_family", async () => {
   const payload = createFullPayload();
   payload.bms_uid = "inferred-dl-bms";
   payload.bluetooth_name = "DL-ABCDEF123456";
@@ -245,7 +248,7 @@ test("Имя Bluetooth DL определяет hardware_family без явног
   const batteriesBody = await batteriesResponse.json();
   const battery = batteriesBody.batteries.find((item) => item.bms_uid === payload.bms_uid);
 
-  assert.equal(battery.hardware_family, "dl_red");
+  assert.equal(battery.hardware_family, "standard");
 });
 
 test("POST проверки конфигурации отклоняет неверный ключ", async () => {
@@ -382,7 +385,7 @@ test("очередь записи принимает остальные пара
   assert.equal((await pack.json()).command.raw_value, 146);
 });
 
-test("очередь записи не ставит DL-параметры для красной BMS", async () => {
+test("очередь записи принимает балансировку для BMS с именем DL", async () => {
   const headers = { "content-type": "application/json", "x-api-key": API_KEY };
   const uid = "DL-write-skip-bms";
   const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
@@ -402,8 +405,107 @@ test("очередь записи не ставит DL-параметры для
     headers,
     body: JSON.stringify({ key: "balance_delta", value: 10 }),
   });
-  assert.equal(response.status, 400);
-  assert.deepEqual(await response.json(), { ok: false, error: "skipped_for_dl_red" });
+  assert.equal(response.status, 201);
+  const body = await response.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.command.key, "balance_delta");
+});
+
+test("POST service-report сохраняет сборку и отдаёт её без api_key", async () => {
+  const payload = {
+    api_key: API_KEY,
+    bms_uid: "service-bms-001",
+    bluetooth_name: "JHB-SERVICE01",
+    bluetooth_address: "DE:AD:BE:EF:00:01",
+    bluetooth_id: "DE:AD:BE:EF:00:01",
+    bms_sn: "JHB-SERVICE01",
+    source: "service",
+    assembler_name: "Петров Пётр",
+    template_id: "liferych-lfp-12v",
+    capacity_ah: 105,
+    written_at: 1_788_182_400_000,
+    status: "ok",
+    items: [
+      {
+        key: "sleep_timeout",
+        label: "Время ожидания сна",
+        expected: 3600,
+        actual: 3600,
+        unit: "s",
+        ok: true,
+      },
+    ],
+  };
+
+  const created = await fetch(`${baseUrl}/api/v1/service-report`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(created.status, 201);
+  assert.deepEqual(await created.json(), { ok: true, report_id: 1 });
+
+  const headers = { "x-api-key": API_KEY };
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`, { headers });
+  const batteriesBody = await batteriesResponse.json();
+  const battery = batteriesBody.batteries.find((item) => item.bms_uid === payload.bms_uid);
+  assert.equal(battery.last_source, "service");
+  assert.equal(battery.assembler_name, "Петров Пётр");
+  assert.equal(battery.bms_sn, "JHB-SERVICE01");
+  assert.equal(battery.bluetooth_id, "DE:AD:BE:EF:00:01");
+  assert.equal(battery.service_report.assembler_name, "Петров Пётр");
+  assert.equal(battery.service_report.template_id, "liferych-lfp-12v");
+  assert.equal(battery.service_report.capacity_ah, 105);
+  assert.equal(battery.service_report.status, "ok");
+
+  const listResponse = await fetch(
+    `${baseUrl}/api/v1/batteries/${encodeURIComponent(payload.bms_uid)}/service-reports?limit=10`,
+    { headers },
+  );
+  const listBody = await listResponse.json();
+  assert.equal(listResponse.status, 200);
+  assert.equal(listBody.service_reports.length, 1);
+  assert.equal(listBody.service_reports[0].api_key, undefined);
+  assert.equal(listBody.service_reports[0].assembler_name, "Петров Пётр");
+  assert.equal(listBody.service_reports[0].items[0].ok, true);
+});
+
+test("POST телеметрии обрезает нули в имени BLE", async () => {
+  const payload = createFullPayload();
+  payload.bms_uid = "DL-D21A07122CC4\u0000\u0000\u0000xx";
+  payload.bluetooth_name = payload.bms_uid;
+  payload.advertised_name = payload.bms_uid;
+  payload.bms_sn = payload.bms_uid;
+  payload.source = "service";
+  payload.assembler_name = "Иванов";
+  payload.bluetooth_id = "D2:1A:07:12:2C:C4";
+
+  const response = await fetch(`${baseUrl}/api/upload.php`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(response.status, 201);
+
+  const headers = { "x-api-key": API_KEY };
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`, { headers });
+  const batteriesBody = await batteriesResponse.json();
+  const battery = batteriesBody.batteries.find((item) => item.bms_uid === "DL-D21A07122CC4");
+  assert.ok(battery);
+  assert.equal(battery.bluetooth_name, "DL-D21A07122CC4");
+  assert.equal(battery.bms_sn, null);
+  assert.equal(battery.last_source, "service");
+  assert.equal(battery.assembler_name, "Иванов");
+  assert.equal(battery.bluetooth_id, "D2:1A:07:12:2C:C4");
+  assert.equal(battery.bms_uid.includes("\0"), false);
+
+  const historyResponse = await fetch(
+    `${baseUrl}/api/v1/batteries/${encodeURIComponent("DL-D21A07122CC4")}/telemetry?limit=5`,
+    { headers },
+  );
+  assert.equal(historyResponse.status, 200);
+  const historyBody = await historyResponse.json();
+  assert.ok(historyBody.telemetry.length >= 1);
 });
 
 function createFullPayload() {

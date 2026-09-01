@@ -5,9 +5,10 @@
   const API_KEY_STORAGE = "liferych:bms:api-key";
   const THEME_STORAGE = "liferych:bms:theme";
   const TAB_STORAGE = "liferych:bms:tab";
-  const DASH_TABS = ["overview", "owner", "balancing", "dynamics", "journal", "archive", "write"];
+  const DASH_TABS = ["overview", "owner", "balancing", "dynamics", "journal", "archive", "write", "service"];
   const REFRESH_INTERVAL_MS = 15000;
   const ONLINE_AFTER_MS = 45000;
+  const HISTORY_LIMIT = 100;
   const DL_RED_SKIPPED_KEYS = new Set([
     "soc_calibration_0",
     "soc_calibration_100",
@@ -17,11 +18,16 @@
   ]);
   const RED_DL_LABEL = "Красная BMS DL-серия (старая)";
 
+  function cleanUid(value) {
+    if (typeof value !== "string") return "";
+    return value.split("\0")[0].replace(/[\u0000-\u001F\u007F]/g, "").trim();
+  }
+
   const state = {
     apiKey: localStorage.getItem(API_KEY_STORAGE) || "",
     batteries: [],
     history: [],
-    selectedUid: localStorage.getItem("liferych:bms:selected") || "",
+    selectedUid: cleanUid(localStorage.getItem("liferych:bms:selected") || ""),
     search: "",
     dashboardTab: localStorage.getItem(TAB_STORAGE) || "overview",
     refreshTimer: 0,
@@ -34,6 +40,7 @@
     writeRenderedUid: "",
     writeCommands: [],
     writeBusyKey: "",
+    serviceReports: [],
   };
 
   const dom = {
@@ -51,6 +58,7 @@
     hardwareBadge: document.getElementById("hardwareBadge"),
     onlineStatus: document.getElementById("onlineStatus"),
     batteryUid: document.getElementById("batteryUid"),
+    batterySn: document.getElementById("batterySn"),
     batteryAddress: document.getElementById("batteryAddress"),
     lastSeen: document.getElementById("lastSeen"),
     dashTabs: document.getElementById("dashTabs"),
@@ -88,6 +96,9 @@
     writeDownloadPlan: document.getElementById("writeDownloadPlan"),
     writeFileName: document.getElementById("writeFileName"),
     writeBody: document.getElementById("writeBody"),
+    serviceCount: document.getElementById("serviceCount"),
+    serviceLatest: document.getElementById("serviceLatest"),
+    serviceBody: document.getElementById("serviceBody"),
     toast: document.getElementById("toast"),
     keyDialog: document.getElementById("keyDialog"),
     keyForm: document.getElementById("keyForm"),
@@ -132,11 +143,10 @@
     window.addEventListener("resize", debounce(() => drawHistoryChart(), 120));
 
     if (!state.apiKey) {
-      dom.keyInput.value = DEFAULT_API_KEY;
-      openKeyDialog(false);
-    } else {
-      refresh();
+      state.apiKey = DEFAULT_API_KEY;
+      localStorage.setItem(API_KEY_STORAGE, DEFAULT_API_KEY);
     }
+    refresh();
 
     state.refreshTimer = window.setInterval(() => refresh(), REFRESH_INTERVAL_MS);
   }
@@ -156,8 +166,7 @@
 
   async function refresh(options) {
     if (!state.apiKey) {
-      openKeyDialog(false);
-      return;
+      state.apiKey = DEFAULT_API_KEY;
     }
 
     const requestId = ++state.requestId;
@@ -182,8 +191,10 @@
           if (requestId !== state.requestId) return;
           state.history = Array.isArray(historyBody.telemetry) ? historyBody.telemetry : [];
         } catch (error) {
-          if (error && error.status === 401) throw error;
           if (error && error.name === "AbortError" && requestId !== state.requestId) return;
+          if (error && error.status !== 401) {
+            /* keep previously loaded history */
+          }
         }
         try {
           const writesPath = `/api/v1/batteries/${encodeURIComponent(state.selectedUid)}/write-commands?limit=20`;
@@ -191,13 +202,22 @@
           if (requestId !== state.requestId) return;
           state.writeCommands = Array.isArray(writesBody.commands) ? writesBody.commands : [];
         } catch (error) {
-          if (error && error.status === 401) throw error;
           if (error && error.name === "AbortError" && requestId !== state.requestId) return;
           if (!(error && error.name === "AbortError")) state.writeCommands = [];
+        }
+        try {
+          const servicePath = `/api/v1/batteries/${encodeURIComponent(state.selectedUid)}/service-reports?limit=50`;
+          const serviceBody = await apiGet(servicePath, state.abortController.signal);
+          if (requestId !== state.requestId) return;
+          state.serviceReports = Array.isArray(serviceBody.service_reports) ? serviceBody.service_reports : [];
+        } catch (error) {
+          if (error && error.name === "AbortError" && requestId !== state.requestId) return;
+          if (!(error && error.name === "AbortError")) state.serviceReports = [];
         }
       } else {
         state.history = [];
         state.writeCommands = [];
+        state.serviceReports = [];
       }
 
       renderDashboard();
@@ -207,6 +227,11 @@
     } catch (error) {
       if (error.name === "AbortError") return;
       if (error.status === 401) {
+        if (!(options && options.retriedDefaultKey)) {
+          state.apiKey = DEFAULT_API_KEY;
+          localStorage.setItem(API_KEY_STORAGE, DEFAULT_API_KEY);
+          return refresh({ ...options, retriedDefaultKey: true });
+        }
         state.apiKey = "";
         localStorage.removeItem(API_KEY_STORAGE);
         openKeyDialog(true);
@@ -267,6 +292,7 @@
   }
 
   function reconcileSelection() {
+    state.selectedUid = cleanUid(state.selectedUid);
     const selectedExists = state.batteries.some((battery) => battery.bms_uid === state.selectedUid);
     if (!selectedExists) {
       state.selectedUid = state.batteries[0] ? state.batteries[0].bms_uid : "";
@@ -291,6 +317,10 @@
         battery.owner_name,
         battery.owner_phone,
         battery.owner_email,
+        battery.assembler_name,
+        battery.bms_sn,
+        battery.bluetooth_id,
+        battery.last_source === "service" ? "сервис" : "",
         isRedDlSeries(battery) ? RED_DL_LABEL : "",
       ].filter(Boolean).join(" ").toLowerCase();
       return haystack.includes(state.search);
@@ -310,11 +340,17 @@
       const main = el("span", "battery-main");
       appendText(main, "span", "battery-name", displayName(battery));
       appendText(main, "span", "battery-uid", battery.bms_uid || "Без UID");
+      if (textOrEmpty(battery.bms_sn)) {
+        appendText(main, "span", "battery-uid", `SN ${battery.bms_sn.trim()}`);
+      }
       if (textOrEmpty(battery.owner_name)) {
         appendText(main, "span", "battery-owner", battery.owner_name.trim());
       }
       if (isRedDlSeries(battery)) {
         appendText(main, "span", "family-badge", RED_DL_LABEL);
+      }
+      if (battery.last_source === "service" || battery.service_report) {
+        appendText(main, "span", "service-badge", "сервис");
       }
       const check = visibleConfigCheck(battery);
       const configBadge = appendText(main, "span", "config-badge", configBadgeText(check));
@@ -358,7 +394,10 @@
     dom.batteryName.textContent = displayName(battery);
     renderHardwareBadge(battery);
     dom.batteryUid.textContent = battery.bms_uid || "—";
-    dom.batteryAddress.textContent = battery.bluetooth_address || "адрес не указан";
+    if (dom.batterySn) {
+      dom.batterySn.textContent = textOrEmpty(battery.bms_sn) ? `SN ${battery.bms_sn.trim()}` : "SN не прочитан";
+    }
+    dom.batteryAddress.textContent = battery.bluetooth_id || battery.bluetooth_address || "адрес не указан";
     dom.lastSeen.textContent = `Последняя связь: ${formatDateTime(battery.last_seen_at)}`;
     renderOwner(battery);
     setOnlinePill(battery);
@@ -377,6 +416,7 @@
     renderFeeds(latest);
     renderHistoryTable();
     renderWritePanel(battery);
+    renderServicePanel(battery);
     drawHistoryChart();
   }
 
@@ -409,16 +449,6 @@
     dom.configCheck.classList.add(statusClass);
     dom.configCheckStatus.className = `config-check-status ${statusClass}`;
     dom.configCheckStatus.textContent = configBadgeText(check);
-
-    if (isRedDlSeries(battery)) {
-      appendText(dom.configCheckMeta, "span", "", RED_DL_LABEL);
-      appendText(
-        dom.configCheckMeta,
-        "span",
-        "",
-        "Нет встроенного балансира; калибровка SOC 0 и SOC 100 не проверяется.",
-      );
-    }
 
     if (!check) {
       appendText(dom.configCheckMeta, "span", "", "Результат проверки ещё не загружен.");
@@ -633,6 +663,80 @@
       const errorCell = appendText(row, "td", errors > 0 ? "error-text" : "", errors > 0 ? String(errors) : "нет");
       if (errors > 0) errorCell.title = item.errors.join(", ");
       dom.historyBody.append(row);
+    }
+  }
+
+  function serviceTemplateLabel(templateId) {
+    if (templateId === "liferych-lfp-12v" || templateId === "12v") return "12В (4S)";
+    if (templateId === "liferych-lfp-24v" || templateId === "24v") return "24В (8S)";
+    return templateId || "—";
+  }
+
+  function serviceStatusLabel(status) {
+    if (status === "ok") return "Записано";
+    if (status === "partial") return "Частично";
+    if (status === "failed") return "Ошибка";
+    return status || "—";
+  }
+
+  function renderServicePanel() {
+    if (!dom.serviceBody || !dom.serviceLatest || !dom.serviceCount) return;
+    clear(dom.serviceBody);
+    clear(dom.serviceLatest);
+
+    const battery = getSelectedBattery();
+    const reports = Array.isArray(state.serviceReports) ? state.serviceReports : [];
+    if (battery) {
+      const sourceLabel = battery.last_source === "service"
+        ? "сервисное приложение"
+        : battery.last_source === "user"
+          ? "пользовательское приложение"
+          : "—";
+      appendText(dom.serviceLatest, "span", "", `Источник: ${sourceLabel}`);
+      appendText(dom.serviceLatest, "span", "", `Сборщик: ${battery.assembler_name || "—"}`);
+      appendText(dom.serviceLatest, "span", "", `SN: ${battery.bms_sn || battery.advertised_name || battery.bluetooth_name || "—"}`);
+      appendText(dom.serviceLatest, "span", "", `Bluetooth ID: ${battery.bluetooth_id || battery.bluetooth_address || "—"}`);
+    }
+
+    dom.serviceCount.textContent = reports.length === 0
+      ? "Нет записей шаблона"
+      : `${reports.length} ${reports.length === 1 ? "запись" : "записей"}`;
+
+    if (reports.length === 0) {
+      appendText(dom.serviceLatest, "p", "config-empty", "Записей прошивки шаблона ещё нет. Они появятся после кнопки «Записать шаблон» в сервисном приложении. Текущие данные BMS смотрите слева в списке и на вкладке «Основное».");
+      const emptyRow = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 7;
+      cell.textContent = "История прошивки шаблона пуста.";
+      emptyRow.append(cell);
+      dom.serviceBody.append(emptyRow);
+      return;
+    }
+
+    const latest = reports[0];
+    appendText(dom.serviceLatest, "span", "", `Последняя запись: ${formatDateTime(latest.written_at)}`);
+    appendText(dom.serviceLatest, "span", "", `Шаблон: ${serviceTemplateLabel(latest.template_id)}`);
+    appendText(dom.serviceLatest, "span", "", `Ёмкость: ${latest.capacity_ah == null ? "—" : `${latest.capacity_ah} А·ч`}`);
+    appendText(dom.serviceLatest, "span", "", `Итог: ${serviceStatusLabel(latest.status)}`);
+
+    for (const report of reports) {
+      const row = document.createElement("tr");
+      appendText(row, "td", "", formatDateTime(report.written_at));
+      appendText(row, "td", "", report.assembler_name || "—");
+      appendText(row, "td", "", serviceTemplateLabel(report.template_id));
+      appendText(row, "td", "", report.capacity_ah == null ? "—" : `${report.capacity_ah} А·ч`);
+      appendText(row, "td", "", report.bms_sn || "—");
+      appendText(row, "td", "", report.bluetooth_id || "—");
+      const statusCell = appendText(row, "td", "", serviceStatusLabel(report.status));
+      if (report.status === "ok") statusCell.classList.add("error-text-ok");
+      if (report.status === "failed") statusCell.classList.add("error-text");
+      if (Array.isArray(report.items) && report.items.length > 0) {
+        statusCell.title = report.items.map((item) => {
+          const mark = item.ok ? "ok" : "fail";
+          return `${item.label}: ${mark}`;
+        }).join("\n");
+      }
+      dom.serviceBody.append(row);
     }
   }
 
@@ -1311,15 +1415,8 @@
     return typeof value === "string" && /^\s*DL/i.test(value);
   }
 
-  function isRedDlSeries(battery) {
-    if (!battery) return false;
-    if (battery.hardware_family === "dl_red") return true;
-    if (battery.config_check && battery.config_check.hardware_family === "dl_red") return true;
-    return [
-      battery.advertised_name,
-      battery.bluetooth_name,
-      battery.bms_uid,
-    ].some(looksLikeRedDlName);
+  function isRedDlSeries(_battery) {
+    return false;
   }
 
   function renderHardwareBadge(battery) {

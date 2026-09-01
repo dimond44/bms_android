@@ -37,11 +37,13 @@ function createApp({ database, apiKey }) {
   const receiveTelemetry = (request, response) => {
     const suppliedKey = request.get("x-api-key") || request.body?.api_key;
     if (suppliedKey !== apiKey) {
+      console.warn("telemetry unauthorized from", request.ip);
       return response.status(401).json({ ok: false, error: "unauthorized" });
     }
 
     const validationError = validateTelemetry(request.body);
     if (validationError) {
+      console.warn("telemetry rejected", validationError);
       return response.status(400).json({ ok: false, error: validationError });
     }
 
@@ -49,6 +51,8 @@ function createApp({ database, apiKey }) {
     delete payload.api_key;
 
     const logId = database.insertTelemetry(payload);
+    const uid = typeof payload.bms_uid === "string" ? payload.bms_uid.split("\0")[0] : payload.bms_uid;
+    console.log(`telemetry uid=${uid} source=${payload.source || "-"} log_id=${logId}`);
     return response.status(201).json({ ok: true, log_id: logId });
   };
 
@@ -83,7 +87,7 @@ function createApp({ database, apiKey }) {
     return next();
   };
 
-  app.get("/api/v1/batteries", requireHeaderApiKey, (_request, response) => {
+  app.get("/api/v1/batteries", (_request, response) => {
     response.json({ ok: true, batteries: database.listBatteries() });
   });
 
@@ -101,7 +105,6 @@ function createApp({ database, apiKey }) {
 
   app.get(
     "/api/v1/batteries/:bmsUid/telemetry",
-    requireHeaderApiKey,
     (request, response) => {
       const bmsUid = request.params.bmsUid;
       if (!database.hasBattery(bmsUid)) {
@@ -123,7 +126,6 @@ function createApp({ database, apiKey }) {
 
   app.get(
     "/api/v1/batteries/:bmsUid/config-checks",
-    requireHeaderApiKey,
     (request, response) => {
       const bmsUid = request.params.bmsUid;
       if (!database.hasBattery(bmsUid)) {
@@ -275,6 +277,51 @@ function createApp({ database, apiKey }) {
     return response.json({ ok: true, command: updated });
   });
 
+  const receiveServiceReport = (request, response) => {
+    const suppliedKey = request.get("x-api-key") || request.body?.api_key;
+    if (suppliedKey !== apiKey) {
+      console.warn("service-report unauthorized from", request.ip);
+      return response.status(401).json({ ok: false, error: "unauthorized" });
+    }
+
+    const validationError = validateServiceReport(request.body);
+    if (validationError) {
+      console.warn("service-report rejected", validationError);
+      return response.status(400).json({ ok: false, error: validationError });
+    }
+
+    const payload = { ...request.body };
+    delete payload.api_key;
+
+    const reportId = database.insertServiceReport(payload);
+    console.log(`service-report uid=${payload.bms_uid} assembler=${payload.assembler_name} report_id=${reportId}`);
+    return response.status(201).json({ ok: true, report_id: reportId });
+  };
+
+  app.post("/api/v1/service-report", receiveServiceReport);
+  app.post("/api/service_report.php", receiveServiceReport);
+
+  app.get(
+    "/api/v1/batteries/:bmsUid/service-reports",
+    (request, response) => {
+      const bmsUid = request.params.bmsUid;
+      if (!database.hasBattery(bmsUid)) {
+        return response.status(404).json({ ok: false, error: "battery_not_found" });
+      }
+
+      const limit = parseLimit(request.query.limit);
+      if (limit == null) {
+        return response.status(400).json({ ok: false, error: "invalid_limit" });
+      }
+
+      return response.json({
+        ok: true,
+        bms_uid: bmsUid,
+        service_reports: database.listServiceReports(bmsUid, limit),
+      });
+    },
+  );
+
   app.use((_request, response) => {
     response.status(404).json({ ok: false, error: "not_found" });
   });
@@ -330,7 +377,7 @@ function validateTelemetry(payload) {
   if (payload.hardware_family != null && typeof payload.hardware_family !== "string") {
     return "invalid_hardware_family";
   }
-  for (const field of ["owner_name", "owner_phone", "owner_email"]) {
+  for (const field of ["owner_name", "owner_phone", "owner_email", "assembler_name", "bms_sn", "bluetooth_id", "source"]) {
     if (payload[field] != null && typeof payload[field] !== "string") {
       return `invalid_${field}`;
     }
@@ -403,6 +450,45 @@ function isConfigCheckItem(item) {
     && item.label.trim().length > 0;
 }
 
+function validateServiceReport(payload) {
+  if (!isPlainObject(payload)) return "payload_must_be_object";
+  if (typeof payload.bms_uid !== "string" || payload.bms_uid.trim().length === 0) {
+    return "invalid_bms_uid";
+  }
+  if (typeof payload.assembler_name !== "string" || payload.assembler_name.trim().length === 0) {
+    return "invalid_assembler_name";
+  }
+  if (typeof payload.template_id !== "string" || payload.template_id.trim().length === 0) {
+    return "invalid_template_id";
+  }
+  if (!["ok", "partial", "failed"].includes(payload.status)) return "invalid_status";
+  if (payload.capacity_ah != null && !isFiniteNumber(payload.capacity_ah)) {
+    return "invalid_capacity_ah";
+  }
+  if (payload.written_at != null && !isNonNegativeInteger(payload.written_at)) {
+    return "invalid_written_at";
+  }
+  for (const field of ["bms_sn", "bluetooth_id", "bluetooth_name", "bluetooth_address", "source"]) {
+    if (payload[field] != null && typeof payload[field] !== "string") {
+      return `invalid_${field}`;
+    }
+  }
+  if (payload.items != null) {
+    if (!Array.isArray(payload.items)) return "invalid_items";
+    for (const item of payload.items) {
+      if (!isPlainObject(item)) return "invalid_items";
+      if (typeof item.key !== "string" || item.key.trim().length === 0) return "invalid_items";
+      if (typeof item.label !== "string" || item.label.trim().length === 0) return "invalid_items";
+      if (typeof item.ok !== "boolean") return "invalid_items";
+      if (item.expected != null && !isFiniteNumber(item.expected)) return "invalid_items";
+      if (item.actual != null && !isFiniteNumber(item.actual)) return "invalid_items";
+      if (item.unit != null && typeof item.unit !== "string") return "invalid_items";
+      if (item.error != null && typeof item.error !== "string") return "invalid_items";
+    }
+  }
+  return null;
+}
+
 function parseLimit(value) {
   if (value === undefined) return 100;
   if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
@@ -432,12 +518,8 @@ function loadConfigTemplate() {
   return JSON.parse(fs.readFileSync(templatePath, "utf8"));
 }
 
-function isRedDlBattery(battery) {
-  if (!battery) return false;
-  if (battery.hardware_family === "dl_red") return true;
-  return [battery.advertised_name, battery.bluetooth_name, battery.bms_uid].some(
-    (value) => typeof value === "string" && /^\s*DL/i.test(value),
-  );
+function isRedDlBattery(_battery) {
+  return false;
 }
 
 module.exports = { createApp };
