@@ -11,8 +11,8 @@ android {
         applicationId = "ru.liferych.bms"
         minSdk = 23
         targetSdk = 35
-        versionCode = 73
-        versionName = "0.2.13-service"
+        versionCode = 82
+        versionName = "0.2.22"
     }
 
     buildFeatures {

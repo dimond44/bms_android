@@ -1,11 +1,22 @@
 {
   "id": "liferych-lfp-12v",
-  "version": 1,
+  "version": 2,
   "chemistry": "LiFePO4",
   "series_count": 4,
   "pack_voltage": 12,
   "supported_series": [4],
   "parameters": [
+    {
+      "key": "series_cell_count",
+      "label": "Количество последовательно соединенных элементов",
+      "register": "0x0094",
+      "scale": 1,
+      "offset": 0,
+      "unit": "",
+      "tolerance": 0,
+      "enforcement": "required",
+      "expected": 4
+    },
     {
       "key": "sleep_timeout",
       "label": "Время ожидания сна",

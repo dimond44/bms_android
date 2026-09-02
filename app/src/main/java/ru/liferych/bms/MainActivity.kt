@@ -62,7 +62,7 @@ private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_su
 private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
 private const val SERVER_WARRANTY_UPDATE_URL = "http://dimond44.xsph.ru/api/warranty_update.php"
 private const val SERVER_API_KEY = "change_me_api_key_2026"
-private const val APP_VERSION = "0.2.13-service"
+private const val APP_VERSION = "0.2.17-service"
 private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
 private const val CONFIG_UPLOAD_INTERVAL_MS = 300000L
@@ -76,6 +76,12 @@ private const val HARDWARE_FAMILY_DL_RED = "dl_red"
 private const val DALY_SN_CODE_START = 0x0057
 private const val DALY_SN_CODE_END = 0x005D
 private const val DALY_SN_CODE_COUNT = DALY_SN_CODE_END - DALY_SN_CODE_START + 1
+private const val DALY_NOMINAL_CAPACITY_HI_REG = 0x0109
+private const val DALY_NOMINAL_CAPACITY_LO_REG = 0x010A
+private const val DALY_REMAINING_CAPACITY_HI_REG = 0x010B
+private const val DALY_REMAINING_CAPACITY_LO_REG = 0x010C
+private const val DALY_PASSWORD_REG_0 = 0x0126
+private const val SERVICE_SETTINGS_PASSWORD = "113355"
 private val DL_RED_SKIPPED_TEMPLATE_KEYS = setOf(
     "soc_calibration_0",
     "soc_calibration_100",
@@ -142,7 +148,8 @@ data class RemoteWriteCommand(
     val offset: Double,
     val unit: String,
     val localOnly: Boolean = false,
-    val displayValue: Double? = null
+    val displayValue: Double? = null,
+    val writeFrames: List<ByteArray>? = null
 )
 
 data class ServiceWriteResult(
@@ -390,7 +397,6 @@ class MainActivity : ComponentActivity() {
     private var currentTab: String = "main"
     private var manageSection: String = "general"
     private var screenState: String = "splash"
-    private var templateCheckShownForConnection: Boolean = false
     private val templateChecksByBms: MutableMap<String, TemplateCheckResult> = mutableMapOf()
     private var latestTemplateCheck: TemplateCheckResult? = null
     private var testSocWriteDoneForConnection: Boolean = false
@@ -412,6 +418,7 @@ class MainActivity : ComponentActivity() {
     private val devices = linkedMapOf<String, BluetoothDevice>()
     private val scanRssi = linkedMapOf<String, Int>()
     private val scanNames = linkedMapOf<String, String>()
+    private var searchIdQuery: String = ""
     private val deviceStatusViews = linkedMapOf<String, TextView>()
     private val deviceActionViews = linkedMapOf<String, TextView>()
     private var returnToBatteriesAfterConnect = false
@@ -439,9 +446,10 @@ class MainActivity : ComponentActivity() {
     private val serviceWriteResults: MutableList<ServiceWriteResult> = mutableListOf()
     private var serviceWriteActive: Boolean = false
     private var serviceWriteCapacityAh: Double? = null
+    private var pendingServiceWriteFinalVerify: Boolean = false
+    private var serviceVerifyNeedsReadAfterCurrent: Boolean = false
     private var bluetoothIdValue: TextView? = null
     private var bmsSnValue: TextView? = null
-    private var serviceStatusText: TextView? = null
     private var serviceUploadStatusText: TextView? = null
     private var dashboardUploadStatusText: TextView? = null
     private var pendingFirstTelemetryUpload = false
@@ -503,6 +511,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var headerSub: TextView
     private lateinit var connectionText: TextView
     private lateinit var manageContentLayout: LinearLayout
+    private lateinit var qtcContentLayout: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         Thread.setDefaultUncaughtExceptionHandler { _, e ->
@@ -1608,7 +1617,7 @@ class MainActivity : ComponentActivity() {
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), 0, dp(16), dp(14))
+            setPadding(hPad(), 0, hPad(), dp(14))
         }
         content.addView(TextView(this).apply {
             text = "Батарея"
@@ -1622,6 +1631,29 @@ class MainActivity : ComponentActivity() {
             setTextColor(Color.rgb(16, 17, 20))
             typeface = interFont(760)
         }, marginLp(-1, -2, 0, 0, 0, 8))
+        val searchEdit = EditText(this).apply {
+            setText(searchIdQuery)
+            hint = "Поиск по ID, например 3A2F"
+            textSize = 15f
+            setSingleLine(true)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+            setPadding(dp(12), 0, dp(12), 0)
+            background = round(Color.rgb(246, 247, 249), dp(12), Color.rgb(223, 229, 235), 1)
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    searchIdQuery = s?.toString().orEmpty()
+                    rebuildSearchDeviceList()
+                }
+            })
+        }
+        content.addView(searchEdit, LinearLayout.LayoutParams(-1, dp(48)))
+        content.addView(TextView(this).apply {
+            text = "Можно ввести последние цифры Bluetooth ID"
+            textSize = 12f
+            setTextColor(Color.rgb(111, 119, 129))
+        }, marginLp(-1, -2, 0, 6, 0, 10))
 
         val scroll = ScrollView(this)
         deviceListLayout = LinearLayout(this).apply {
@@ -1669,7 +1701,7 @@ class MainActivity : ComponentActivity() {
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), 0, dp(16), dp(14))
+            setPadding(hPad(), 0, hPad(), dp(14))
         }
 
         val hero = LinearLayout(this).apply {
@@ -1740,7 +1772,7 @@ class MainActivity : ComponentActivity() {
                 minimumHeight = dp(82)
                 background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
                 addView(TextView(this@MainActivity).apply {
-                    text = "$icon  $label"
+                    text = if (icon.isBlank()) label else "$icon  $label"
                     textSize = 11f
                     setTextColor(Color.rgb(111, 119, 129))
                     typeface = interFont(650)
@@ -1773,23 +1805,29 @@ class MainActivity : ComponentActivity() {
         metricRow2.addView(modeMetric.first, marginLp(0, -2, 4, 0, 0, 0).apply { weight = 1f })
         content.addView(metricRow2, marginLp(-1, -2, 0, 8, 0, 0))
 
-        val metricRow3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val metricRow3 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.FILL
+            isMeasureWithLargestChildEnabled = true
+        }
         val nameMetric = metricBox("⌁", selectedDeviceName.ifBlank { "--" }, "Имя устройства", "Bluetooth", 14f, true)
         deviceNameValue = nameMetric.second
-        metricRow3.addView(nameMetric.first, marginLp(0, -2, 0, 0, 4, 0).apply { weight = 1.4f })
-        val cyclesMetric = metricBox("#", "--", "Циклы", "Заряд / разряд")
+        metricRow3.addView(nameMetric.first, marginLp(0, -1, 0, 0, 4, 0).apply { weight = 1.4f })
+        val cyclesMetric = metricBox("#", "--", "Циклы", "Заряд / разряд", 14f)
         cycleCountValue = cyclesMetric.second
-        metricRow3.addView(cyclesMetric.first, marginLp(0, -2, 4, 0, 0, 0).apply { weight = 1f })
+        metricRow3.addView(cyclesMetric.first, marginLp(0, -1, 4, 0, 0, 0).apply { weight = 1f })
         content.addView(metricRow3, marginLp(-1, -2, 0, 8, 0, 0))
+        equalizeRowChildHeights(metricRow3)
 
-        val idRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val btMetric = metricBox("ID", bluetoothId().ifBlank { "--" }, "Bluetooth ID", "MAC-адрес", 13f, true)
-        bluetoothIdValue = btMetric.second
-        idRow.addView(btMetric.first, marginLp(0, -2, 0, 0, 4, 0).apply { weight = 1f })
-        val snMetric = metricBox("SN", bmsSn().ifBlank { "--" }, "SN BMS", "Заводской номер", 13f, true)
+        val idMetric = metricBox("ID", bluetoothId().ifBlank { "--" }, "Bluetooth ID", "MAC-адрес", 12f, true)
+        bluetoothIdValue = idMetric.second.apply {
+            maxLines = 2
+            ellipsize = null
+        }
+        content.addView(idMetric.first, marginLp(-1, -2, 0, 8, 0, 0))
+        val snMetric = metricBox("", displayFactorySn().ifBlank { "--" }, "Заводской номер", "BMS", 13f, true)
         bmsSnValue = snMetric.second
-        idRow.addView(snMetric.first, marginLp(0, -2, 4, 0, 0, 0).apply { weight = 1f })
-        content.addView(idRow, marginLp(-1, -2, 0, 8, 0, 0))
+        content.addView(snMetric.first, marginLp(-1, -2, 0, 8, 0, 0))
 
         if (isServiceApp()) {
             dashboardUploadStatusText = TextView(this).apply {
@@ -2016,6 +2054,8 @@ class MainActivity : ComponentActivity() {
                     showBatteriesScreen()
                 } else if (text.contains("Сервис")) {
                     showServiceScreen()
+                } else if (text.contains("ОТК")) {
+                    showQtcScreen()
                 } else if (text.contains("Управление") || text.contains("Настройки")) {
                     showManageScreen()
                 } else if (text.contains("Журнал")) {
@@ -2044,6 +2084,7 @@ class MainActivity : ComponentActivity() {
             navItem(this, "⌂\nГлавная", selectedTab == "main")
             if (isServiceApp()) {
                 navItem(this, "⚙\nСервис", selectedTab == "service")
+                navItem(this, "✓\nОТК", selectedTab == "qtc")
                 navItem(this, "●\nПрофиль", selectedTab == "profile")
             } else {
                 navItem(this, "≡\nЖурнал", selectedTab == "journal")
@@ -2178,7 +2219,7 @@ class MainActivity : ComponentActivity() {
         content.addView(templateCard, marginLp(-1, -2, 0, 0, 0, 12))
 
         content.addView(TextView(this).apply {
-            text = if (serviceWriteActive) "Идёт запись…" else "ЗАПИСАТЬ ШАБЛОН"
+            text = "ЗАПИСАТЬ ШАБЛОН"
             gravity = Gravity.CENTER
             textSize = 15f
             typeface = interFont(760)
@@ -2189,36 +2230,181 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { startServiceTemplateWrite() }
         }, marginLp(-1, dp(54), 0, 0, 0, 10))
 
-        serviceStatusText = TextView(this).apply {
-            text = when {
-                serviceWriteActive -> "Запись параметров в BMS…"
-                serviceWriteResults.isNotEmpty() -> serviceWriteSummaryText()
-                else -> "После записи здесь появится список того, что ушло в BMS."
-            }
-            textSize = 13f
-            setTextColor(Color.rgb(90, 90, 90))
-        }
-        content.addView(serviceStatusText, marginLp(-1, -2, 0, 0, 0, 12))
-
-        if (serviceWriteResults.isNotEmpty()) {
-            val resultCard = card()
-            resultCard.addView(sectionTitle("Что записалось", serviceWriteSummaryText()))
-            for (item in serviceWriteResults) {
-                val line = "${if (item.ok) "✓" else "✗"}  ${item.label}: ${formatTemplateNumber(item.expected)} → ${formatTemplateNumber(item.actual)} ${item.unit}".trim()
-                resultCard.addView(TextView(this).apply {
-                    text = if (item.error.isNullOrBlank()) line else "$line\n${item.error}"
-                    textSize = 13f
-                    setTextColor(if (item.ok) Color.rgb(28, 160, 55) else Color.rgb(196, 40, 40))
-                    setPadding(0, dp(4), 0, dp(4))
-                })
-            }
-            content.addView(resultCard, marginLp(-1, -2, 0, 0, 0, 12))
-        }
-
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(fixedBottomNav("service"), LinearLayout.LayoutParams(-1, dp(70)))
         setContentView(root)
+    }
+
+    private fun showQtcScreen() {
+        if (!isServiceApp()) {
+            showBatteriesScreen()
+            return
+        }
+        if (configRegisters.isEmpty() && !configReadInProgress) loadCachedConfigForCurrentBms()
+
+        screenState = "qtc"
+        currentTab = "qtc"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+        root.addView(
+            header(
+                "ОТК",
+                selectedDeviceName.ifBlank { selectedAddress ?: "нет подключения" },
+                if (bluetoothGatt != null) "Bluetooth\nподключен" else "Нет BLE"
+            )
+        )
+
+        val scroll = ScrollView(this)
+        qtcContentLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(16))
+        }
+        scroll.addView(qtcContentLayout)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(fixedBottomNav("qtc"), LinearLayout.LayoutParams(-1, dp(70)))
+        setContentView(root)
+        renderQtcContent()
+    }
+
+    private fun renderQtcContent() {
+        if (!::qtcContentLayout.isInitialized) return
+        qtcContentLayout.removeAllViews()
+
+        val result = if (configRegisters.isNotEmpty()) evaluateTemplateCheck() else currentTemplateCheck()
+        qtcContentLayout.addView(qtcStatusCard(result), marginLp(-1, -2, 0, 0, 0, 12))
+
+        val mismatches = result?.mismatches.orEmpty()
+        val missing = result?.missing.orEmpty()
+        if (result?.status == "mismatch" || mismatches.isNotEmpty() || missing.isNotEmpty()) {
+            val rows = mutableListOf<Pair<String, String>>()
+            mismatches.forEach {
+                rows += it.label to "${qtcValueText(it.actual, it.unit)}  ≠  ${qtcValueText(it.expected, it.unit)}"
+            }
+            missing.forEach {
+                rows += it.label to "нет данных, ожидалось ${qtcValueText(it.expected, it.unit)}"
+            }
+            if (rows.isNotEmpty()) {
+                qtcContentLayout.addView(
+                    manageSectionCard("Не совпадает с шаблоном", rows),
+                    marginLp(-1, -2, 0, 0, 0, 12)
+                )
+            }
+        }
+
+        qtcContentLayout.addView(
+            manageSectionCard("Параметры шаблона", qtcTemplateParameterRows()),
+            marginLp(-1, -2, 0, 0, 0, 12)
+        )
+
+        val cellCount = data.cellCount
+        val cellRows = if (cellCount != null) {
+            (1..cellCount).map { no ->
+                "Ячейка $no" to (data.cells[no]?.let { "%.3f В".format(it) } ?: "--")
+            }
+        } else {
+            emptyList()
+        }
+        qtcContentLayout.addView(
+            manageSectionCard(
+                "Параметры АКБ",
+                listOf(
+                    "Серийный номер BMS" to displayFactorySn().ifBlank { "--" },
+                    "Напряжение" to (data.voltage?.let { "%.2f В".format(it) } ?: "--"),
+                    "Температура 1" to qtcTempText(1),
+                    "Температура 2" to qtcTempText(2),
+                    "Разбег ячеек" to (data.cellDiffV?.let { "%.3f В".format(it) } ?: "--"),
+                    "Ёмкость" to (data.remainingAh?.let { "%.1f А·ч".format(it) } ?: "--"),
+                    "Номинальная ёмкость" to nominalCapacityText(),
+                    "MOS зарядки" to mosText(data.chargeMos),
+                    "MOS разрядки" to mosText(data.dischargeMos)
+                ) + cellRows
+            ),
+            marginLp(-1, -2, 0, 0, 0, 12)
+        )
+    }
+
+    private fun qtcStatusCard(result: TemplateCheckResult?): LinearLayout {
+        val status = result?.status ?: "unknown"
+        val color = when (status) {
+            "ok" -> Color.rgb(28, 160, 55)
+            "mismatch" -> Color.rgb(211, 47, 47)
+            "incomplete" -> Color.rgb(224, 150, 0)
+            else -> Color.rgb(110, 118, 128)
+        }
+        val series = result?.seriesCount?.let { "${it}S" } ?: data.cellCount?.let { "${it}S" } ?: "—"
+        val title = when (status) {
+            "checking" -> "Проверка конфигурации…"
+            "ok" -> "Конфигурация соответствует шаблону"
+            "mismatch" -> "Конфигурация не соответствует шаблону"
+            "incomplete" -> "Проверка конфигурации неполная"
+            else -> "Конфигурация ещё не проверена"
+        }
+        val detail = when (status) {
+            "ok" -> "Серия $series. Все параметры шаблона совпадают."
+            "mismatch" -> "Серия $series. Ниже указаны расхождения."
+            "incomplete" -> "Серия $series. Не все параметры удалось сравнить."
+            "checking" -> "Чтение настроек BMS ещё не закончено."
+            else -> "Подключите BMS и дождитесь чтения конфигурации."
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = round(Color.argb(24, Color.red(color), Color.green(color), Color.blue(color)), dp(14), color, 1)
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 16f
+                typeface = interFont(720)
+                setTextColor(color)
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = detail
+                textSize = 13f
+                setTextColor(Color.rgb(75, 79, 84))
+                setPadding(0, dp(4), 0, 0)
+            })
+        }
+    }
+
+    private fun qtcTemplateParameterRows(): List<Pair<String, String>> {
+        val series = data.cellCount?.takeIf { it == 4 || it == 8 }
+        val template = try {
+            loadBmsConfigTemplate()
+        } catch (_: Exception) {
+            return listOf("Шаблон" to "не загружен")
+        }
+        val family = currentHardwareFamily()
+        val rows = mutableListOf<Pair<String, String>>()
+        for (parameter in template.parameters) {
+            if (parameter.enforcement == "informational") continue
+            if (shouldSkipTemplateParameter(parameter, family)) continue
+            val expected = parameter.expected ?: series?.let { parameter.expectedBySeries[it] }
+            val actual = templateParameterActual(parameter)
+            val actualText = qtcValueText(actual, parameter.unit)
+            val expectedText = qtcValueText(expected, parameter.unit)
+            val ok = actual != null && expected != null &&
+                kotlin.math.abs(actual - expected) <= parameter.tolerance
+            rows += parameter.label to if (ok) {
+                actualText
+            } else {
+                "$actualText  ·  шаблон $expectedText"
+            }
+        }
+        if (rows.isEmpty()) return listOf("Параметры" to "нет данных")
+        return rows
+    }
+
+    private fun qtcValueText(value: Double?, unit: String): String {
+        if (value == null) return "—"
+        return "${formatTemplateNumber(value)} $unit".trim()
+    }
+
+    private fun qtcTempText(no: Int): String {
+        if (hasTemperatureSensorError()) return "Нет датчика"
+        val t = data.temps[no] ?: if (no == 1) data.minTemp else data.maxTemp
+        return t?.let { "$it °C" } ?: "--"
     }
 
     private fun serviceWriteSummaryText(): String {
@@ -2242,20 +2428,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         val series = if (serviceTemplateKey == "24v") 8 else 4
-        val cells = data.cellCount
-        val proceed = {
-            enqueueServiceTemplateWrites(capacity, series)
-        }
-        if (cells != null && cells != series) {
-            AlertDialog.Builder(this)
-                .setTitle("Проверьте шаблон")
-                .setMessage("BMS показывает $cells ячеек, выбран шаблон ${series}S (${if (series == 4) "12В" else "24В"}). Продолжить запись?")
-                .setNegativeButton("Отмена", null)
-                .setPositiveButton("Записать") { _, _ -> proceed() }
-                .show()
-        } else {
-            proceed()
-        }
+        enqueueServiceTemplateWrites(capacity, series)
     }
 
     private fun enqueueServiceTemplateWrites(capacityAh: Double, series: Int) {
@@ -2271,7 +2444,9 @@ class MainActivity : ComponentActivity() {
         var id = 1
         serviceWriteResults.clear()
         serviceWriteCapacityAh = capacityAh
+        id = enqueueSeriesCountWrite(queue, series, id)
         for (parameter in template.parameters) {
+            if (parameter.key == "series_cell_count") continue
             if (shouldSkipTemplateParameter(parameter, family)) continue
             val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
             val raw = Math.round((expected - parameter.offset) * parameter.scale).toInt()
@@ -2314,38 +2489,32 @@ class MainActivity : ComponentActivity() {
                 error = null
             )
         } else {
-            val milliAh = Math.round(capacityAh * 1000.0).toInt().coerceIn(0, 0x7FFFFFFF)
-            queue.add(
-                RemoteWriteCommand(
-                    id = id++,
-                    key = "nominal_capacity_lo",
-                    label = "Номинальная емкость",
-                    register = 0x010A,
-                    rawValue = milliAh and 0xFFFF,
-                    value = (milliAh and 0xFFFF).toDouble(),
-                    scale = 1.0,
-                    offset = 0.0,
-                    unit = "Ah",
-                    localOnly = true,
-                    displayValue = capacityAh
-                )
-            )
+            val milliAh = Math.round(capacityAh * 1000.0).toInt().coerceIn(1, 0x7FFFFFFF)
+            val capHi = (milliAh ushr 16) and 0xFFFF
+            val capLo = milliAh and 0xFFFF
             queue.add(
                 RemoteWriteCommand(
                     id = id,
-                    key = "nominal_capacity_hi",
+                    key = "nominal_capacity",
                     label = "Номинальная емкость",
-                    register = 0x010B,
-                    rawValue = milliAh ushr 16,
-                    value = (milliAh ushr 16).toDouble(),
-                    scale = 1.0,
+                    register = DALY_NOMINAL_CAPACITY_HI_REG,
+                    rawValue = milliAh,
+                    value = capacityAh,
+                    scale = 1000.0,
                     offset = 0.0,
                     unit = "Ah",
                     localOnly = true,
-                    displayValue = capacityAh
+                    displayValue = capacityAh,
+                    writeFrames = listOf(
+                        buildModbusWriteSingleRequest(0x81, DALY_REMAINING_CAPACITY_HI_REG, capHi),
+                        buildModbusWriteSingleRequest(0x81, DALY_REMAINING_CAPACITY_LO_REG, capLo),
+                        buildModbusWriteSingleRequest(0x81, DALY_NOMINAL_CAPACITY_HI_REG, capHi),
+                        buildModbusWriteSingleRequest(0x81, DALY_NOMINAL_CAPACITY_LO_REG, capLo)
+                    )
                 )
             )
         }
+        enqueueServicePasswordWrite(queue, id + 1)
         if (queue.isEmpty()) {
             serviceWriteActive = false
             uploadServiceReport()
@@ -2358,9 +2527,100 @@ class MainActivity : ComponentActivity() {
         }
         serviceWriteQueue = queue
         serviceWriteActive = true
-        showServiceScreen()
         val first = serviceWriteQueue.poll()
         if (first != null) startRemoteWrite(first)
+    }
+
+    private fun enqueueSeriesCountWrite(
+        queue: java.util.ArrayDeque<RemoteWriteCommand>,
+        series: Int,
+        nextId: Int
+    ): Int {
+        if (data.cellCount == series) {
+            serviceWriteResults += ServiceWriteResult(
+                key = "series_cell_count",
+                label = "Количество последовательно соединенных элементов",
+                expected = series.toDouble(),
+                actual = series.toDouble(),
+                unit = "",
+                ok = true,
+                error = null
+            )
+            return nextId
+        }
+        queue.add(
+            RemoteWriteCommand(
+                id = nextId,
+                key = "series_cell_count",
+                label = "Количество последовательно соединенных элементов",
+                register = 0x0094,
+                rawValue = series,
+                value = series.toDouble(),
+                scale = 1.0,
+                offset = 0.0,
+                unit = "",
+                localOnly = true,
+                writeFrames = buildDalyCellCountWriteFrames(series)
+            )
+        )
+        return nextId + 1
+    }
+
+    private fun templateParameterHasActual(parameter: BmsTemplateParameter): Boolean {
+        return if (parameter.key == "series_cell_count") data.cellCount != null
+        else configRegisters.containsKey(parameter.register)
+    }
+
+    private fun templateParameterActual(parameter: BmsTemplateParameter): Double? {
+        if (parameter.key == "series_cell_count") return data.cellCount?.toDouble()
+        val raw = configRegisters[parameter.register] ?: return null
+        return (raw / parameter.scale) + parameter.offset
+    }
+
+    private fun enqueueServicePasswordWrite(queue: java.util.ArrayDeque<RemoteWriteCommand>, id: Int) {
+        if (passwordFromBmsConfig() == SERVICE_SETTINGS_PASSWORD) {
+            upsertServiceWriteResult(
+                ServiceWriteResult(
+                    key = "settings_password",
+                    label = "Пароль настроек",
+                    expected = 113355.0,
+                    actual = 113355.0,
+                    unit = "",
+                    ok = true,
+                    error = null
+                )
+            )
+            return
+        }
+        val words = passwordToRegisterValues(SERVICE_SETTINGS_PASSWORD) ?: return
+        queue.add(
+            RemoteWriteCommand(
+                id = id,
+                key = "settings_password",
+                label = "Пароль настроек",
+                register = DALY_PASSWORD_REG_0,
+                rawValue = words[0],
+                value = 113355.0,
+                scale = 1.0,
+                offset = 0.0,
+                unit = "",
+                localOnly = true,
+                writeFrames = listOf(
+                    buildModbusWriteSingleRequest(0x81, DALY_PASSWORD_REG_0, words[0]),
+                    buildModbusWriteSingleRequest(0x81, DALY_PASSWORD_REG_0 + 1, words[1]),
+                    buildModbusWriteSingleRequest(0x81, DALY_PASSWORD_REG_0 + 2, words[2])
+                )
+            )
+        )
+    }
+
+    private fun passwordToRegisterValues(password: String): IntArray? {
+        if (password.length != 6 || !password.all { it.isDigit() }) return null
+        return IntArray(3) { index ->
+            val hi = password[index * 2].code
+            val lo = password[index * 2 + 1].code
+            (hi shl 8) or lo
+        }
     }
 
     private fun completeServiceWriteStep(
@@ -2369,34 +2629,99 @@ class MainActivity : ComponentActivity() {
         actual: Double?,
         error: String?
     ) {
-        if (command.key != "nominal_capacity_lo") {
-            val expected = command.displayValue ?: command.value
-            val actualShown = if (command.key == "nominal_capacity_hi") reconstructedCapacityAh() else actual
-            val resultOk = if (command.key == "nominal_capacity_hi") {
-                val exp = serviceWriteCapacityAh
-                actualShown != null && exp != null && kotlin.math.abs(actualShown - exp) <= 0.6
-            } else {
-                ok
-            }
+        if (command.key != "nominal_capacity" && command.key != "settings_password") {
             serviceWriteResults += ServiceWriteResult(
-                key = if (command.key == "nominal_capacity_hi") "nominal_capacity" else command.key,
+                key = command.key,
                 label = command.label,
-                expected = expected,
-                actual = actualShown,
+                expected = command.displayValue ?: command.value,
+                actual = actual,
                 unit = command.unit,
-                ok = resultOk,
-                error = if (resultOk) null else error
+                ok = ok,
+                error = if (ok) null else error
             )
         }
         val next = serviceWriteQueue.poll()
         if (next != null) {
-            serviceStatusText?.text = "Запись: ${next.label}"
-            mainHandler.postDelayed({ startRemoteWrite(next) }, 450)
+            mainHandler.postDelayed({ startRemoteWrite(next) }, 120L)
         } else {
             serviceWriteActive = false
-            uploadServiceReport()
-            showServiceScreen()
-            toast(serviceWriteSummaryText())
+            pendingServiceWriteFinalVerify = true
+            if (configReadInProgress) {
+                serviceVerifyNeedsReadAfterCurrent = true
+            } else {
+                startConfigReadIfNeeded(force = true)
+                if (!configReadInProgress) {
+                    finishServiceBatchWrite()
+                }
+            }
+        }
+    }
+
+    private fun finishServiceBatchWrite() {
+        pendingServiceWriteFinalVerify = false
+        finalizeServiceWriteResults()
+        uploadServiceReport()
+        val failed = serviceWriteResults.count { !it.ok }
+        toast(
+            when {
+                serviceWriteResults.isEmpty() -> "Запись завершена"
+                failed == 0 -> "Шаблон записан"
+                else -> "Запись завершена с ошибками ($failed)"
+            }
+        )
+        showServiceScreen()
+    }
+
+    private fun finalizeServiceWriteResults() {
+        val target = serviceWriteCapacityAh
+        if (target != null) {
+            val actual = configCapacityAhFromHiLo(DALY_REMAINING_CAPACITY_HI_REG, DALY_REMAINING_CAPACITY_LO_REG)
+                ?: configCapacityAhFromHiLo(DALY_NOMINAL_CAPACITY_HI_REG, DALY_NOMINAL_CAPACITY_LO_REG)
+            upsertServiceWriteResult(
+                ServiceWriteResult(
+                    key = "nominal_capacity",
+                    label = "Номинальная емкость",
+                    expected = target,
+                    actual = actual,
+                    unit = "Ah",
+                    ok = capacityMatchesTarget(target),
+                    error = if (capacityMatchesTarget(target)) null else "not_confirmed"
+                )
+            )
+        }
+        val password = passwordFromBmsConfig()
+        val passwordOk = password == SERVICE_SETTINGS_PASSWORD
+        upsertServiceWriteResult(
+            ServiceWriteResult(
+                key = "settings_password",
+                label = "Пароль настроек",
+                expected = SERVICE_SETTINGS_PASSWORD.toDoubleOrNull(),
+                actual = password?.toDoubleOrNull(),
+                unit = "",
+                ok = passwordOk,
+                error = if (passwordOk) null else "not_confirmed"
+            )
+        )
+        val expectedSeries = if (serviceTemplateKey == "24v") 8 else 4
+        upsertServiceWriteResult(
+            ServiceWriteResult(
+                key = "series_cell_count",
+                label = "Количество последовательно соединенных элементов",
+                expected = expectedSeries.toDouble(),
+                actual = data.cellCount?.toDouble(),
+                unit = "",
+                ok = data.cellCount == expectedSeries,
+                error = if (data.cellCount == expectedSeries) null else "not_confirmed"
+            )
+        )
+    }
+
+    private fun upsertServiceWriteResult(result: ServiceWriteResult) {
+        val existing = serviceWriteResults.indexOfFirst { it.key == result.key }
+        if (existing >= 0) {
+            serviceWriteResults[existing] = result
+        } else {
+            serviceWriteResults += result
         }
     }
 
@@ -2422,7 +2747,7 @@ class MainActivity : ComponentActivity() {
         val body = JSONObject().apply {
             put("api_key", SERVER_API_KEY)
             put("bms_uid", bmsUid())
-            put("bluetooth_name", selectedDeviceName)
+            put("bluetooth_name", dalyBluetoothDeviceId())
             put("bluetooth_address", selectedAddress ?: "")
             put("bluetooth_id", bluetoothId())
             put("bms_sn", bmsSn())
@@ -2488,10 +2813,12 @@ class MainActivity : ComponentActivity() {
         if (!::manageContentLayout.isInitialized) return
         manageContentLayout.removeAllViews()
 
-        manageContentLayout.addView(
-            templateCheckCard(),
-            marginLp(-1, -2, 0, 0, 0, 10)
-        )
+        if (manageSection == "general") {
+            manageContentLayout.addView(
+                templateCheckCard(),
+                marginLp(-1, -2, 0, 0, 0, 10)
+            )
+        }
 
         manageContentLayout.addView(TextView(this).apply {
             text = when (manageSection) {
@@ -2584,43 +2911,45 @@ class MainActivity : ComponentActivity() {
         ), marginLp(-1, -2, 0, 0, 0, 12))
 
 
-        val writeTestCard = card()
-        writeTestCard.addView(sectionTitle("Тест записи в BMS", ""))
-        writeTestCard.addView(TextView(this).apply {
-            val fromBms = passwordFromBmsConfig() ?: "не прочитан"
-            text = "Безопасная диагностика: формирует кадры SOC = 90% и показывает выбранный пароль. Команды НЕ отправляются в BMS, пока не найдена точная авторизация пароля.\n\nПароль в BMS: $fromBms\nВыбран для записи: ${selectedWritePassword()}"
-            textSize = 13f
-            setTextColor(Color.rgb(90,90,90))
-            setPadding(0, 0, 0, dp(8))
-        })
+        if (isServiceApp()) {
+            val writeTestCard = card()
+            writeTestCard.addView(sectionTitle("Тест записи в BMS", ""))
+            writeTestCard.addView(TextView(this).apply {
+                val fromBms = passwordFromBmsConfig() ?: "не прочитан"
+                text = "Безопасная диагностика: формирует кадры SOC = 90% и показывает выбранный пароль. Команды НЕ отправляются в BMS, пока не найдена точная авторизация пароля.\n\nПароль в BMS: $fromBms\nВыбран для записи: ${selectedWritePassword()}"
+                textSize = 13f
+                setTextColor(Color.rgb(90,90,90))
+                setPadding(0, 0, 0, dp(8))
+            })
 
-        val passRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        passRow.addView(passwordButton("123456"), LinearLayout.LayoutParams(0, dp(44), 1f))
-        passRow.addView(passwordButton("113355"), marginLp(0, dp(44), 8, 0, 0, 0).apply { weight = 1f })
-        writeTestCard.addView(passRow, marginLp(-1, -2, 0, 0, 0, 10))
+            val passRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            passRow.addView(passwordButton("123456"), LinearLayout.LayoutParams(0, dp(44), 1f))
+            passRow.addView(passwordButton("113355"), marginLp(0, dp(44), 8, 0, 0, 0).apply { weight = 1f })
+            writeTestCard.addView(passRow, marginLp(-1, -2, 0, 0, 0, 10))
 
-        writeTestCard.addView(TextView(this).apply {
-            text = "Сформировать кадры SOC 90%"
-            textSize = 16f
-            typeface = interFont(700)
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(dp(10), dp(13), dp(10), dp(13))
-            background = round(red, dp(14), Color.TRANSPARENT, 0)
-            setOnClickListener { writeTestSoc90ToBms() }
-        }, LinearLayout.LayoutParams(-1, -2))
+            writeTestCard.addView(TextView(this).apply {
+                text = "Сформировать кадры SOC 90%"
+                textSize = 16f
+                typeface = interFont(700)
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                setPadding(dp(10), dp(13), dp(10), dp(13))
+                background = round(red, dp(14), Color.TRANSPARENT, 0)
+                setOnClickListener { writeTestSoc90ToBms() }
+            }, LinearLayout.LayoutParams(-1, -2))
 
-        val stepRow1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        stepRow1.addView(socStepButton("1. Time", "time"), LinearLayout.LayoutParams(0, dp(46), 1f))
-        stepRow1.addView(socStepButton("2. SOC", "soc"), marginLp(0, dp(46), 8, 0, 0, 0).apply { weight = 1f })
-        writeTestCard.addView(stepRow1, marginLp(-1, -2, 0, 10, 0, 0))
+            val stepRow1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            stepRow1.addView(socStepButton("1. Time", "time"), LinearLayout.LayoutParams(0, dp(46), 1f))
+            stepRow1.addView(socStepButton("2. SOC", "soc"), marginLp(0, dp(46), 8, 0, 0, 0).apply { weight = 1f })
+            writeTestCard.addView(stepRow1, marginLp(-1, -2, 0, 10, 0, 0))
 
-        val stepRow2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        stepRow2.addView(socStepButton("3. Service", "service"), LinearLayout.LayoutParams(0, dp(46), 1f))
-        stepRow2.addView(socStepButton("Все 3 по очереди", "all"), marginLp(0, dp(46), 8, 0, 0, 0).apply { weight = 1f })
-        writeTestCard.addView(stepRow2, marginLp(-1, -2, 0, 8, 0, 0))
+            val stepRow2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            stepRow2.addView(socStepButton("3. Service", "service"), LinearLayout.LayoutParams(0, dp(46), 1f))
+            stepRow2.addView(socStepButton("Все 3 по очереди", "all"), marginLp(0, dp(46), 8, 0, 0, 0).apply { weight = 1f })
+            writeTestCard.addView(stepRow2, marginLp(-1, -2, 0, 8, 0, 0))
 
-        manageContentLayout.addView(writeTestCard, marginLp(-1, -2, 0, 0, 0, 12))
+            manageContentLayout.addView(writeTestCard, marginLp(-1, -2, 0, 0, 0, 12))
+        }
 
 
         val crashText = getSharedPreferences("crash_log", MODE_PRIVATE).getString("last_crash", "") ?: ""
@@ -2763,23 +3092,33 @@ class MainActivity : ComponentActivity() {
             )
         ), marginLp(-1, -2, 0, 0, 0, 12))
 
-        manageContentLayout.addView(manageSectionCard(
-            "Диагностика служебных регистров",
-            listOf(
-                "Тип инвертора, raw 0x024B" to regText(0x024B, null, ""),
-                "Способ связи, raw 0x024C" to regText(0x024C, null, ""),
-                "Протокол одной шины, raw 0x022A" to regText(0x022A, null, "")
-            )
-        ), marginLp(-1, -2, 0, 0, 0, 12))
+        if (isServiceApp()) {
+            manageContentLayout.addView(manageSectionCard(
+                "Диагностика служебных регистров",
+                listOf(
+                    "Тип инвертора, raw 0x024B" to regText(0x024B, null, ""),
+                    "Способ связи, raw 0x024C" to regText(0x024C, null, ""),
+                    "Протокол одной шины, raw 0x022A" to regText(0x022A, null, "")
+                )
+            ), marginLp(-1, -2, 0, 0, 0, 12))
+        }
 
+        val cellCount = data.cellCount
+        val cellRows = if (cellCount != null) {
+            (1..cellCount).map { no ->
+                "Ячейка $no" to (data.cells[no]?.let { fmtV(it, 3) } ?: "--")
+            }
+        } else {
+            emptyList()
+        }
         manageContentLayout.addView(manageSectionCard(
             "Текущие элементы",
             listOf(
-                "Количество ячеек" to (data.cellCount?.toString() ?: "--"),
+                "Количество ячеек" to (cellCount?.toString() ?: "--"),
                 "SOC" to fmtPct(data.soc),
                 "Оставшаяся емкость" to fmtAh(data.remainingAh),
                 "Расчетная полная емкость" to fmtAh(data.estimatedFullAh)
-            ) + data.cells.map { (no, voltage) -> "Ячейка $no" to fmtV(voltage, 3) }
+            ) + cellRows
         ), marginLp(-1, -2, 0, 0, 0, 12))
     }
 
@@ -2941,8 +3280,8 @@ class MainActivity : ComponentActivity() {
 
             for (parameter in template.parameters) {
                 val expected = parameter.expected ?: series?.let { parameter.expectedBySeries[it] }
-                val raw = configRegisters[parameter.register]
-                val actual = raw?.let { (it / parameter.scale) + parameter.offset }
+                val actual = templateParameterActual(parameter)
+                val hasActual = templateParameterHasActual(parameter)
 
                 if (parameter.enforcement == "informational") {
                     continue
@@ -2971,7 +3310,7 @@ class MainActivity : ComponentActivity() {
                         parameter.tolerance,
                         "unsupported_series"
                     )
-                } else if (raw == null) {
+                } else if (!hasActual) {
                     missing += TemplateCheckItem(
                         parameter.key,
                         parameter.label,
@@ -3460,8 +3799,6 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(11), dp(14), dp(11))
             background = round(Color.argb(24, Color.red(color), Color.green(color), Color.blue(color)), dp(14), color, 1)
-            isClickable = true
-            isFocusable = true
             addView(TextView(this@MainActivity).apply {
                 text = title
                 textSize = 15f
@@ -3474,70 +3811,8 @@ class MainActivity : ComponentActivity() {
                 setTextColor(Color.rgb(75, 79, 84))
                 setPadding(0, dp(4), 0, 0)
             })
-            setOnClickListener { showTemplateCheckDetails(currentTemplateCheck()) }
         }
     }
-
-    private fun templateCheckDetails(result: TemplateCheckResult?): String {
-        if (result == null) return "Результата ещё нет. Проверка запустится после чтения конфигурации BMS."
-        if (result.status == "checking") return "Чтение и проверка конфигурации выполняются."
-        val lines = mutableListOf<String>()
-        lines += "Серия: ${result.seriesCount?.let { "${it}S" } ?: "не определена"}"
-        lines += "Отклонений: ${result.mismatches.size}, нет данных: ${result.missing.size}"
-        if (result.mismatches.isNotEmpty()) {
-            lines += ""
-            lines += "Отклонения:"
-            result.mismatches.forEach {
-                lines += "• ${it.label}: ${formatTemplateNumber(it.actual)} ${it.unit}; ожидалось ${formatTemplateNumber(it.expected)} ${it.unit} ±${formatTemplateNumber(it.tolerance)}"
-            }
-        }
-        if (result.missing.isNotEmpty()) {
-            lines += ""
-            lines += "Нет данных:"
-            result.missing.forEach {
-                lines += "• ${it.label}: ${it.reason ?: "не прочитано"}; ожидалось ${formatTemplateNumber(it.expected)} ${it.unit}"
-            }
-        }
-        val informational = result.unverified.filter { it.reason?.startsWith("not_applicable") != true }
-        if (informational.isNotEmpty()) {
-            lines += ""
-            lines += "Информационные (не влияют на статус):"
-            informational.forEach {
-                lines += "• ${it.label}: ${formatTemplateNumber(it.actual)} ${it.unit}; ожидалось ${formatTemplateNumber(it.expected)} ${it.unit} (${it.reason ?: "mapping_unverified"})"
-            }
-        }
-        if (result.status == "ok") {
-            lines += ""
-            lines += "Все обязательные параметры соответствуют шаблону."
-        }
-        lines += ""
-        lines += "Проверка носит предупредительный характер и не блокирует работу BMS."
-        return lines.joinToString("\n")
-    }
-
-    private fun showTemplateCheckDetails(result: TemplateCheckResult?) {
-        val title = when (result?.status) {
-            "ok" -> "Конфигурация BMS: OK"
-            "mismatch" -> "Отклонения конфигурации BMS"
-            "incomplete" -> "Неполная проверка BMS"
-            "checking" -> "Проверка конфигурации BMS"
-            else -> "Конфигурация BMS"
-        }
-        AlertDialog.Builder(this)
-            .setTitle(title)
-            .setMessage(templateCheckDetails(result))
-            .setPositiveButton("OK", null)
-            .show()
-    }
-
-    private fun showTemplateCheckDialogIfNeeded() {
-        if (templateCheckShownForConnection || configReadInProgress) return
-        val result = currentTemplateCheck() ?: return
-        if (result.status !in setOf("ok", "mismatch", "incomplete")) return
-        templateCheckShownForConnection = true
-        showTemplateCheckDetails(result)
-    }
-
 
     private fun String.trimTrailingZeros(): String {
         return this.replace(Regex("0+$"), "").replace(Regex("\\.$"), "")
@@ -3592,7 +3867,7 @@ class MainActivity : ComponentActivity() {
 
     private fun rawCapacityRegistersJson(): JSONObject {
         val obj = JSONObject()
-        for (addr in listOf(0x010A, 0x010B, 0x010C, 0x010D)) {
+        for (addr in listOf(0x0109, 0x010A, 0x010B, 0x010C, 0x010D)) {
             if (configRegisters.containsKey(addr)) {
                 obj.put("0x%04X".format(addr), configRegisters[addr])
             }
@@ -3659,6 +3934,9 @@ class MainActivity : ComponentActivity() {
         runOnUiThread {
             if (screenState == "manage") {
                 renderManageContent()
+            }
+            if (screenState == "qtc") {
+                renderQtcContent()
             }
         }
     }
@@ -4716,7 +4994,7 @@ class MainActivity : ComponentActivity() {
         payload.put("battery_model", model)
         payload.put("problem_text", problem)
         payload.put("bms_uid", bmsUid())
-        payload.put("bluetooth_name", selectedDeviceName)
+        payload.put("bluetooth_name", dalyBluetoothDeviceId())
         payload.put("bluetooth_address", selectedAddress ?: "")
         payload.put("app_version", "v57-step-soc-write")
         payload.put("battery_snapshot", buildUploadJson())
@@ -5105,6 +5383,7 @@ class MainActivity : ComponentActivity() {
         if (!::deviceListLayout.isInitialized) return
         val address = device.address
         val name = displayName ?: device.name ?: "Unknown"
+        if (!deviceMatchesSearch(address, name)) return
 
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -5142,6 +5421,13 @@ class MainActivity : ComponentActivity() {
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         })
+        info.addView(TextView(this).apply {
+            text = address
+            textSize = 12f
+            typeface = interFont(650)
+            setTextColor(Color.rgb(16, 17, 20))
+            maxLines = 2
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
         info.addView(TextView(this).apply {
             text = "RSSI $rssi"
             textSize = 12f
@@ -5213,7 +5499,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun deviceMatchesSearch(address: String, name: String): Boolean {
+        val query = searchIdQuery.trim()
+        if (query.isBlank()) return true
+        val compactAddress = address.replace(":", "").replace("-", "")
+        val compactQuery = query.replace(":", "").replace("-", "").replace(" ", "")
+        if (compactQuery.isBlank()) return true
+        return compactAddress.contains(compactQuery, ignoreCase = true) ||
+            name.contains(query, ignoreCase = true)
+    }
+
+    private fun rebuildSearchDeviceList() {
+        if (screenState != "search" || !::deviceListLayout.isInitialized) return
+        deviceListLayout.removeAllViews()
+        deviceStatusViews.clear()
+        deviceActionViews.clear()
+        for ((address, device) in devices) {
+            val name = scanNames[address] ?: continue
+            addDeviceRow(device, scanRssi[address] ?: 0, name)
+        }
+    }
+
     private fun refreshDeviceRowsSelection() {
+        if (!::deviceListLayout.isInitialized) return
         for (i in 0 until deviceListLayout.childCount) {
             val row = deviceListLayout.getChildAt(i)
             val selected = row.tag == selectedAddress
@@ -5278,7 +5586,6 @@ class MainActivity : ComponentActivity() {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 pendingFirstTelemetryUpload = true
                 configAutoReadStartedForConnection = false
-                templateCheckShownForConnection = false
                 setTemplateCheckChecking()
                 testSocWriteDoneForConnection = false
                 servicesDiscoveryStarted = false
@@ -5326,7 +5633,6 @@ class MainActivity : ComponentActivity() {
                 pollLoopToken++
                 resetRemoteWriteState()
                 configAutoReadStartedForConnection = false
-                templateCheckShownForConnection = false
                 latestTemplateCheck = null
                 runOnUiThread {
                     selectedAddress?.let { address ->
@@ -5827,6 +6133,10 @@ class MainActivity : ComponentActivity() {
             if (::manageContentLayout.isInitialized) renderManageContent()
             return
         }
+        if (screenState == "qtc") {
+            if (::qtcContentLayout.isInitialized) renderQtcContent()
+            return
+        }
         if (!::socGauge.isInitialized) return
 
         socGauge.setSoc(data.soc)
@@ -5864,7 +6174,7 @@ class MainActivity : ComponentActivity() {
         val device = selectedDeviceName.ifBlank { selectedAddress ?: "не выбрано" }
         if (::deviceNameValue.isInitialized) deviceNameValue.text = device
         bluetoothIdValue?.text = bluetoothId().ifBlank { "--" }
-        bmsSnValue?.text = bmsSn().ifBlank { "--" }
+        bmsSnValue?.text = displayFactorySn().ifBlank { "--" }
         if (::cycleCountValue.isInitialized) {
             cycleCountValue.text = data.cycles?.toString() ?: "--"
         }
@@ -5972,11 +6282,19 @@ class MainActivity : ComponentActivity() {
         // Он читается только вручную кнопкой «Обновить конфиг BMS» и сохраняется в память приложения.
     }
 
-    private fun bmsUid(): String {
-        val name = sanitizeBleText(selectedDeviceName)
-        if (name.isNotBlank() && !name.equals("Unknown", true)) return name
-        return selectedAddress ?: "unknown_bms"
+    private fun isDalyBluetoothDeviceId(value: String): Boolean {
+        return value.matches(Regex("^DL-[0-9A-Fa-f]+$"))
     }
+
+    private fun dalyBluetoothDeviceId(): String {
+        val advertised = advertisedBluetoothName()
+        if (isDalyBluetoothDeviceId(advertised)) return advertised
+        val mac = selectedAddress.orEmpty().filter { it.isLetterOrDigit() }.uppercase()
+        if (mac.isNotBlank()) return "DL-$mac"
+        return advertised.ifBlank { selectedAddress ?: "unknown_bms" }
+    }
+
+    private fun bmsUid(): String = dalyBluetoothDeviceId()
 
     private fun sanitizeBleText(value: String?): String {
         if (value.isNullOrEmpty()) return ""
@@ -6007,6 +6325,13 @@ class MainActivity : ComponentActivity() {
             return live
         }
         return cachedFactorySerial()
+    }
+
+    private fun displayFactorySn(): String {
+        val raw = bmsSn()
+        if (raw.isBlank()) return ""
+        val cut = raw.indexOf("R24", ignoreCase = true)
+        return if (cut >= 0) raw.substring(0, cut).trim() else raw
     }
 
     private fun cachedFactorySerial(): String {
@@ -6057,10 +6382,28 @@ class MainActivity : ComponentActivity() {
         return servicePrefs.getString("assembler_name", "")?.trim().orEmpty()
     }
 
+    private fun configCapacityAhFromHiLo(hiAddr: Int, loAddr: Int): Double? {
+        val hi = configRegisters[hiAddr] ?: return null
+        val lo = configRegisters[loAddr] ?: return null
+        val raw = ((hi.toLong() and 0xFFFFL) shl 16) or (lo.toLong() and 0xFFFFL)
+        val ah = raw / 1000.0
+        return if (ah > 0.0 && ah < 5000.0) ah else null
+    }
+
+    private fun capacityMatchesTarget(targetAh: Double, tolerance: Double = 0.6): Boolean {
+        for (pair in listOf(
+            DALY_NOMINAL_CAPACITY_HI_REG to DALY_NOMINAL_CAPACITY_LO_REG,
+            DALY_REMAINING_CAPACITY_HI_REG to DALY_REMAINING_CAPACITY_LO_REG
+        )) {
+            val actual = configCapacityAhFromHiLo(pair.first, pair.second) ?: continue
+            if (kotlin.math.abs(actual - targetAh) <= tolerance) return true
+        }
+        return false
+    }
+
     private fun reconstructedCapacityAh(): Double? {
-        val lo = configRegisters[0x010A] ?: return null
-        val hi = configRegisters[0x010B] ?: return null
-        return ((hi shl 16) or (lo and 0xFFFF)).toDouble() / 1000.0
+        return configCapacityAhFromHiLo(DALY_REMAINING_CAPACITY_HI_REG, DALY_REMAINING_CAPACITY_LO_REG)
+            ?: configCapacityAhFromHiLo(DALY_NOMINAL_CAPACITY_HI_REG, DALY_NOMINAL_CAPACITY_LO_REG)
     }
 
     private fun scaledRegisterValue(register: Int, scale: Double, offset: Double): Double? {
@@ -6083,7 +6426,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentNominalCapacityAh(): Double? {
-        reconstructedCapacityAh()?.let { return it }
+        configCapacityAhFromHiLo(DALY_REMAINING_CAPACITY_HI_REG, DALY_REMAINING_CAPACITY_LO_REG)?.let { return it }
+        configCapacityAhFromHiLo(DALY_NOMINAL_CAPACITY_HI_REG, DALY_NOMINAL_CAPACITY_LO_REG)?.let { return it }
         val soc = data.soc
         val rem = data.remainingAh
         if (rem != null && rem > 0.0 && soc != null && soc >= 99.0) return rem
@@ -6091,12 +6435,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun capacityAlreadyMatches(targetAh: Double): Boolean {
-        val current = currentNominalCapacityAh() ?: return false
-        return kotlin.math.abs(current - targetAh) <= 0.6
+        fun close(v: Double?) = v != null && kotlin.math.abs(v - targetAh) <= 0.6
+        return close(configCapacityAhFromHiLo(DALY_REMAINING_CAPACITY_HI_REG, DALY_REMAINING_CAPACITY_LO_REG)) &&
+            close(configCapacityAhFromHiLo(DALY_NOMINAL_CAPACITY_HI_REG, DALY_NOMINAL_CAPACITY_LO_REG))
     }
 
     private fun remoteWriteAlreadyMatches(command: RemoteWriteCommand): Boolean {
-        if (command.key == "nominal_capacity_lo" || command.key == "nominal_capacity_hi") {
+        if (command.key == "series_cell_count") {
+            return data.cellCount == command.rawValue
+        }
+        if (command.key == "nominal_capacity") {
             val target = command.displayValue ?: serviceWriteCapacityAh ?: return false
             return capacityAlreadyMatches(target)
         }
@@ -6149,7 +6497,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun putHardwareIdentity(obj: JSONObject) {
-        val advertised = advertisedBluetoothName()
+        val advertised = dalyBluetoothDeviceId()
         obj.put("advertised_name", advertised)
         obj.put("hardware_family", currentHardwareFamily())
         obj.put("bluetooth_id", bluetoothId())
@@ -6549,6 +6897,10 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun startRemoteWrite(command: RemoteWriteCommand) {
+        if (command.localOnly && isServiceApp()) {
+            startServiceLocalWrite(command)
+            return
+        }
         if (remoteWriteInProgress || configReadInProgress) {
             if (command.localOnly) {
                 mainHandler.postDelayed({ startRemoteWrite(command) }, 350)
@@ -6560,12 +6912,14 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (remoteWriteAlreadyMatches(command)) {
-            val actual = if (command.key == "nominal_capacity_hi" || command.key == "nominal_capacity_lo") {
+            val actual = if (command.key == "nominal_capacity") {
                 currentNominalCapacityAh()
             } else {
                 scaledRegisterValue(command.register, command.scale, command.offset)
             }
-            toast("${command.label}: уже совпадает")
+            if (!command.localOnly) {
+                toast("${command.label}: уже совпадает")
+            }
             if (command.localOnly) {
                 completeServiceWriteStep(command, true, actual, null)
             } else {
@@ -6615,6 +6969,94 @@ class MainActivity : ComponentActivity() {
                 }, 900)
             }, 250)
         }, 140)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startServiceLocalWrite(command: RemoteWriteCommand) {
+        if (remoteWriteInProgress || configReadInProgress) {
+            mainHandler.postDelayed({ startServiceLocalWrite(command) }, 150)
+            return
+        }
+        if (bluetoothGatt == null || writeCharacteristic == null) {
+            completeServiceWriteStep(command, false, null, "no_ble")
+            return
+        }
+        if (remoteWriteAlreadyMatches(command)) {
+            completeServiceWriteStep(
+                command,
+                true,
+                command.displayValue ?: command.value,
+                null
+            )
+            return
+        }
+        if (command.key == "series_cell_count") {
+            startSeriesCountLocalWrite(command)
+            return
+        }
+
+        remoteWriteInProgress = true
+        pendingRemoteWrite = command
+        pollLoopToken++
+
+        val timeFrame = buildDalyTimeFrame()
+        val openFrame = buildModbusWriteSingleRequest(0x81, 0x0174, 0x00A2)
+        val writeFrames = command.writeFrames ?: listOf(
+            buildModbusWriteSingleRequest(0x81, command.register, command.rawValue)
+        )
+
+        fun writeFrameAt(index: Int) {
+            if (index >= writeFrames.size) {
+                remoteWriteInProgress = false
+                pendingRemoteWrite = null
+                completeServiceWriteStep(
+                    command,
+                    true,
+                    command.displayValue ?: command.value,
+                    null
+                )
+                return
+            }
+            writeBleFrame(timeFrame)
+            mainHandler.postDelayed({
+                writeBleFrame(writeFrames[index])
+                mainHandler.postDelayed({
+                    writeBleFrame(openFrame)
+                    mainHandler.postDelayed({ writeFrameAt(index + 1) }, 120L)
+                }, 120L)
+            }, 80L)
+        }
+
+        writeFrameAt(0)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startSeriesCountLocalWrite(command: RemoteWriteCommand) {
+        remoteWriteInProgress = true
+        pendingRemoteWrite = command
+        pollLoopToken++
+        val frames = command.writeFrames ?: buildDalyCellCountWriteFrames(command.rawValue)
+        fun writeAt(index: Int) {
+            if (index >= frames.size) {
+                writeBleFrame(buildRequest(0x94))
+                mainHandler.postDelayed({
+                    val actual = data.cellCount?.toDouble()
+                    val ok = data.cellCount == command.rawValue
+                    remoteWriteInProgress = false
+                    pendingRemoteWrite = null
+                    completeServiceWriteStep(
+                        command,
+                        ok,
+                        actual,
+                        if (ok) null else "not_confirmed"
+                    )
+                }, 600)
+                return
+            }
+            writeBleFrame(frames[index])
+            mainHandler.postDelayed({ writeAt(index + 1) }, 160L)
+        }
+        writeAt(0)
     }
 
     @SuppressLint("MissingPermission")
@@ -6856,6 +7298,27 @@ class MainActivity : ComponentActivity() {
         return frame
     }
 
+    private fun buildModbusWriteMultipleRegisters(slave: Int, startRegister: Int, values: IntArray): ByteArray {
+        val byteCount = values.size * 2
+        val frame = ByteArray(7 + byteCount + 2)
+        frame[0] = (slave and 0xFF).toByte()
+        frame[1] = 0x10.toByte()
+        frame[2] = ((startRegister shr 8) and 0xFF).toByte()
+        frame[3] = (startRegister and 0xFF).toByte()
+        frame[4] = ((values.size shr 8) and 0xFF).toByte()
+        frame[5] = (values.size and 0xFF).toByte()
+        frame[6] = byteCount.toByte()
+        for (i in values.indices) {
+            val v = values[i]
+            frame[7 + i * 2] = ((v shr 8) and 0xFF).toByte()
+            frame[8 + i * 2] = (v and 0xFF).toByte()
+        }
+        val crc = modbusCrc16(frame, frame.size - 2)
+        frame[frame.size - 2] = (crc and 0xFF).toByte()
+        frame[frame.size - 1] = ((crc shr 8) and 0xFF).toByte()
+        return frame
+    }
+
     @SuppressLint("MissingPermission")
     private fun sendNextConfigRead(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic) {
         if (!configReadInProgress) return
@@ -6878,6 +7341,27 @@ class MainActivity : ComponentActivity() {
             runOnUiThread { updateDashboardUi() }
             uploadCurrentData(force = true)
 
+            if (serviceVerifyNeedsReadAfterCurrent) {
+                serviceVerifyNeedsReadAfterCurrent = false
+                val gatt = bluetoothGatt
+                val ch = writeCharacteristic
+                if (gatt != null && ch != null) {
+                    configReadInProgress = true
+                    configReadQueue.clear()
+                    for (req in originalDalyConfigReadRequests()) {
+                        configReadQueue.add(req)
+                    }
+                    sendHciPreflightThenRead(gatt, ch)
+                }
+                return
+            }
+
+            if (pendingServiceWriteFinalVerify) {
+                finishServiceBatchWrite()
+                mainHandler.postDelayed({ pollOnce() }, 800)
+                return
+            }
+
             if (remoteWriteAwaitingVerify) {
                 finishRemoteWriteVerification()
                 return
@@ -6885,7 +7369,6 @@ class MainActivity : ComponentActivity() {
 
             mainHandler.postDelayed({
                 rememberCurrentBmsState()
-                showTemplateCheckDialogIfNeeded()
                 uploadConfigSnapshot(force = true)
                 scheduleExactSocWriteTest()
                 fetchAndApplyRemoteWrites()
@@ -7201,7 +7684,7 @@ class MainActivity : ComponentActivity() {
         val obj = JSONObject()
         obj.put("api_key", SERVER_API_KEY)
         obj.put("bms_uid", bmsUid())
-        obj.put("bluetooth_name", selectedDeviceName)
+        obj.put("bluetooth_name", dalyBluetoothDeviceId())
         obj.put("bluetooth_address", selectedAddress ?: "")
         putHardwareIdentity(obj)
         obj.put("app_version", APP_VERSION)
@@ -7383,7 +7866,7 @@ class MainActivity : ComponentActivity() {
         val obj = JSONObject()
         obj.put("api_key", SERVER_API_KEY)
         obj.put("bms_uid", bmsUid())
-        obj.put("bluetooth_name", selectedDeviceName)
+        obj.put("bluetooth_name", dalyBluetoothDeviceId())
         obj.put("bluetooth_address", selectedAddress ?: "")
         putHardwareIdentity(obj)
         putNullable(obj, "voltage", data.voltage)
@@ -7456,14 +7939,52 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun buildRequest(cmd: Int): ByteArray {
+        return buildDalyA5Frame(cmd, ByteArray(8))
+    }
+
+    private fun buildDalyA5Frame(cmd: Int, payload: ByteArray): ByteArray {
         val frame = ByteArray(13)
         frame[0] = FRAME_START
         frame[1] = REQUEST_ADDRESS
         frame[2] = cmd.toByte()
         frame[3] = DATA_LEN
-        for (i in 4..11) frame[i] = 0
+        for (i in 0 until 8) {
+            frame[4 + i] = if (i < payload.size) payload[i] else 0
+        }
         frame[12] = checksum(frame, 12)
         return frame
+    }
+
+    private fun lastDaly94Payload(): ByteArray? {
+        val hex = data.raw["0x94"] ?: return null
+        val parts = hex.trim().split(Regex("\\s+"))
+        if (parts.size < 13) return null
+        val bytes = ByteArray(13)
+        for (i in 0 until 13) {
+            val value = parts[i].toIntOrNull(16) ?: return null
+            bytes[i] = value.toByte()
+        }
+        if ((bytes[2].toInt() and 0xFF) != 0x94) return null
+        return bytes.copyOfRange(4, 12)
+    }
+
+    private fun buildDalyCellCountWriteFrames(series: Int): List<ByteArray> {
+        val count = series.coerceIn(1, 24)
+        val prev = lastDaly94Payload()
+        val temps = prev?.get(1)?.toInt()?.and(0xFF)?.takeIf { it in 1..16 }
+            ?: data.tempCount?.takeIf { it in 1..16 }
+            ?: 2
+        val setBoard = ByteArray(8)
+        setBoard[0] = 1
+        setBoard[1] = count.toByte()
+        setBoard[4] = temps.toByte()
+        val set94 = prev?.copyOf() ?: ByteArray(8)
+        set94[0] = count.toByte()
+        set94[1] = temps.toByte()
+        return listOf(
+            buildDalyA5Frame(0x11, setBoard),
+            buildDalyA5Frame(0x94, set94)
+        )
     }
 
     private fun checksum(bytes: ByteArray, length: Int): Byte {
@@ -7550,6 +8071,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun equalizeRowChildHeights(row: LinearLayout) {
+        row.post {
+            var maxH = 0
+            for (i in 0 until row.childCount) {
+                maxH = max(maxH, row.getChildAt(i).measuredHeight)
+            }
+            if (maxH <= 0) return@post
+            for (i in 0 until row.childCount) {
+                val child = row.getChildAt(i)
+                val lp = child.layoutParams
+                if (lp.height != maxH) {
+                    lp.height = maxH
+                    child.layoutParams = lp
+                }
+            }
+        }
+    }
+
     private fun openExternalUrl(url: String) {
         try {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
@@ -7583,6 +8122,10 @@ class MainActivity : ComponentActivity() {
 
     private fun dp(value: Int): Int {
         return (value * resources.displayMetrics.density).toInt()
+    }
+
+    private fun hPad(): Int {
+        return if (resources.displayMetrics.widthPixels < dp(360)) dp(10) else dp(16)
     }
 
     @Deprecated("Deprecated in Java")

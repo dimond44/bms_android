@@ -339,7 +339,7 @@
 
       const main = el("span", "battery-main");
       appendText(main, "span", "battery-name", displayName(battery));
-      appendText(main, "span", "battery-uid", battery.bms_uid || "Без UID");
+      appendText(main, "span", "battery-uid", bluetoothDeviceId(battery));
       if (textOrEmpty(battery.bms_sn)) {
         appendText(main, "span", "battery-uid", `SN ${battery.bms_sn.trim()}`);
       }
@@ -393,7 +393,7 @@
 
     dom.batteryName.textContent = displayName(battery);
     renderHardwareBadge(battery);
-    dom.batteryUid.textContent = battery.bms_uid || "—";
+    dom.batteryUid.textContent = bluetoothDeviceId(battery);
     if (dom.batterySn) {
       dom.batterySn.textContent = textOrEmpty(battery.bms_sn) ? `SN ${battery.bms_sn.trim()}` : "SN не прочитан";
     }
@@ -1387,7 +1387,24 @@
   }
 
   function displayName(battery) {
-    return battery.bluetooth_name || battery.advertised_name || battery.bms_uid || "Аккумулятор";
+    return bluetoothDeviceId(battery);
+  }
+
+  function isBluetoothDeviceId(value) {
+    return /^DL-[0-9A-F]+$/i.test(textOrEmpty(value));
+  }
+
+  function bluetoothDeviceId(battery) {
+    const advertised = textOrEmpty(battery.advertised_name);
+    if (isBluetoothDeviceId(advertised)) return advertised;
+    const named = textOrEmpty(battery.bluetooth_name);
+    if (isBluetoothDeviceId(named)) return named;
+    const uid = textOrEmpty(battery.bms_uid);
+    if (isBluetoothDeviceId(uid)) return uid;
+    const mac = textOrEmpty(battery.bluetooth_id) || textOrEmpty(battery.bluetooth_address);
+    const hex = mac.replace(/[^0-9A-Fa-f]/g, "").toUpperCase();
+    if (hex.length >= 8) return `DL-${hex}`;
+    return advertised || named || uid || "Аккумулятор";
   }
 
   function textOrEmpty(value) {

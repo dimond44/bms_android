@@ -1,9 +1,23 @@
 {
   "id": "liferych-lfp-default",
-  "version": 4,
+  "version": 5,
   "chemistry": "LiFePO4",
   "supported_series": [4, 8],
   "parameters": [
+    {
+      "key": "series_cell_count",
+      "label": "Количество последовательно соединенных элементов",
+      "register": "0x0094",
+      "scale": 1,
+      "offset": 0,
+      "unit": "",
+      "tolerance": 0,
+      "enforcement": "required",
+      "expected_by_series": {
+        "4": 4,
+        "8": 8
+      }
+    },
     {
       "key": "sleep_timeout",
       "label": "Время ожидания сна",
