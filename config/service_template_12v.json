@@ -37,6 +37,7 @@
       "unit": "V",
       "tolerance": 0.03,
       "enforcement": "required",
+            "skip_for": ["r10k", "tk10"],
       "expected": 2.5
     },
     {
@@ -48,6 +49,7 @@
       "unit": "V",
       "tolerance": 0.03,
       "enforcement": "required",
+            "skip_for": ["r10k", "tk10"],
       "expected": 3.65
     },
     {
@@ -147,6 +149,7 @@
       "unit": "V",
       "tolerance": 0.05,
       "enforcement": "required",
+            "skip_for": ["r10k", "tk10"],
       "expected": 3
     },
     {
@@ -158,6 +161,7 @@
       "unit": "V",
       "tolerance": 0.05,
       "enforcement": "required",
+            "skip_for": ["r10k", "tk10"],
       "expected": 3.8
     },
     {
@@ -169,6 +173,7 @@
       "unit": "mV",
       "tolerance": 0,
       "enforcement": "required",
+            "skip_for": ["r10k", "tk10"],
       "expected": 10
     }
   ]

@@ -209,8 +209,8 @@ function createApp({ database, apiKey }) {
     }
 
     const skipFor = Array.isArray(param.skip_for) ? param.skip_for : [];
-    if (skipFor.includes("dl_red") && isRedDlBattery(database.getBattery(bmsUid))) {
-      return response.status(400).json({ ok: false, error: "skipped_for_dl_red" });
+    if ((skipFor.includes("r10k") || skipFor.includes("tk10")) && isR10kBattery(database.getBattery(bmsUid))) {
+      return response.status(400).json({ ok: false, error: "skipped_for_r10k" });
     }
 
     const scale = Number(param.scale);
@@ -377,7 +377,7 @@ function validateTelemetry(payload) {
   if (payload.hardware_family != null && typeof payload.hardware_family !== "string") {
     return "invalid_hardware_family";
   }
-  for (const field of ["owner_name", "owner_phone", "owner_email", "assembler_name", "bms_sn", "bluetooth_id", "source"]) {
+  for (const field of ["owner_name", "owner_phone", "owner_email", "assembler_name", "bms_sn", "bms_version", "bms_battery_code", "bms_hw_version", "bluetooth_id", "source"]) {
     if (payload[field] != null && typeof payload[field] !== "string") {
       return `invalid_${field}`;
     }
@@ -468,7 +468,7 @@ function validateServiceReport(payload) {
   if (payload.written_at != null && !isNonNegativeInteger(payload.written_at)) {
     return "invalid_written_at";
   }
-  for (const field of ["bms_sn", "bluetooth_id", "bluetooth_name", "bluetooth_address", "source"]) {
+  for (const field of ["bms_sn", "bms_version", "bms_battery_code", "bms_hw_version", "bluetooth_id", "bluetooth_name", "bluetooth_address", "source"]) {
     if (payload[field] != null && typeof payload[field] !== "string") {
       return `invalid_${field}`;
     }
@@ -518,8 +518,34 @@ function loadConfigTemplate() {
   return JSON.parse(fs.readFileSync(templatePath, "utf8"));
 }
 
-function isRedDlBattery(_battery) {
-  return false;
+function parseBmsHardwareVersion(battery) {
+  const tokens = ["R24TK", "R24TH", "R10K"];
+  const explicit = String((battery && battery.bms_version) || "").trim().toUpperCase();
+  if (tokens.includes(explicit)) return explicit;
+  const haystack = [
+    battery && battery.bms_hw_version,
+    battery && battery.bms_battery_code,
+    battery && battery.bms_sn,
+  ].map((value) => String(value || "").toUpperCase()).join(" ");
+  let bestIndex = Number.POSITIVE_INFINITY;
+  let bestToken = "";
+  for (const token of tokens) {
+    const index = haystack.indexOf(token);
+    if (index >= 0 && index < bestIndex) {
+      bestIndex = index;
+      bestToken = token;
+    }
+  }
+  return bestToken;
+}
+
+function isR10kBattery(battery) {
+  if (!battery) return false;
+  const version = parseBmsHardwareVersion(battery);
+  if (version === "R24TK" || version === "R24TH") return false;
+  if (version === "R10K") return true;
+  if (battery.hardware_family === "r10k" || battery.hardware_family === "tk10") return true;
+  return typeof battery.bms_sn === "string" && /R10K/i.test(battery.bms_sn);
 }
 
 module.exports = { createApp };

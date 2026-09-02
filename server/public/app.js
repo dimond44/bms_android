@@ -9,14 +9,15 @@
   const REFRESH_INTERVAL_MS = 15000;
   const ONLINE_AFTER_MS = 45000;
   const HISTORY_LIMIT = 100;
-  const DL_RED_SKIPPED_KEYS = new Set([
+  const R10K_SKIPPED_KEYS = new Set([
     "soc_calibration_0",
     "soc_calibration_100",
     "balance_start_voltage",
     "balance_stop_voltage",
     "balance_delta",
   ]);
-  const RED_DL_LABEL = "Красная BMS DL-серия (старая)";
+  const R10K_LABEL = "Старая BMS R10K (без активного балансира)";
+  const BMS_VERSION_TOKENS = ["R24TK", "R24TH", "R10K"];
 
   function cleanUid(value) {
     if (typeof value !== "string") return "";
@@ -59,6 +60,7 @@
     onlineStatus: document.getElementById("onlineStatus"),
     batteryUid: document.getElementById("batteryUid"),
     batterySn: document.getElementById("batterySn"),
+    batteryVersion: document.getElementById("batteryVersion"),
     batteryAddress: document.getElementById("batteryAddress"),
     lastSeen: document.getElementById("lastSeen"),
     dashTabs: document.getElementById("dashTabs"),
@@ -319,9 +321,10 @@
         battery.owner_email,
         battery.assembler_name,
         battery.bms_sn,
+        battery.bms_version,
         battery.bluetooth_id,
         battery.last_source === "service" ? "сервис" : "",
-        isRedDlSeries(battery) ? RED_DL_LABEL : "",
+        isR10kSeries(battery) ? R10K_LABEL : "",
       ].filter(Boolean).join(" ").toLowerCase();
       return haystack.includes(state.search);
     });
@@ -343,11 +346,15 @@
       if (textOrEmpty(battery.bms_sn)) {
         appendText(main, "span", "battery-uid", `SN ${battery.bms_sn.trim()}`);
       }
+      const versionLabel = bmsVersionLabel(battery);
+      if (versionLabel) {
+        appendText(main, "span", "battery-uid", `BMS ${versionLabel}`);
+      }
       if (textOrEmpty(battery.owner_name)) {
         appendText(main, "span", "battery-owner", battery.owner_name.trim());
       }
-      if (isRedDlSeries(battery)) {
-        appendText(main, "span", "family-badge", RED_DL_LABEL);
+      if (isR10kSeries(battery)) {
+        appendText(main, "span", "family-badge", R10K_LABEL);
       }
       if (battery.last_source === "service" || battery.service_report) {
         appendText(main, "span", "service-badge", "сервис");
@@ -395,7 +402,12 @@
     renderHardwareBadge(battery);
     dom.batteryUid.textContent = bluetoothDeviceId(battery);
     if (dom.batterySn) {
-      dom.batterySn.textContent = textOrEmpty(battery.bms_sn) ? `SN ${battery.bms_sn.trim()}` : "SN не прочитан";
+      const sn = displayBatterySn(battery);
+      dom.batterySn.textContent = sn ? `SN ${sn}` : "SN не прочитан";
+    }
+    if (dom.batteryVersion) {
+      const version = bmsVersionLabel(battery);
+      dom.batteryVersion.textContent = version ? `BMS ${version}` : "версия BMS не прочитана";
     }
     dom.batteryAddress.textContent = battery.bluetooth_id || battery.bluetooth_address || "адрес не указан";
     dom.lastSeen.textContent = `Последняя связь: ${formatDateTime(battery.last_seen_at)}`;
@@ -766,12 +778,12 @@
       return;
     }
 
-    const skipDl = isRedDlSeries(battery);
+    const skipR10k = isR10kSeries(battery);
     const series = detectSeries(battery);
     const bucket = writeDraftBucket(state.writeRenderedUid);
 
     for (const param of params) {
-      const skipped = shouldSkipWriteParam(param, skipDl);
+      const skipped = shouldSkipWriteParam(param, skipR10k);
       const row = el("tr", skipped ? "write-row skipped" : "write-row");
       const nameCell = document.createElement("td");
       appendText(nameCell, "div", "write-param-label", param.label || param.key);
@@ -782,7 +794,7 @@
 
       const valueCell = document.createElement("td");
       if (skipped) {
-        appendText(valueCell, "span", "write-skipped", "не записывается на DL");
+        appendText(valueCell, "span", "write-skipped", "не записывается на R10K");
       } else {
         const input = document.createElement("input");
         input.type = "text";
@@ -916,8 +928,8 @@
       return;
     }
     captureWriteDrafts();
-    const skipDl = isRedDlSeries(battery);
-    const params = templateParameters().filter((param) => !shouldSkipWriteParam(param, skipDl));
+    const skipR10k = isR10kSeries(battery);
+    const params = templateParameters().filter((param) => !shouldSkipWriteParam(param, skipR10k));
     const filled = params.filter((param) => parseWriteNumber(writeDraftBucket(battery.bms_uid)[param.key]) != null);
     if (filled.length === 0) {
       showToast("Нет заполненных значений для записи");
@@ -951,11 +963,13 @@
     return template && Array.isArray(template.parameters) ? template.parameters.filter((item) => item && item.key) : [];
   }
 
-  function shouldSkipWriteParam(param, skipDl) {
+  function shouldSkipWriteParam(param, skipR10k) {
     const enforcement = param && param.enforcement;
     if (enforcement === "info" || enforcement === "informational") return true;
+    if (!skipR10k) return false;
     const skipFor = Array.isArray(param && param.skip_for) ? param.skip_for : [];
-    return Boolean(skipDl && skipFor.includes("dl_red"));
+    if (skipFor.includes("r10k") || skipFor.includes("tk10")) return true;
+    return R10K_SKIPPED_KEYS.has(param.key);
   }
 
   function detectSeries(battery) {
@@ -1014,7 +1028,7 @@
     const parts = [
       template.version != null ? `Шаблон v${template.version}` : "Шаблон",
       series != null ? `${series}S` : null,
-      isRedDlSeries(battery) ? "DL-серия" : null,
+      isR10kSeries(battery) ? "R10K" : null,
     ].filter(Boolean);
     dom.writeTemplateMeta.textContent = parts.join(" · ");
   }
@@ -1067,13 +1081,13 @@
       return;
     }
     const battery = getSelectedBattery();
-    const skipDl = isRedDlSeries(battery);
+    const skipR10k = isR10kSeries(battery);
     const series = detectSeries(battery);
     const bucket = writeDraftBucket(battery && battery.bms_uid);
     let filled = 0;
     let skippedSeries = 0;
     for (const param of params) {
-      if (shouldSkipWriteParam(param, skipDl)) continue;
+      if (shouldSkipWriteParam(param, skipR10k)) continue;
       const expected = expectedFromParam(param, series);
       if (expected == null) {
         if (param.expected_by_series) skippedSeries += 1;
@@ -1128,14 +1142,14 @@
     const flat = flattenSnapshotValues(snapshotRoot);
     const looksLikeSnapshot = Boolean(parsed.config) || Object.keys(flat).some((key) => /_num$|_v$|_c$|_a$/.test(key) || key === "sleep_time_s");
     const battery = getSelectedBattery();
-    const skipDl = isRedDlSeries(battery);
+    const skipR10k = isR10kSeries(battery);
     const series = detectSeries(battery);
     const bucket = writeDraftBucket(battery && battery.bms_uid);
     let filled = 0;
 
     if (looksLikeSnapshot) {
       for (const param of params) {
-        if (shouldSkipWriteParam(param, skipDl)) continue;
+        if (shouldSkipWriteParam(param, skipR10k)) continue;
         const value = snapshotValueForKey(flat, param.key);
         if (value == null) continue;
         bucket[param.key] = formatWriteDraft(value);
@@ -1143,7 +1157,7 @@
       }
     } else if (hasParams) {
       for (const param of params) {
-        if (shouldSkipWriteParam(param, skipDl)) continue;
+        if (shouldSkipWriteParam(param, skipR10k)) continue;
         const expected = expectedFromParam(param, series);
         if (expected == null) continue;
         bucket[param.key] = formatWriteDraft(expected);
@@ -1206,7 +1220,7 @@
       showToast("Нет параметров для задания");
       return;
     }
-    const skipDl = isRedDlSeries(battery);
+    const skipR10k = isR10kSeries(battery);
     const series = detectSeries(battery);
     const bucket = writeDraftBucket(battery && battery.bms_uid);
     const payload = {
@@ -1219,7 +1233,7 @@
       template_version: state.configTemplate && state.configTemplate.version,
       source: state.writeSourceName || "template",
       parameters: params.map((param) => {
-        const skipped = shouldSkipWriteParam(param, skipDl);
+        const skipped = shouldSkipWriteParam(param, skipR10k);
         return {
           key: param.key,
           label: param.label,
@@ -1448,32 +1462,70 @@
     return typeof value === "string" && /^\s*DL/i.test(value);
   }
 
-  function isRedDlSeries(_battery) {
-    return false;
+  function parseBmsHardwareVersion(battery) {
+    const explicit = textOrEmpty(battery && battery.bms_version).toUpperCase();
+    if (BMS_VERSION_TOKENS.includes(explicit)) return explicit;
+    const haystack = [
+      textOrEmpty(battery && battery.bms_hw_version),
+      textOrEmpty(battery && battery.bms_battery_code),
+      textOrEmpty(battery && battery.bms_sn),
+    ].join(" ").toUpperCase();
+    let bestIndex = Number.POSITIVE_INFINITY;
+    let bestToken = "";
+    for (const token of BMS_VERSION_TOKENS) {
+      const index = haystack.indexOf(token);
+      if (index >= 0 && index < bestIndex) {
+        bestIndex = index;
+        bestToken = token;
+      }
+    }
+    return bestToken;
+  }
+
+  function displayBatterySn(battery) {
+    const raw = textOrEmpty(battery && battery.bms_sn);
+    if (!raw) return "";
+    const upper = raw.toUpperCase();
+    const cuts = BMS_VERSION_TOKENS.map((token) => upper.indexOf(token)).filter((index) => index >= 0);
+    const cut = cuts.length ? Math.min(...cuts) : -1;
+    return cut >= 0 ? raw.slice(0, cut).trim() : raw.trim();
+  }
+
+  function bmsVersionLabel(battery) {
+    return parseBmsHardwareVersion(battery);
+  }
+
+  function isR10kSeries(battery) {
+    if (!battery) return false;
+    const version = parseBmsHardwareVersion(battery);
+    if (version === "R24TK" || version === "R24TH") return false;
+    if (version === "R10K") return true;
+    if (battery.hardware_family === "r10k" || battery.hardware_family === "tk10") return true;
+    return /R10K/i.test(textOrEmpty(battery.bms_sn));
   }
 
   function renderHardwareBadge(battery) {
     if (!dom.hardwareBadge) return;
-    if (!isRedDlSeries(battery)) {
+    if (!isR10kSeries(battery)) {
       dom.hardwareBadge.classList.add("hidden");
       dom.hardwareBadge.textContent = "";
       return;
     }
     dom.hardwareBadge.classList.remove("hidden");
-    dom.hardwareBadge.textContent = RED_DL_LABEL;
+    dom.hardwareBadge.textContent = R10K_LABEL;
   }
 
-  function filterDlRedItems(items) {
-    return (Array.isArray(items) ? items : []).filter((item) => !DL_RED_SKIPPED_KEYS.has(item.key));
+  function filterTk10Items(items) {
+    return (Array.isArray(items) ? items : []).filter((item) => !R10K_SKIPPED_KEYS.has(item.key));
   }
 
   function visibleConfigCheck(battery) {
     const check = battery && battery.config_check;
     if (!check) return null;
-    if (!isRedDlSeries(battery)) return check;
+    if (!isR10kSeries(battery)) return check;
 
-    const mismatches = filterDlRedItems(check.mismatches);
-    const missing = filterDlRedItems(check.missing);
+    const mismatches = filterTk10Items(check.mismatches);
+    const missing = filterTk10Items(check.missing);
     let status = check.status;
     if (status === "mismatch" && mismatches.length === 0) {
       status = missing.length === 0 ? "ok" : "incomplete";

@@ -123,11 +123,13 @@ function openDatabase(filename) {
   ensureColumn(db, "batteries", "last_source", "TEXT");
   ensureColumn(db, "batteries", "assembler_name", "TEXT");
   ensureColumn(db, "batteries", "bms_sn", "TEXT");
+  ensureColumn(db, "batteries", "bms_version", "TEXT");
   ensureColumn(db, "batteries", "bluetooth_id", "TEXT");
 
   repairBatteryIdentities(db);
   db.exec(`
     UPDATE batteries SET hardware_family = 'standard' WHERE hardware_family = 'dl_red';
+    UPDATE batteries SET hardware_family = 'r10k' WHERE hardware_family = 'tk10';
     UPDATE batteries SET bms_sn = NULL WHERE bms_sn LIKE 'DL-%';
   `);
 
@@ -135,11 +137,11 @@ function openDatabase(filename) {
     INSERT INTO batteries (
       bms_uid, bluetooth_name, bluetooth_address, advertised_name, hardware_family,
       owner_name, owner_phone, owner_email, last_source, assembler_name, bms_sn,
-      bluetooth_id, first_seen_at, last_seen_at
+      bms_version, bluetooth_id, first_seen_at, last_seen_at
     ) VALUES (
       @bms_uid, @bluetooth_name, @bluetooth_address, @advertised_name, @hardware_family,
       @owner_name, @owner_phone, @owner_email, @last_source, @assembler_name, @bms_sn,
-      @bluetooth_id, @received_at, @received_at
+      @bms_version, @bluetooth_id, @received_at, @received_at
     )
     ON CONFLICT(bms_uid) DO UPDATE SET
       bluetooth_name = COALESCE(excluded.bluetooth_name, batteries.bluetooth_name),
@@ -152,6 +154,7 @@ function openDatabase(filename) {
       last_source = COALESCE(excluded.last_source, batteries.last_source),
       assembler_name = COALESCE(excluded.assembler_name, batteries.assembler_name),
       bms_sn = COALESCE(excluded.bms_sn, batteries.bms_sn),
+      bms_version = COALESCE(excluded.bms_version, batteries.bms_version),
       bluetooth_id = COALESCE(excluded.bluetooth_id, batteries.bluetooth_id),
       last_seen_at = excluded.last_seen_at
   `);
@@ -259,7 +262,7 @@ function openDatabase(filename) {
     const row = {
       bms_uid: payload.bms_uid,
       bms_sn: emptyToNull(payload.bms_sn),
-      bluetooth_id: emptyToNull(payload.bluetooth_id) ?? emptyToNull(payload.bluetooth_address),
+      bluetooth_id: stableBluetoothId(payload),
       assembler_name: payload.assembler_name.trim(),
       template_id: payload.template_id.trim(),
       capacity_ah: payload.capacity_ah ?? null,
@@ -390,7 +393,7 @@ function openDatabase(filename) {
 
     getBattery(bmsUid) {
       return db.prepare(`
-        SELECT bms_uid, bluetooth_name, advertised_name, hardware_family
+        SELECT bms_uid, bluetooth_name, advertised_name, hardware_family, bms_sn, bms_version
         FROM batteries
         WHERE bms_uid = ?
       `).get(bmsUid) || null;
@@ -410,6 +413,7 @@ function openDatabase(filename) {
           b.last_source,
           b.assembler_name,
           b.bms_sn,
+          b.bms_version,
           b.bluetooth_id,
           b.first_seen_at,
           b.last_seen_at,
@@ -736,6 +740,22 @@ function emptyToNull(value) {
   return trimmed.length === 0 ? null : trimmed;
 }
 
+function isDalyBluetoothDeviceId(value) {
+  return typeof value === "string" && /^DL-[0-9A-F]+$/i.test(value.trim());
+}
+
+function stableBluetoothId(payload) {
+  const source = isPlainObject(payload) ? payload : {};
+  for (const field of ["advertised_name", "bluetooth_name", "bms_uid"]) {
+    const text = sanitizeIdentity(source[field]);
+    if (text && isDalyBluetoothDeviceId(text)) return text;
+  }
+  const mac = sanitizeIdentity(source.bluetooth_id) || emptyToNull(source.bluetooth_address);
+  const hex = (mac || "").replace(/[^0-9A-Fa-f]/g, "").toUpperCase();
+  if (hex.length >= 8) return `DL-${hex}`;
+  return sanitizeIdentity(source.bluetooth_id);
+}
+
 function sanitizeIdentity(value) {
   if (typeof value !== "string") return null;
   const cut = value.indexOf("\0");
@@ -754,6 +774,9 @@ function normalizePayload(payload) {
     "bluetooth_name",
     "advertised_name",
     "bms_sn",
+    "bms_version",
+    "bms_battery_code",
+    "bms_hw_version",
     "bluetooth_id",
     "bluetooth_address",
     "assembler_name",
@@ -792,7 +815,7 @@ function repairBatteryIdentities(db) {
     }
 
     const batteries = db.prepare(`
-      SELECT bms_uid, bluetooth_name, advertised_name, bms_sn, assembler_name, bluetooth_id
+      SELECT bms_uid, bluetooth_name, advertised_name, bms_sn, assembler_name, bluetooth_id, bluetooth_address
       FROM batteries
     `).all();
     const updateBattery = db.prepare(`
@@ -811,7 +834,27 @@ function repairBatteryIdentities(db) {
         advertised_name: sanitizeIdentity(battery.advertised_name),
         bms_sn: sanitizeIdentity(battery.bms_sn),
         assembler_name: sanitizeIdentity(battery.assembler_name),
-        bluetooth_id: sanitizeIdentity(battery.bluetooth_id),
+        bluetooth_id: stableBluetoothId(battery),
+      });
+    }
+
+    const reports = db.prepare(`
+      SELECT id, bms_uid, bluetooth_id FROM service_reports
+    `).all();
+    const updateReport = db.prepare(`
+      UPDATE service_reports SET bluetooth_id = @bluetooth_id WHERE id = @id
+    `);
+    for (const report of reports) {
+      const battery = db.prepare(`
+        SELECT bms_uid, bluetooth_name, advertised_name, bluetooth_id, bluetooth_address
+        FROM batteries WHERE bms_uid = ?
+      `).get(report.bms_uid) || {};
+      updateReport.run({
+        id: report.id,
+        bluetooth_id: stableBluetoothId({
+          ...battery,
+          bluetooth_id: report.bluetooth_id || battery.bluetooth_id,
+        }),
       });
     }
   });
@@ -821,7 +864,32 @@ function repairBatteryIdentities(db) {
   }
 }
 
-function inferHardwareFamily(_payload) {
+function parseBmsHardwareVersion(payload) {
+  const tokens = ["R24TK", "R24TH", "R10K"];
+  const explicit = String((payload && payload.bms_version) || "").trim().toUpperCase();
+  if (tokens.includes(explicit)) return explicit;
+  const haystack = [
+    payload && payload.bms_hw_version,
+    payload && payload.bms_battery_code,
+    payload && payload.bms_sn,
+  ].map((value) => String(value || "").toUpperCase()).join(" ");
+  let bestIndex = Number.POSITIVE_INFINITY;
+  let bestToken = "";
+  for (const token of tokens) {
+    const index = haystack.indexOf(token);
+    if (index >= 0 && index < bestIndex) {
+      bestIndex = index;
+      bestToken = token;
+    }
+  }
+  return bestToken;
+}
+
+function inferHardwareFamily(payload) {
+  const version = parseBmsHardwareVersion(payload);
+  if (version === "R24TK" || version === "R24TH") return "standard";
+  if (version === "R10K") return "r10k";
+  if (payload && (payload.hardware_family === "r10k" || payload.hardware_family === "tk10")) return "r10k";
   return "standard";
 }
 
@@ -842,7 +910,8 @@ function batteryIdentity(payload) {
     last_source: payload.source === "service" ? "service" : payload.source === "user" ? "user" : null,
     assembler_name: sanitizeIdentity(payload.assembler_name),
     bms_sn: sanitizeIdentity(payload.bms_sn),
-    bluetooth_id: sanitizeIdentity(payload.bluetooth_id) ?? emptyToNull(payload.bluetooth_address),
+    bms_version: parseBmsHardwareVersion(payload) || null,
+    bluetooth_id: stableBluetoothId(payload),
   };
 }
 

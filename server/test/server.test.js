@@ -199,7 +199,7 @@ test("Имя Bluetooth DL не помечает батарею как стару
   assert.equal(battery.advertised_name, "DL-40D63C3223A2");
   assert.equal(battery.hardware_family, "standard");
   assert.equal(battery.bms_sn, "224LG2504150001");
-  assert.equal(battery.bluetooth_id, "D2:1A:07:12:2C:C4");
+  assert.equal(battery.bluetooth_id, "DL-40D63C3223A2");
 });
 
 test("Профиль владельца сохраняется из телеметрии", async () => {
@@ -411,6 +411,161 @@ test("очередь записи принимает балансировку д
   assert.equal(body.command.key, "balance_delta");
 });
 
+test("очередь записи пропускает SOC и баланс для BMS R10K в серийном номере", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+  const uid = "r10k-skip-bms";
+  const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...createFullPayload(),
+      bms_uid: uid,
+      bms_sn: "221KA160900368R10K",
+    }),
+  });
+  assert.equal(telemetry.status, 201);
+
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
+  const battery = (await batteriesResponse.json()).batteries.find((item) => item.bms_uid === uid);
+  assert.equal(battery.hardware_family, "r10k");
+  assert.equal(battery.bms_version, "R10K");
+
+  const skipped = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "soc_calibration_100", value: 3.65 }),
+  });
+  assert.equal(skipped.status, 400);
+  assert.equal((await skipped.json()).error, "skipped_for_r10k");
+
+  const allowed = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "sleep_timeout", value: 3600 }),
+  });
+  assert.equal(allowed.status, 201);
+});
+
+test("очередь записи пропускает SOC и баланс по версии BMS R10K", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+  const uid = "r10k-version-skip-bms";
+  const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...createFullPayload(),
+      bms_uid: uid,
+      bms_sn: "221KA160900368",
+      bms_version: "R10K",
+      hardware_family: "r10k",
+    }),
+  });
+  assert.equal(telemetry.status, 201);
+
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
+  const battery = (await batteriesResponse.json()).batteries.find((item) => item.bms_uid === uid);
+  assert.equal(battery.hardware_family, "r10k");
+  assert.equal(battery.bms_version, "R10K");
+
+  const skipped = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "balance_start_voltage", value: 3.4 }),
+  });
+  assert.equal(skipped.status, 400);
+  assert.equal((await skipped.json()).error, "skipped_for_r10k");
+});
+
+test("версии R24TK и R24TH проверяют SOC и баланс", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+
+  for (const version of ["R24TK", "R24TH"]) {
+    const uid = `balanced-${version.toLowerCase()}-bms`;
+    const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        ...createFullPayload(),
+        bms_uid: uid,
+        bms_sn: "221KA160900368",
+        bms_version: version,
+        hardware_family: "standard",
+      }),
+    });
+    assert.equal(telemetry.status, 201);
+
+    const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
+    const battery = (await batteriesResponse.json()).batteries.find((item) => item.bms_uid === uid);
+    assert.equal(battery.hardware_family, "standard");
+    assert.equal(battery.bms_version, version);
+
+    const allowed = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ key: "soc_calibration_100", value: 3.65 }),
+    });
+    assert.equal(allowed.status, 201, version);
+  }
+});
+
+test("код модели BMS R24TK1A-8S100A даёт версию R24TK", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+  const uid = "battery-code-r24tk";
+  const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...createFullPayload(),
+      bms_uid: uid,
+      bms_sn: "221KA160900368",
+      bms_battery_code: "R24TK1A-8S100A",
+    }),
+  });
+  assert.equal(telemetry.status, 201);
+
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
+  const battery = (await batteriesResponse.json()).batteries.find((item) => item.bms_uid === uid);
+  assert.equal(battery.bms_version, "R24TK");
+  assert.equal(battery.hardware_family, "standard");
+
+  const allowed = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "balance_delta", value: 10 }),
+  });
+  assert.equal(allowed.status, 201);
+});
+
+test("версия железа A5 0x63 JHB-R10K важнее кода модели R24TK", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+  const uid = "hw-version-r10k";
+  const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...createFullPayload(),
+      bms_uid: uid,
+      bms_sn: "221KA160900368",
+      bms_battery_code: "R24TK1A-8S100A",
+      bms_hw_version: "JHB-R10K-V1.0",
+    }),
+  });
+  assert.equal(telemetry.status, 201);
+
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
+  const battery = (await batteriesResponse.json()).batteries.find((item) => item.bms_uid === uid);
+  assert.equal(battery.bms_version, "R10K");
+  assert.equal(battery.hardware_family, "r10k");
+
+  const skipped = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "soc_calibration_0", value: 2.5 }),
+  });
+  assert.equal(skipped.status, 400);
+  assert.equal((await skipped.json()).error, "skipped_for_r10k");
+});
+
 test("POST service-report сохраняет сборку и отдаёт её без api_key", async () => {
   const payload = {
     api_key: API_KEY,
@@ -452,7 +607,7 @@ test("POST service-report сохраняет сборку и отдаёт её �
   assert.equal(battery.last_source, "service");
   assert.equal(battery.assembler_name, "Петров Пётр");
   assert.equal(battery.bms_sn, "JHB-SERVICE01");
-  assert.equal(battery.bluetooth_id, "DE:AD:BE:EF:00:01");
+  assert.equal(battery.bluetooth_id, "DL-DEADBEEF0001");
   assert.equal(battery.service_report.assembler_name, "Петров Пётр");
   assert.equal(battery.service_report.template_id, "liferych-lfp-12v");
   assert.equal(battery.service_report.capacity_ah, 105);
@@ -496,7 +651,7 @@ test("POST телеметрии обрезает нули в имени BLE", as
   assert.equal(battery.bms_sn, null);
   assert.equal(battery.last_source, "service");
   assert.equal(battery.assembler_name, "Иванов");
-  assert.equal(battery.bluetooth_id, "D2:1A:07:12:2C:C4");
+  assert.equal(battery.bluetooth_id, "DL-D21A07122CC4");
   assert.equal(battery.bms_uid.includes("\0"), false);
 
   const historyResponse = await fetch(

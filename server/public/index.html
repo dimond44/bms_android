@@ -55,7 +55,7 @@
                   <span class="status-pill" id="onlineStatus">—</span>
                 </div>
               </div>
-              <p class="identity"><span id="batteryUid">—</span><span id="batterySn">—</span><span id="batteryAddress">—</span></p>
+              <p class="identity"><span id="batteryUid">—</span><span id="batterySn">—</span><span id="batteryVersion">—</span><span id="batteryAddress">—</span></p>
               <p class="last-seen" id="lastSeen">—</p>
             </div>
           </div>
@@ -174,7 +174,7 @@
                   </div>
                   <span class="section-meta" id="writeTemplateMeta">Шаблон не загружен</span>
                 </div>
-                <p class="write-note">Подставьте значения из шаблона или введите вручную и нажмите «Записать». Задания уходят в очередь, Android-приложение записывает их в BMS по Bluetooth при подключении. Калибровка SOC и балансировка записываются и проверяются.</p>
+                <p class="write-note">Подставьте значения из шаблона или введите вручную и нажмите «Записать». Задания уходят в очередь, Android-приложение записывает их в BMS по Bluetooth при подключении. Для старых BMS R10K (без балансира) калибровка SOC и балансировка не записываются и не проверяются. Для R24TK и R24TH проверяются все параметры.</p>
                 <div class="write-toolbar">
                   <label class="write-file">
                     <input id="writeFileInput" type="file" accept=".json,application/json">
@@ -251,6 +251,6 @@
       </form>
     </dialog>
 
-    <script src="/app.js?v=20260901f" defer></script>
+    <script src="/app.js?v=20260902e" defer></script>
   </body>
 </html>

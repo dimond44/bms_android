@@ -62,7 +62,7 @@ private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_su
 private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
 private const val SERVER_WARRANTY_UPDATE_URL = "http://dimond44.xsph.ru/api/warranty_update.php"
 private const val SERVER_API_KEY = "change_me_api_key_2026"
-private const val APP_VERSION = "0.2.17-service"
+private const val APP_VERSION = "0.2.29"
 private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
 private const val CONFIG_UPLOAD_INTERVAL_MS = 300000L
@@ -73,6 +73,16 @@ private const val TEST_SOC_PERCENT_ON_CONNECT = 90.0
 private const val TEST_SOC_REGISTER_ADDR = 0x0116
 private const val HARDWARE_FAMILY_STANDARD = "standard"
 private const val HARDWARE_FAMILY_DL_RED = "dl_red"
+private const val HARDWARE_FAMILY_R10K = "r10k"
+private val BMS_VERSION_TOKENS = listOf("R24TK", "R24TH", "R10K")
+private const val DALY_BATTERY_CODE_CMD = 0x57
+private const val DALY_BATTERY_CODE_FRAMES = 5
+private const val DALY_HW_VERSION_CMD = 0x63
+private const val DALY_HW_VERSION_FRAMES = 5
+private val DEBUG_A5_SKIP_CMDS = setOf(
+    0x10, 0x11, 0x12,
+    0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56
+)
 private const val DALY_SN_CODE_START = 0x0057
 private const val DALY_SN_CODE_END = 0x005D
 private const val DALY_SN_CODE_COUNT = DALY_SN_CODE_END - DALY_SN_CODE_START + 1
@@ -82,7 +92,7 @@ private const val DALY_REMAINING_CAPACITY_HI_REG = 0x010B
 private const val DALY_REMAINING_CAPACITY_LO_REG = 0x010C
 private const val DALY_PASSWORD_REG_0 = 0x0126
 private const val SERVICE_SETTINGS_PASSWORD = "113355"
-private val DL_RED_SKIPPED_TEMPLATE_KEYS = setOf(
+private val R10K_SKIPPED_TEMPLATE_KEYS = setOf(
     "soc_calibration_0",
     "soc_calibration_100",
     "balance_start_voltage",
@@ -450,6 +460,9 @@ class MainActivity : ComponentActivity() {
     private var serviceVerifyNeedsReadAfterCurrent: Boolean = false
     private var bluetoothIdValue: TextView? = null
     private var bmsSnValue: TextView? = null
+    private var bmsVersionValue: TextView? = null
+    private var serviceVersionDebugView: TextView? = null
+    private var debugDumpView: TextView? = null
     private var serviceUploadStatusText: TextView? = null
     private var dashboardUploadStatusText: TextView? = null
     private var pendingFirstTelemetryUpload = false
@@ -470,6 +483,16 @@ class MainActivity : ComponentActivity() {
     private var pendingRuntimeCommand: Int? = null
     private var runtimeExpectedFrames = 1
     private val runtimeReceivedGroups: MutableSet<Int> = mutableSetOf()
+    private val batteryCodeFrames: MutableMap<Int, String> = sortedMapOf()
+    private val batteryCodeFrameHex: MutableMap<Int, String> = sortedMapOf()
+    private val hwVersionFrames: MutableMap<Int, String> = sortedMapOf()
+    private val hwVersionFrameHex: MutableMap<Int, String> = sortedMapOf()
+    private val debugA5Frames: MutableMap<Int, MutableList<String>> = sortedMapOf()
+    private var debugA5ScanActive = false
+    private var debugA5ScanToken = 0
+    private var debugA5ScanIndex = 0
+    private var debugA5ScanCommands: List<Int> = emptyList()
+    private var debugA5ScanStatus: String = ""
     private var negotiatedMtu = 23
     private var servicesDiscoveryStarted = false
     private var selectedAddress: String? = null
@@ -1819,15 +1842,44 @@ class MainActivity : ComponentActivity() {
         content.addView(metricRow3, marginLp(-1, -2, 0, 8, 0, 0))
         equalizeRowChildHeights(metricRow3)
 
-        val idMetric = metricBox("ID", bluetoothId().ifBlank { "--" }, "Bluetooth ID", "MAC-адрес", 12f, true)
-        bluetoothIdValue = idMetric.second.apply {
-            maxLines = 2
-            ellipsize = null
+        if (isServiceApp()) {
+            val idMetric = metricBox("ID", bluetoothId().ifBlank { "--" }, "Bluetooth ID", "MAC-адрес", 12f, true)
+            bluetoothIdValue = idMetric.second.apply {
+                maxLines = 2
+                ellipsize = null
+            }
+            content.addView(idMetric.first, marginLp(-1, -2, 0, 8, 0, 0))
+        } else {
+            bluetoothIdValue = null
         }
-        content.addView(idMetric.first, marginLp(-1, -2, 0, 8, 0, 0))
-        val snMetric = metricBox("", displayFactorySn().ifBlank { "--" }, "Заводской номер", "BMS", 13f, true)
+
+        val snRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.FILL
+            isMeasureWithLargestChildEnabled = true
+        }
+        val snMetric = metricBox("", displayFactorySn().ifBlank { "--" }, "Заводской номер", "SN", 13f, true)
         bmsSnValue = snMetric.second
-        content.addView(snMetric.first, marginLp(-1, -2, 0, 8, 0, 0))
+        snRow.addView(snMetric.first, marginLp(0, -1, 0, 0, 4, 0).apply { weight = 1.3f })
+        val versionMetric = metricBox("", displayBmsVersion().ifBlank { "--" }, "Версия BMS", "A5 0x63", 12f, true)
+        bmsVersionValue = versionMetric.second
+        snRow.addView(versionMetric.first, marginLp(0, -1, 4, 0, 0, 0).apply { weight = 1f })
+        content.addView(snRow, marginLp(-1, -2, 0, 8, 0, 0))
+        equalizeRowChildHeights(snRow)
+
+        if (isServiceApp()) {
+            serviceVersionDebugView = TextView(this).apply {
+                text = serviceVersionDebugDump()
+                textSize = 12f
+                typeface = Typeface.MONOSPACE
+                setTextColor(Color.rgb(50, 50, 50))
+                setPadding(dp(12), dp(10), dp(12), dp(10))
+                background = round(Color.rgb(247, 248, 250), dp(14), Color.rgb(223, 229, 235), 1)
+            }
+            content.addView(serviceVersionDebugView, marginLp(-1, -2, 0, 8, 0, 0))
+        } else {
+            serviceVersionDebugView = null
+        }
 
         if (isServiceApp()) {
             dashboardUploadStatusText = TextView(this).apply {
@@ -2054,6 +2106,8 @@ class MainActivity : ComponentActivity() {
                     showBatteriesScreen()
                 } else if (text.contains("Сервис")) {
                     showServiceScreen()
+                } else if (text.contains("Отладка")) {
+                    showDebugScreen()
                 } else if (text.contains("ОТК")) {
                     showQtcScreen()
                 } else if (text.contains("Управление") || text.contains("Настройки")) {
@@ -2085,6 +2139,7 @@ class MainActivity : ComponentActivity() {
             if (isServiceApp()) {
                 navItem(this, "⚙\nСервис", selectedTab == "service")
                 navItem(this, "✓\nОТК", selectedTab == "qtc")
+                navItem(this, "☰\nОтладка", selectedTab == "debug")
                 navItem(this, "●\nПрофиль", selectedTab == "profile")
             } else {
                 navItem(this, "≡\nЖурнал", selectedTab == "journal")
@@ -2166,8 +2221,9 @@ class MainActivity : ComponentActivity() {
         val idCard = card()
         idCard.addView(sectionTitle("Идентификация BMS", ""))
         idCard.addView(TextView(this).apply {
-            text = "Bluetooth ID: ${bluetoothId().ifBlank { "—" }}\nSN: ${bmsSn().ifBlank { "—" }}"
-            textSize = 14f
+            text = "SN: ${displayFactorySn().ifBlank { "—" }}\nВерсия BMS: ${displayBmsVersion().ifBlank { "—" }}\nBluetooth ID: ${bluetoothId().ifBlank { "—" }}\n\n${serviceVersionDebugDump()}"
+            textSize = 13f
+            typeface = Typeface.MONOSPACE
             setTextColor(Color.rgb(50, 50, 50))
         })
         content.addView(idCard, marginLp(-1, -2, 0, 0, 0, 12))
@@ -2233,6 +2289,87 @@ class MainActivity : ComponentActivity() {
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(fixedBottomNav("service"), LinearLayout.LayoutParams(-1, dp(70)))
+        setContentView(root)
+    }
+
+    private fun showDebugScreen() {
+        if (!isServiceApp()) {
+            showBatteriesScreen()
+            return
+        }
+        if (configRegisters.isEmpty() && !configReadInProgress) loadCachedConfigForCurrentBms()
+        if (bluetoothGatt != null && !configReadInProgress) {
+            startConfigReadIfNeeded(force = true)
+        }
+
+        screenState = "debug"
+        currentTab = "debug"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+        root.addView(
+            header(
+                "Отладка BMS",
+                selectedDeviceName.ifBlank { selectedAddress ?: "нет подключения" },
+                if (configReadInProgress) "Читаю регистры" else if (bluetoothGatt != null) "Bluetooth\nподключен" else "Нет BLE"
+            )
+        )
+
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(16), dp(8), dp(16), dp(4))
+        }
+        actions.addView(TextView(this).apply {
+            text = "Прочитать"
+            gravity = Gravity.CENTER
+            textSize = 14f
+            typeface = interFont(740)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(red, dp(12), Color.TRANSPARENT, 0)
+            setOnClickListener {
+                if (bluetoothGatt == null) {
+                    toast("Нет подключения")
+                    return@setOnClickListener
+                }
+                startConfigReadIfNeeded(force = true)
+                startDebugA5Scan()
+                debugDumpView?.text = bmsRegisterDump()
+                toast("Читаю Modbus и сканирую A5")
+            }
+        }, LinearLayout.LayoutParams(0, dp(44), 1f))
+        actions.addView(TextView(this).apply {
+            text = "Копировать"
+            gravity = Gravity.CENTER
+            textSize = 14f
+            typeface = interFont(740)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(Color.WHITE, dp(12), Color.rgb(223, 229, 235), 1)
+            setOnClickListener {
+                val dump = bmsRegisterDump()
+                val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("BMS registers", dump))
+                toast("Дамп скопирован")
+            }
+        }, marginLp(0, dp(44), 8, 0, 0, 0).apply { weight = 1f })
+        root.addView(actions)
+
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(16))
+        }
+        debugDumpView = TextView(this).apply {
+            text = bmsRegisterDump()
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setTextColor(Color.rgb(30, 30, 30))
+        }
+        content.addView(debugDumpView)
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(fixedBottomNav("debug"), LinearLayout.LayoutParams(-1, dp(70)))
         setContentView(root)
     }
 
@@ -2312,6 +2449,7 @@ class MainActivity : ComponentActivity() {
                 "Параметры АКБ",
                 listOf(
                     "Серийный номер BMS" to displayFactorySn().ifBlank { "--" },
+                    "Версия BMS" to displayBmsVersion().ifBlank { "--" },
                     "Напряжение" to (data.voltage?.let { "%.2f В".format(it) } ?: "--"),
                     "Температура 1" to qtcTempText(1),
                     "Температура 2" to qtcTempText(2),
@@ -2750,7 +2888,11 @@ class MainActivity : ComponentActivity() {
             put("bluetooth_name", dalyBluetoothDeviceId())
             put("bluetooth_address", selectedAddress ?: "")
             put("bluetooth_id", bluetoothId())
-            put("bms_sn", bmsSn())
+            put("bms_sn", displayFactorySn())
+            put("bms_battery_code", bmsBatteryCode())
+            put("bms_hw_version", bmsHwVersionText())
+            put("bms_version", bmsHardwareVersion())
+            put("hardware_family", currentHardwareFamily())
             put("source", "service")
             put("assembler_name", assemblerName())
             put("template_id", if (serviceTemplateKey == "24v") "liferych-lfp-24v" else "liferych-lfp-12v")
@@ -2891,8 +3033,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderManageGeneral() {
-        addRedDlNoticeIfNeeded(
-            "Красная BMS DL-серии (старая): калибровка SOC 0 и SOC 100 не настраивается и не проверяется по шаблону."
+        addTk10NoticeIfNeeded(
+            "Старая BMS R10K: калибровка SOC 0 и SOC 100 не настраивается и не проверяется по шаблону."
         )
         manageContentLayout.addView(manageSectionCard(
             "1. Основные параметры",
@@ -3048,8 +3190,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderManageBalancing() {
-        addRedDlNoticeIfNeeded(
-            "У красной BMS DL-серии (старой) нет встроенного балансира. Настройки балансировки не проверяются."
+        addTk10NoticeIfNeeded(
+            "У старой BMS R10K нет активного балансира. Параметры балансировки не проверяются."
         )
         manageContentLayout.addView(manageSectionCard(
             "4. Настройка балансировки",
@@ -3073,8 +3215,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderManageCellParameters() {
-        addRedDlNoticeIfNeeded(
-            "Красная BMS DL-серии (старая): калибровка SOC 0 и SOC 100 не настраивается и не проверяется по шаблону."
+        addTk10NoticeIfNeeded(
+            "Старая BMS R10K: калибровка SOC 0 и SOC 100 не настраивается и не проверяется по шаблону."
         )
         manageContentLayout.addView(manageSectionCard(
             "5. Параметры элемента",
@@ -3288,15 +3430,6 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (shouldSkipTemplateParameter(parameter, hardwareFamily)) {
-                    unverified += TemplateCheckItem(
-                        parameter.key,
-                        parameter.label,
-                        expected,
-                        actual,
-                        parameter.unit,
-                        parameter.tolerance,
-                        "not_applicable_$hardwareFamily"
-                    )
                     continue
                 }
 
@@ -3937,6 +4070,9 @@ class MainActivity : ComponentActivity() {
             }
             if (screenState == "qtc") {
                 renderQtcContent()
+            }
+            if (screenState == "debug") {
+                debugDumpView?.text = bmsRegisterDump()
             }
         }
     }
@@ -5568,6 +5704,8 @@ class MainActivity : ComponentActivity() {
     private fun disconnectGatt() {
         polling = false
         pollLoopToken++
+        debugA5ScanActive = false
+        debugA5ScanToken++
         resetRemoteWriteState()
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
@@ -5592,6 +5730,14 @@ class MainActivity : ComponentActivity() {
                 negotiatedMtu = 23
                 data.cells.clear()
                 data.cellCount = null
+                batteryCodeFrames.clear()
+                batteryCodeFrameHex.clear()
+                hwVersionFrames.clear()
+                hwVersionFrameHex.clear()
+                debugA5Frames.clear()
+                debugA5ScanActive = false
+                debugA5ScanToken++
+                debugA5ScanStatus = ""
                 runOnUiThread {
                     if (::statusText.isInitialized) statusText.text = "Подключено. Читаю сервисы..."
                     selectedAddress?.let { address ->
@@ -5734,7 +5880,7 @@ class MainActivity : ComponentActivity() {
                         if (polling && !configReadInProgress && !remoteWriteInProgress) {
                             startConfigReadIfNeeded(force = true)
                         }
-                    }, CONFIG_AUTO_READ_DELAY_MS)
+                    }, if (isServiceApp()) 400L else CONFIG_AUTO_READ_DELAY_MS)
                 }
                 startRemoteWritePolling()
                 mainHandler.postDelayed({ pollOnce() }, 300)
@@ -5878,9 +6024,21 @@ class MainActivity : ComponentActivity() {
             mainHandler.postDelayed({ pollOnce(token) }, 1000)
             return
         }
+        if (debugA5ScanActive) {
+            mainHandler.postDelayed({ pollOnce(token) }, 800)
+            return
+        }
         val gatt = bluetoothGatt ?: return
         val ch = writeCharacteristic ?: return
-        runtimeCommands = listOf(0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98)
+        runtimeCommands = buildList {
+            if (isServiceApp() || parseBmsHardwareVersion(liveHwVersion()).isBlank()) {
+                add(DALY_HW_VERSION_CMD)
+            }
+            if (isServiceApp() || parseBmsHardwareVersion(liveBatteryCode()).isBlank()) {
+                add(DALY_BATTERY_CODE_CMD)
+            }
+            addAll(listOf(0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98))
+        }
         runtimeCommandIndex = 0
         pendingRuntimeCommand = null
         sendCurrentRuntimeCommand(gatt, ch, token)
@@ -5906,6 +6064,8 @@ class MainActivity : ComponentActivity() {
         pendingRuntimeCommand = command
         runtimeReceivedGroups.clear()
         runtimeExpectedFrames = when (command) {
+            DALY_HW_VERSION_CMD -> DALY_HW_VERSION_FRAMES
+            DALY_BATTERY_CODE_CMD -> DALY_BATTERY_CODE_FRAMES
             0x95 -> ((data.cellCount ?: 1) + 2) / 3
             0x96 -> ((data.tempCount ?: 1) + 6) / 7
             else -> 1
@@ -5945,8 +6105,9 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun completeRuntimeCommand(cmd: Int, payload: ByteArray) {
+        if (debugA5ScanActive) return
         if (pendingRuntimeCommand != cmd) return
-        if (cmd == 0x95 || cmd == 0x96) {
+        if (cmd == 0x95 || cmd == 0x96 || cmd == DALY_BATTERY_CODE_CMD || cmd == DALY_HW_VERSION_CMD) {
             runtimeReceivedGroups.add(payload[0].toInt() and 0xFF)
             if (runtimeReceivedGroups.size < runtimeExpectedFrames) return
         }
@@ -6009,6 +6170,7 @@ class MainActivity : ComponentActivity() {
         val cmd = frame[2].toInt() and 0xFF
         val p = frame.copyOfRange(4, 12)
         data.raw["0x%02X".format(cmd)] = hex(frame)
+        recordDebugA5Frame(cmd, frame, p)
 
         when (cmd) {
             0x90 -> {
@@ -6038,6 +6200,16 @@ class MainActivity : ComponentActivity() {
                 data.loadConnected = (p[3].toInt() and 0xFF) != 0
                 data.cycles = u16(p, 5)
                 pruneCellsToCount()
+            }
+            DALY_BATTERY_CODE_CMD -> {
+                if (storeAsciiCmdFrame(batteryCodeFrames, batteryCodeFrameHex, p)) {
+                    rememberBatteryCode()
+                }
+            }
+            DALY_HW_VERSION_CMD -> {
+                if (storeAsciiCmdFrame(hwVersionFrames, hwVersionFrameHex, p)) {
+                    rememberHwVersion()
+                }
             }
             0x95 -> {
                 val group = p[0].toInt() and 0xFF
@@ -6129,6 +6301,10 @@ class MainActivity : ComponentActivity() {
 
     private fun updateDashboardUi() {
         if (polling) saveCurrentBattery()
+        if (screenState == "debug") {
+            debugDumpView?.text = bmsRegisterDump()
+            return
+        }
         if (screenState == "manage") {
             if (::manageContentLayout.isInitialized) renderManageContent()
             return
@@ -6175,6 +6351,10 @@ class MainActivity : ComponentActivity() {
         if (::deviceNameValue.isInitialized) deviceNameValue.text = device
         bluetoothIdValue?.text = bluetoothId().ifBlank { "--" }
         bmsSnValue?.text = displayFactorySn().ifBlank { "--" }
+        bmsVersionValue?.text = displayBmsVersion().ifBlank { "--" }
+        if (isServiceApp()) {
+            serviceVersionDebugView?.text = serviceVersionDebugDump()
+        }
         if (::cycleCountValue.isInitialized) {
             cycleCountValue.text = data.cycles?.toString() ?: "--"
         }
@@ -6327,10 +6507,367 @@ class MainActivity : ComponentActivity() {
         return cachedFactorySerial()
     }
 
+    private fun bmsBatteryCode(): String {
+        val live = liveBatteryCode()
+        if (live.isNotBlank()) {
+            rememberBatteryCode()
+            return live
+        }
+        return cachedBatteryCode()
+    }
+
+    private fun liveBatteryCode(): String = joinAsciiFrames(batteryCodeFrames)
+
+    private fun bmsHwVersionText(): String {
+        val live = liveHwVersion()
+        if (live.isNotBlank()) {
+            rememberHwVersion()
+            return live
+        }
+        return cachedHwVersion()
+    }
+
+    private fun liveHwVersion(): String = joinAsciiFrames(hwVersionFrames)
+
+    private fun joinAsciiFrames(frames: Map<Int, String>): String {
+        if (frames.isEmpty()) return ""
+        val last = frames.keys.maxOrNull() ?: return ""
+        return buildString {
+            for (frameNo in 1..last) {
+                append(frames[frameNo].orEmpty())
+            }
+        }.trim()
+    }
+
+    private fun storeAsciiCmdFrame(
+        frames: MutableMap<Int, String>,
+        hex: MutableMap<Int, String>,
+        payload: ByteArray
+    ): Boolean {
+        val frameNo = payload[0].toInt() and 0xFF
+        if (frameNo !in 1..8) return false
+        hex[frameNo] = payload.joinToString(" ") { b ->
+            (b.toInt() and 0xFF).toString(16).uppercase().padStart(2, '0')
+        }
+        frames[frameNo] = buildString {
+            for (i in 1..7) {
+                val b = payload[i].toInt() and 0xFF
+                if (b == 0) return@buildString
+                if (b !in 32..126) return@buildString
+                append(b.toChar())
+            }
+        }
+        return true
+    }
+
+    private fun recordDebugA5Frame(cmd: Int, frame: ByteArray, payload: ByteArray) {
+        if (!isServiceApp()) return
+        val ascii = buildString {
+            for (b in payload) {
+                val v = b.toInt() and 0xFF
+                append(if (v in 32..126) v.toChar() else '.')
+            }
+        }
+        val line = "${bytesToHex(frame)}  \"$ascii\""
+        val list = debugA5Frames.getOrPut(cmd) { mutableListOf() }
+        if (list.lastOrNull() == line) return
+        if (list.size >= 8) list.removeAt(0)
+        list.add(line)
+    }
+
+    private fun startDebugA5Scan() {
+        if (!isServiceApp()) return
+        if (bluetoothGatt == null || writeCharacteristic == null) {
+            toast("Нет BLE")
+            return
+        }
+        if (debugA5ScanActive) {
+            toast("Скан A5 уже идёт")
+            return
+        }
+        val token = ++debugA5ScanToken
+        debugA5ScanStatus = "жду Modbus, затем скан A5"
+        debugDumpView?.text = bmsRegisterDump()
+        fun beginWhenIdle() {
+            if (token != debugA5ScanToken) return
+            if (bluetoothGatt == null) return
+            if (configReadInProgress || remoteWriteInProgress) {
+                debugA5ScanStatus = "жду Modbus…"
+                debugDumpView?.text = bmsRegisterDump()
+                mainHandler.postDelayed({ beginWhenIdle() }, 400)
+                return
+            }
+            pendingRuntimeCommand = null
+            pollLoopToken++
+            debugA5ScanActive = true
+            debugA5ScanCommands = (0x01..0x9F).filter { it !in DEBUG_A5_SKIP_CMDS }
+            debugA5ScanIndex = 0
+            debugA5ScanStatus = "скан A5 0/${debugA5ScanCommands.size}"
+            sendNextDebugA5Command(token)
+        }
+        mainHandler.post { beginWhenIdle() }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun sendNextDebugA5Command(token: Int) {
+        if (token != debugA5ScanToken || !debugA5ScanActive) return
+        if (debugA5ScanIndex >= debugA5ScanCommands.size) {
+            debugA5ScanActive = false
+            debugA5ScanStatus = "скан A5 готов: ${debugA5Frames.size} команд с ответом"
+            debugDumpView?.text = bmsRegisterDump()
+            toast("Скан A5 готов: ${debugA5Frames.size} команд")
+            if (polling) pollOnce()
+            return
+        }
+        val cmd = debugA5ScanCommands[debugA5ScanIndex]
+        debugA5ScanStatus = "скан A5 ${debugA5ScanIndex + 1}/${debugA5ScanCommands.size}  cmd=0x%02X".format(cmd)
+        debugDumpView?.text = bmsRegisterDump()
+        writeBleFrame(buildRequest(cmd))
+        val waitMs = when (cmd) {
+            DALY_BATTERY_CODE_CMD, DALY_HW_VERSION_CMD, 0x95, 0x96 -> 1200L
+            else -> 320L
+        }
+        mainHandler.postDelayed({
+            if (token != debugA5ScanToken) return@postDelayed
+            debugA5ScanIndex++
+            sendNextDebugA5Command(token)
+        }, waitMs)
+    }
+
+    private fun displayBmsVersion(): String {
+        if (isServiceApp()) {
+            return bmsHwVersionText().ifBlank { bmsHardwareVersion() }
+        }
+        return bmsBatteryCode().ifBlank { bmsHardwareVersion() }
+    }
+
+    private fun parseBmsHardwareVersion(raw: String): String {
+        val upper = raw.uppercase().trim()
+        if (upper in BMS_VERSION_TOKENS) return upper
+        var bestIndex = Int.MAX_VALUE
+        var bestToken = ""
+        for (token in BMS_VERSION_TOKENS) {
+            val index = upper.indexOf(token)
+            if (index >= 0 && index < bestIndex) {
+                bestIndex = index
+                bestToken = token
+            }
+        }
+        return bestToken
+    }
+
+    private fun factorySerialCandidates(): List<String> {
+        return listOf(
+            decodeDalySnCode(swapBytes = false),
+            decodeDalySnCode(swapBytes = true)
+        ).filter { it.isNotBlank() }.distinct()
+    }
+
+    private fun versionFromFactorySn(): String {
+        for (candidate in factorySerialCandidates() + listOf(cachedFactorySerial())) {
+            val token = parseBmsHardwareVersion(candidate)
+            if (token.isNotBlank()) return token
+        }
+        return ""
+    }
+
+    private fun bmsHardwareVersion(): String {
+        if (isServiceApp()) {
+            val fromHw = parseBmsHardwareVersion(bmsHwVersionText())
+            if (fromHw.isNotBlank()) return fromHw
+            val fromSn = versionFromFactorySn()
+            if (fromSn.isNotBlank()) return fromSn
+            val fromCode = parseBmsHardwareVersion(bmsBatteryCode())
+            if (fromCode.isNotBlank()) return fromCode
+            val address = selectedAddress ?: return ""
+            return identityPrefs().getString("ver_$address", "")?.trim().orEmpty()
+        }
+        val fromCode = parseBmsHardwareVersion(bmsBatteryCode())
+        if (fromCode.isNotBlank()) return fromCode
+        val address = selectedAddress ?: return ""
+        return identityPrefs().getString("ver_$address", "")?.trim().orEmpty()
+    }
+
+    private fun serviceVersionDebugDump(): String {
+        val snBe = decodeDalySnCode(swapBytes = false)
+        val snLe = decodeDalySnCode(swapBytes = true)
+        val hw = bmsHwVersionText()
+        val fromHw = parseBmsHardwareVersion(hw)
+        val code = liveBatteryCode().ifBlank { cachedBatteryCode() }
+        val fromSn = versionFromFactorySn()
+        val fromCode = parseBmsHardwareVersion(code)
+        val source = when {
+            fromHw.isNotBlank() -> "A5 команда 0x63"
+            fromSn.isNotBlank() -> "заводской SN (Modbus 0x0057-0x005D)"
+            fromCode.isNotBlank() -> "A5 команда 0x57"
+            else -> "не определена"
+        }
+        val hwFrames = if (hwVersionFrameHex.isEmpty()) {
+            "кадров A5 0x63 нет"
+        } else {
+            hwVersionFrameHex.entries.sortedBy { it.key }.joinToString("\n") { (no, hex) ->
+                "кадр $no: $hex"
+            }
+        }
+        val frames = if (batteryCodeFrameHex.isEmpty()) {
+            "кадров A5 0x57 нет"
+        } else {
+            batteryCodeFrameHex.entries.sortedBy { it.key }.joinToString("\n") { (no, hex) ->
+                "кадр $no: $hex"
+            }
+        }
+        val regs = (DALY_SN_CODE_START..DALY_SN_CODE_END).joinToString(" ") { addr ->
+            val value = configRegisters[addr]
+            if (value == null) {
+                "%04X:—".format(addr)
+            } else {
+                "%04X:%04X".format(addr, value and 0xFFFF)
+            }
+        }
+        return buildString {
+            appendLine("Отладка версии (сервис)")
+            appendLine("A5 0x63: ${hw.ifBlank { "—" }} → ${fromHw.ifBlank { "нет" }}")
+            appendLine(hwFrames)
+            appendLine("A5 0x57: ${code.ifBlank { "—" }} → ${fromCode.ifBlank { "нет" }}")
+            appendLine(frames)
+            appendLine("SN BE: ${snBe.ifBlank { "—" }}")
+            appendLine("SN LE: ${snLe.ifBlank { "—" }}")
+            appendLine("Modbus: $regs")
+            appendLine("Берём: ${bmsHardwareVersion().ifBlank { "—" }} ($source)")
+        }.trim()
+    }
+
+    private fun registerAscii(value: Int, swapBytes: Boolean): String {
+        val hi = (value shr 8) and 0xFF
+        val lo = value and 0xFF
+        val bytes = if (swapBytes) intArrayOf(lo, hi) else intArrayOf(hi, lo)
+        return buildString {
+            for (b in bytes) {
+                append(if (b in 32..126) b.toChar() else '.')
+            }
+        }
+    }
+
+    private fun consecutiveAsciiRuns(swapBytes: Boolean): List<String> {
+        if (configRegisters.isEmpty()) return emptyList()
+        val runs = mutableListOf<String>()
+        val addrs = configRegisters.keys.sorted()
+        var start = addrs.first()
+        var prev = addrs.first()
+        val chunk = StringBuilder(registerAscii(configRegisters.getValue(start), swapBytes))
+        for (addr in addrs.drop(1)) {
+            if (addr == prev + 1) {
+                chunk.append(registerAscii(configRegisters.getValue(addr), swapBytes))
+            } else {
+                val text = chunk.toString().trim { it == '.' || it.isWhitespace() }
+                if (text.length >= 4 && text.any { it.isLetter() }) {
+                    runs += "0x%04X–0x%04X  %s".format(start, prev, text)
+                }
+                start = addr
+                chunk.clear()
+                chunk.append(registerAscii(configRegisters.getValue(addr), swapBytes))
+            }
+            prev = addr
+        }
+        val text = chunk.toString().trim { it == '.' || it.isWhitespace() }
+        if (text.length >= 4 && text.any { it.isLetter() }) {
+            runs += "0x%04X–0x%04X  %s".format(start, prev, text)
+        }
+        return runs
+    }
+
+    private fun bmsRegisterDump(): String {
+        val status = when {
+            configReadInProgress -> "идёт чтение Modbus"
+            configRegisters.isEmpty() -> "регистров пока нет — нажмите «Прочитать»"
+            else -> "прочитано ${configRegisters.size} holding"
+        }
+        return buildString {
+            appendLine("=== ${appBrandTitle()} $APP_VERSION ===")
+            appendLine("UID: ${bmsUid()}")
+            appendLine("SN: ${displayFactorySn().ifBlank { "—" }}")
+            appendLine("Версия: ${bmsHardwareVersion().ifBlank { "—" }}")
+            appendLine("A5 0x63: ${bmsHwVersionText().ifBlank { "—" }}")
+            appendLine("Код A5 0x57: ${bmsBatteryCode().ifBlank { "—" }}")
+            appendLine("Статус: $status")
+            appendLine("A5 скан: ${debugA5ScanStatus.ifBlank { "не запускался — нажмите «Прочитать»" }}")
+            appendLine("lastConfig: $lastConfigStatus")
+            appendLine()
+            appendLine("--- Все ответы A5 ---")
+            if (debugA5Frames.isEmpty()) {
+                appendLine("пока нет кадров")
+            } else {
+                for ((cmd, frames) in debugA5Frames) {
+                    appendLine("cmd 0x%02X  (%d кадр.)".format(cmd, frames.size))
+                    for (line in frames) {
+                        appendLine("  $line")
+                    }
+                }
+            }
+            appendLine()
+            appendLine("--- Daly A5 last ---")
+            if (data.raw.isEmpty()) {
+                appendLine("нет кадров")
+            } else {
+                for ((cmd, hex) in data.raw.entries.sortedBy { it.key }) {
+                    appendLine("$cmd  $hex")
+                }
+            }
+            if (hwVersionFrameHex.isNotEmpty()) {
+                appendLine()
+                appendLine("--- A5 0x63 кадры (железо) ---")
+                for ((no, hex) in hwVersionFrameHex.entries.sortedBy { it.key }) {
+                    val ascii = hwVersionFrames[no].orEmpty()
+                    appendLine("кадр $no  $hex  \"$ascii\"")
+                }
+            }
+            if (batteryCodeFrameHex.isNotEmpty()) {
+                appendLine()
+                appendLine("--- A5 0x57 кадры ---")
+                for ((no, hex) in batteryCodeFrameHex.entries.sortedBy { it.key }) {
+                    val ascii = batteryCodeFrames[no].orEmpty()
+                    appendLine("кадр $no  $hex  \"$ascii\"")
+                }
+            }
+            appendLine()
+            appendLine("--- Modbus holding ---")
+            appendLine("addr    hex   u16    BE   LE")
+            if (configRegisters.isEmpty()) {
+                appendLine("пусто")
+            } else {
+                for ((addr, value) in configRegisters) {
+                    val word = value and 0xFFFF
+                    appendLine(
+                        "0x%04X  %04X  %5d  '%s'  '%s'".format(
+                            addr,
+                            word,
+                            word,
+                            registerAscii(word, false),
+                            registerAscii(word, true)
+                        )
+                    )
+                }
+            }
+            val asciiBe = consecutiveAsciiRuns(false)
+            val asciiLe = consecutiveAsciiRuns(true)
+            if (asciiBe.isNotEmpty()) {
+                appendLine()
+                appendLine("--- ASCII BE ---")
+                asciiBe.forEach { appendLine(it) }
+            }
+            if (asciiLe.isNotEmpty()) {
+                appendLine()
+                appendLine("--- ASCII LE ---")
+                asciiLe.forEach { appendLine(it) }
+            }
+        }.trim()
+    }
+
     private fun displayFactorySn(): String {
         val raw = bmsSn()
         if (raw.isBlank()) return ""
-        val cut = raw.indexOf("R24", ignoreCase = true)
+        val upper = raw.uppercase()
+        val cut = BMS_VERSION_TOKENS.map { upper.indexOf(it) }.filter { it >= 0 }.minOrNull() ?: -1
         return if (cut >= 0) raw.substring(0, cut).trim() else raw
     }
 
@@ -6339,17 +6876,63 @@ class MainActivity : ComponentActivity() {
         return identityPrefs().getString("sn_$address", "")?.trim().orEmpty()
     }
 
+    private fun cachedBatteryCode(): String {
+        val address = selectedAddress ?: return ""
+        return identityPrefs().getString("code_$address", "")?.trim().orEmpty()
+    }
+
+    private fun cachedHwVersion(): String {
+        val address = selectedAddress ?: return ""
+        return identityPrefs().getString("hw_$address", "")?.trim().orEmpty()
+    }
+
     private fun rememberFactorySerial() {
         val sn = factorySerialFromRegisters()
         val address = selectedAddress
         if (sn.isBlank() || address.isNullOrBlank()) return
-        identityPrefs().edit().putString("sn_$address", sn).apply()
+        val editor = identityPrefs().edit().putString("sn_$address", sn)
+        if (isServiceApp() && parseBmsHardwareVersion(bmsHwVersionText()).isBlank()) {
+            val version = versionFromFactorySn()
+            if (version.isNotBlank()) editor.putString("ver_$address", version)
+        }
+        editor.apply()
+    }
+
+    private fun rememberBatteryCode() {
+        val code = liveBatteryCode()
+        val address = selectedAddress
+        if (code.isBlank() || address.isNullOrBlank()) return
+        val editor = identityPrefs().edit().putString("code_$address", code)
+        if (!isServiceApp()) {
+            editor.putString("ver_$address", parseBmsHardwareVersion(code))
+        }
+        editor.apply()
+    }
+
+    private fun rememberHwVersion() {
+        val hw = liveHwVersion()
+        val address = selectedAddress
+        if (hw.isBlank() || address.isNullOrBlank()) return
+        val editor = identityPrefs().edit().putString("hw_$address", hw)
+        if (isServiceApp()) {
+            val version = parseBmsHardwareVersion(hw)
+            if (version.isNotBlank()) editor.putString("ver_$address", version)
+        }
+        editor.apply()
     }
 
     private fun factorySerialFromRegisters(): String {
-        if (configRegisters.isEmpty()) return ""
-        val sn = decodeDalySnCode(swapBytes = false).ifBlank { decodeDalySnCode(swapBytes = true) }
+        val sn = factorySerialRaw()
         return if (isValidBmsSn(sn)) sn else ""
+    }
+
+    private fun factorySerialRaw(): String {
+        if (configRegisters.isEmpty()) return ""
+        if (isServiceApp()) {
+            return factorySerialCandidates().firstOrNull { parseBmsHardwareVersion(it).isNotBlank() }
+                ?: factorySerialCandidates().firstOrNull().orEmpty()
+        }
+        return decodeDalySnCode(swapBytes = false).ifBlank { decodeDalySnCode(swapBytes = true) }
     }
 
     // Daly SN Code: Modbus 0xD2, holding 0x0057–0x005D, 7 registers / 14 ASCII bytes.
@@ -6467,20 +7050,25 @@ class MainActivity : ComponentActivity() {
         return sanitizeBleText(selectedDeviceName)
     }
 
-    private fun isRedDlBms(): Boolean = false
+    private fun isLegacyBmsWithoutBalancer(): Boolean {
+        return bmsHardwareVersion().equals("R10K", ignoreCase = true)
+    }
 
-    private fun currentHardwareFamily(): String = HARDWARE_FAMILY_STANDARD
+    private fun currentHardwareFamily(): String {
+        return if (isLegacyBmsWithoutBalancer()) HARDWARE_FAMILY_R10K else HARDWARE_FAMILY_STANDARD
+    }
 
     private fun shouldSkipTemplateParameter(parameter: BmsTemplateParameter, hardwareFamily: String): Boolean {
+        if (isLegacyBmsWithoutBalancer() && parameter.key in R10K_SKIPPED_TEMPLATE_KEYS) return true
         return hardwareFamily in parameter.skipFor
     }
 
     private fun dlUnsupportedOr(value: String): String {
-        return if (isRedDlBms()) "не настраивается" else value
+        return if (isLegacyBmsWithoutBalancer()) "не настраивается" else value
     }
 
-    private fun addRedDlNoticeIfNeeded(text: String) {
-        if (!isRedDlBms() || !::manageContentLayout.isInitialized) return
+    private fun addTk10NoticeIfNeeded(text: String) {
+        if (!isLegacyBmsWithoutBalancer() || !::manageContentLayout.isInitialized) return
         manageContentLayout.addView(
             LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -6501,7 +7089,10 @@ class MainActivity : ComponentActivity() {
         obj.put("advertised_name", advertised)
         obj.put("hardware_family", currentHardwareFamily())
         obj.put("bluetooth_id", bluetoothId())
-        obj.put("bms_sn", bmsSn())
+        obj.put("bms_sn", displayFactorySn())
+        obj.put("bms_battery_code", bmsBatteryCode())
+        obj.put("bms_hw_version", bmsHwVersionText())
+        obj.put("bms_version", bmsHardwareVersion())
         obj.put("source", if (isServiceApp()) "service" else "user")
         if (isServiceApp()) obj.put("assembler_name", assemblerName())
         putOwnerProfile(obj)
@@ -7675,6 +8266,7 @@ class MainActivity : ComponentActivity() {
             put("missing", JSONArray().apply { result.missing.forEach { put(unavailableJson(it)) } })
             put("unverified", JSONArray().apply { result.unverified.forEach { put(unverifiedJson(it)) } })
             put("hardware_family", result.hardwareFamily)
+            put("bms_version", bmsHardwareVersion())
         }
     }
 
@@ -7696,8 +8288,11 @@ class MainActivity : ComponentActivity() {
         val general = JSONObject()
         general.put("Тип батареи", batteryTypeText())
         general.put("Номинальная емкость", nominalCapacityText())
-        general.put("Серийный номер", bmsSn().ifBlank { "не прочитан" })
-        general.put("Bluetooth ID", bluetoothId().ifBlank { "не указан" })
+        general.put("Серийный номер", displayFactorySn().ifBlank { "не прочитан" })
+        general.put("Версия BMS", displayBmsVersion().ifBlank { "не прочитана" })
+        if (isServiceApp()) {
+            general.put("Bluetooth ID", bluetoothId().ifBlank { "не указан" })
+        }
         general.put("Источник емкости", nominalCapacitySource())
         general.put("Время ожидания сна", regText(0x0115, 0.1, "S"))
         general.put("Настройка SOC", currentSocTextForConfig())
@@ -8131,7 +8726,7 @@ class MainActivity : ComponentActivity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when (screenState) {
-            "dashboard", "journal", "support", "profile", "manage" -> {
+            "dashboard", "journal", "support", "profile", "manage", "service", "qtc", "debug" -> {
                 disconnectGatt()
                 showBatteriesScreen()
             }
