@@ -197,7 +197,7 @@ test("Имя Bluetooth DL не помечает батарею как стару
 
   assert.equal(battery.bluetooth_name, "Гараж");
   assert.equal(battery.advertised_name, "DL-40D63C3223A2");
-  assert.equal(battery.hardware_family, "standard");
+  assert.equal(battery.hardware_family, "r10k");
   assert.equal(battery.bms_sn, "224LG2504150001");
   assert.equal(battery.bluetooth_id, "DL-40D63C3223A2");
 });
@@ -248,7 +248,7 @@ test("Имя Bluetooth DL не определяет hardware_family", async () =
   const batteriesBody = await batteriesResponse.json();
   const battery = batteriesBody.batteries.find((item) => item.bms_uid === payload.bms_uid);
 
-  assert.equal(battery.hardware_family, "standard");
+  assert.equal(battery.hardware_family, "r10k");
 });
 
 test("POST проверки конфигурации отклоняет неверный ключ", async () => {
@@ -385,7 +385,7 @@ test("очередь записи принимает остальные пара
   assert.equal((await pack.json()).command.raw_value, 146);
 });
 
-test("очередь записи принимает балансировку для BMS с именем DL", async () => {
+test("очередь записи не принимает балансировку без версии R24TK", async () => {
   const headers = { "content-type": "application/json", "x-api-key": API_KEY };
   const uid = "DL-write-skip-bms";
   const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
@@ -405,10 +405,8 @@ test("очередь записи принимает балансировку д
     headers,
     body: JSON.stringify({ key: "balance_delta", value: 10 }),
   });
-  assert.equal(response.status, 201);
-  const body = await response.json();
-  assert.equal(body.ok, true);
-  assert.equal(body.command.key, "balance_delta");
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error, "skipped_for_r10k");
 });
 
 test("очередь записи пропускает SOC и баланс для BMS R10K в серийном номере", async () => {
@@ -476,36 +474,52 @@ test("очередь записи пропускает SOC и баланс по 
   assert.equal((await skipped.json()).error, "skipped_for_r10k");
 });
 
-test("версии R24TK и R24TH проверяют SOC и баланс", async () => {
+test("версия R24TK и R24TH проверяют SOC и баланс", async () => {
   const headers = { "content-type": "application/json", "x-api-key": API_KEY };
 
-  for (const version of ["R24TK", "R24TH"]) {
-    const uid = `balanced-${version.toLowerCase()}-bms`;
-    const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        ...createFullPayload(),
-        bms_uid: uid,
-        bms_sn: "221KA160900368",
-        bms_version: version,
-        hardware_family: "standard",
-      }),
-    });
-    assert.equal(telemetry.status, 201);
+  const tk = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...createFullPayload(),
+      bms_uid: "balanced-r24tk-bms",
+      bms_sn: "221KA160900368",
+      bms_version: "R24TK",
+      hardware_family: "standard",
+    }),
+  });
+  assert.equal(tk.status, 201);
+  const tkBattery = (await (await fetch(`${baseUrl}/api/v1/batteries`)).json())
+    .batteries.find((item) => item.bms_uid === "balanced-r24tk-bms");
+  assert.equal(tkBattery.hardware_family, "standard");
+  const tkWrite = await fetch(`${baseUrl}/api/v1/batteries/balanced-r24tk-bms/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "soc_calibration_100", value: 3.65 }),
+  });
+  assert.equal(tkWrite.status, 201);
 
-    const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
-    const battery = (await batteriesResponse.json()).batteries.find((item) => item.bms_uid === uid);
-    assert.equal(battery.hardware_family, "standard");
-    assert.equal(battery.bms_version, version);
-
-    const allowed = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ key: "soc_calibration_100", value: 3.65 }),
-    });
-    assert.equal(allowed.status, 201, version);
-  }
+  const th = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...createFullPayload(),
+      bms_uid: "balanced-r24th-bms",
+      bms_sn: "221KA160900368",
+      bms_version: "R24TH",
+      hardware_family: "standard",
+    }),
+  });
+  assert.equal(th.status, 201);
+  const thBattery = (await (await fetch(`${baseUrl}/api/v1/batteries`)).json())
+    .batteries.find((item) => item.bms_uid === "balanced-r24th-bms");
+  assert.equal(thBattery.hardware_family, "standard");
+  const thWrite = await fetch(`${baseUrl}/api/v1/batteries/balanced-r24th-bms/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "soc_calibration_100", value: 3.65 }),
+  });
+  assert.equal(thWrite.status, 201);
 });
 
 test("код модели BMS R24TK1A-8S100A даёт версию R24TK", async () => {
@@ -536,6 +550,28 @@ test("код модели BMS R24TK1A-8S100A даёт версию R24TK", async
   assert.equal(allowed.status, 201);
 });
 
+test("телеметрия сохраняет строку версии BMS как в сервисном приложении", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+  const uid = "service-display-version";
+  const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...createFullPayload(),
+      bms_uid: uid,
+      bms_sn: "221KA160900368",
+      bms_hw_version: "JHB-R24TK1A-8S100A",
+      bms_version: "JHB-R24TK1A-8S100A",
+    }),
+  });
+  assert.equal(telemetry.status, 201);
+
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
+  const battery = (await batteriesResponse.json()).batteries.find((item) => item.bms_uid === uid);
+  assert.equal(battery.bms_version, "JHB-R24TK1A-8S100A");
+  assert.equal(battery.hardware_family, "standard");
+});
+
 test("версия железа A5 0x63 JHB-R10K важнее кода модели R24TK", async () => {
   const headers = { "content-type": "application/json", "x-api-key": API_KEY };
   const uid = "hw-version-r10k";
@@ -554,7 +590,7 @@ test("версия железа A5 0x63 JHB-R10K важнее кода моде�
 
   const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
   const battery = (await batteriesResponse.json()).batteries.find((item) => item.bms_uid === uid);
-  assert.equal(battery.bms_version, "R10K");
+  assert.equal(battery.bms_version, "JHB-R10K-V1.0");
   assert.equal(battery.hardware_family, "r10k");
 
   const skipped = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {

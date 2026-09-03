@@ -778,7 +778,7 @@
       return;
     }
 
-    const skipR10k = isR10kSeries(battery);
+    const skipR10k = skipsLimitedTemplateParams(battery);
     const series = detectSeries(battery);
     const bucket = writeDraftBucket(state.writeRenderedUid);
 
@@ -928,7 +928,7 @@
       return;
     }
     captureWriteDrafts();
-    const skipR10k = isR10kSeries(battery);
+    const skipR10k = skipsLimitedTemplateParams(battery);
     const params = templateParameters().filter((param) => !shouldSkipWriteParam(param, skipR10k));
     const filled = params.filter((param) => parseWriteNumber(writeDraftBucket(battery.bms_uid)[param.key]) != null);
     if (filled.length === 0) {
@@ -974,12 +974,15 @@
 
   function detectSeries(battery) {
     const latest = { ...(battery || {}), ...(state.history[0] || {}) };
+    const fromCheck = numberOrNull(battery && battery.config_check && battery.config_check.series_count);
+    if (fromCheck === 4 || fromCheck === 8) return fromCheck;
     const live = liveCellEntries(latest).length;
+    if (live === 4 || live === 8) return live;
+    const voltage = numberOrNull(latest.voltage);
+    if (voltage != null && voltage < 18) return 4;
+    if (voltage != null && voltage < 36) return 8;
     if (live > 0) return live;
-    const check = battery && battery.config_check;
-    const fromCheck = check ? numberOrNull(check.series_count) : null;
-    if (fromCheck != null) return fromCheck;
-    return null;
+    return fromCheck;
   }
 
   function liveCellEntries(latest) {
@@ -1081,7 +1084,7 @@
       return;
     }
     const battery = getSelectedBattery();
-    const skipR10k = isR10kSeries(battery);
+    const skipR10k = skipsLimitedTemplateParams(battery);
     const series = detectSeries(battery);
     const bucket = writeDraftBucket(battery && battery.bms_uid);
     let filled = 0;
@@ -1142,7 +1145,7 @@
     const flat = flattenSnapshotValues(snapshotRoot);
     const looksLikeSnapshot = Boolean(parsed.config) || Object.keys(flat).some((key) => /_num$|_v$|_c$|_a$/.test(key) || key === "sleep_time_s");
     const battery = getSelectedBattery();
-    const skipR10k = isR10kSeries(battery);
+    const skipR10k = skipsLimitedTemplateParams(battery);
     const series = detectSeries(battery);
     const bucket = writeDraftBucket(battery && battery.bms_uid);
     let filled = 0;
@@ -1220,7 +1223,7 @@
       showToast("Нет параметров для задания");
       return;
     }
-    const skipR10k = isR10kSeries(battery);
+    const skipR10k = skipsLimitedTemplateParams(battery);
     const series = detectSeries(battery);
     const bucket = writeDraftBucket(battery && battery.bms_uid);
     const payload = {
@@ -1463,10 +1466,9 @@
   }
 
   function parseBmsHardwareVersion(battery) {
-    const explicit = textOrEmpty(battery && battery.bms_version).toUpperCase();
-    if (BMS_VERSION_TOKENS.includes(explicit)) return explicit;
     const haystack = [
       textOrEmpty(battery && battery.bms_hw_version),
+      textOrEmpty(battery && battery.bms_version),
       textOrEmpty(battery && battery.bms_battery_code),
       textOrEmpty(battery && battery.bms_sn),
     ].join(" ").toUpperCase();
@@ -1492,14 +1494,22 @@
   }
 
   function bmsVersionLabel(battery) {
-    return parseBmsHardwareVersion(battery);
+    return textOrEmpty(battery && battery.bms_version);
+  }
+
+  function isR24Hardware(battery) {
+    return parseBmsHardwareVersion(battery).startsWith("R24");
+  }
+
+  function skipsLimitedTemplateParams(battery) {
+    return !isR24Hardware(battery);
   }
 
   function isR10kSeries(battery) {
     if (!battery) return false;
     const version = parseBmsHardwareVersion(battery);
-    if (version === "R24TK" || version === "R24TH") return false;
     if (version === "R10K") return true;
+    if (version === "R24TK" || version === "R24TH") return false;
     if (battery.hardware_family === "r10k" || battery.hardware_family === "tk10") return true;
     return /R10K/i.test(textOrEmpty(battery.bms_sn));
   }
@@ -1522,19 +1532,36 @@
   function visibleConfigCheck(battery) {
     const check = battery && battery.config_check;
     if (!check) return null;
-    if (!isR10kSeries(battery)) return check;
 
-    const mismatches = filterTk10Items(check.mismatches);
-    const missing = filterTk10Items(check.missing);
+    let mismatches = Array.isArray(check.mismatches) ? check.mismatches.slice() : [];
+    let missing = Array.isArray(check.missing) ? check.missing.slice() : [];
+    if (skipsLimitedTemplateParams(battery)) {
+      mismatches = filterTk10Items(mismatches);
+      missing = filterTk10Items(missing);
+    }
+
+    const series = detectSeries(battery);
+    if (series === 4 || series === 8) {
+      missing = missing.filter((item) => {
+        if (item.reason === "unsupported_series") return false;
+        if (item.key === "series_cell_count" && item.reason === "register_missing") return false;
+        return true;
+      });
+    }
+
     let status = check.status;
-    if (status === "mismatch" && mismatches.length === 0) {
-      status = missing.length === 0 ? "ok" : "incomplete";
-    } else if (status === "incomplete" && missing.length === 0 && mismatches.length === 0) {
+    if (mismatches.length > 0) {
+      status = "mismatch";
+    } else if (missing.length > 0) {
+      status = "incomplete";
+    } else if (status === "mismatch" || status === "incomplete") {
       status = "ok";
     }
+
     return {
       ...check,
       status,
+      series_count: check.series_count ?? series,
       mismatches,
       missing,
       mismatch_count: mismatches.length,

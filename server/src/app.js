@@ -520,10 +520,9 @@ function loadConfigTemplate() {
 
 function parseBmsHardwareVersion(battery) {
   const tokens = ["R24TK", "R24TH", "R10K"];
-  const explicit = String((battery && battery.bms_version) || "").trim().toUpperCase();
-  if (tokens.includes(explicit)) return explicit;
   const haystack = [
     battery && battery.bms_hw_version,
+    battery && battery.bms_version,
     battery && battery.bms_battery_code,
     battery && battery.bms_sn,
   ].map((value) => String(value || "").toUpperCase()).join(" ");
@@ -540,12 +539,8 @@ function parseBmsHardwareVersion(battery) {
 }
 
 function isR10kBattery(battery) {
-  if (!battery) return false;
-  const version = parseBmsHardwareVersion(battery);
-  if (version === "R24TK" || version === "R24TH") return false;
-  if (version === "R10K") return true;
-  if (battery.hardware_family === "r10k" || battery.hardware_family === "tk10") return true;
-  return typeof battery.bms_sn === "string" && /R10K/i.test(battery.bms_sn);
+  if (!battery) return true;
+  return !parseBmsHardwareVersion(battery).startsWith("R24");
 }
 
 module.exports = { createApp };

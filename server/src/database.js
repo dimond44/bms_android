@@ -866,10 +866,9 @@ function repairBatteryIdentities(db) {
 
 function parseBmsHardwareVersion(payload) {
   const tokens = ["R24TK", "R24TH", "R10K"];
-  const explicit = String((payload && payload.bms_version) || "").trim().toUpperCase();
-  if (tokens.includes(explicit)) return explicit;
   const haystack = [
     payload && payload.bms_hw_version,
+    payload && payload.bms_version,
     payload && payload.bms_battery_code,
     payload && payload.bms_sn,
   ].map((value) => String(value || "").toUpperCase()).join(" ");
@@ -887,10 +886,8 @@ function parseBmsHardwareVersion(payload) {
 
 function inferHardwareFamily(payload) {
   const version = parseBmsHardwareVersion(payload);
-  if (version === "R24TK" || version === "R24TH") return "standard";
-  if (version === "R10K") return "r10k";
-  if (payload && (payload.hardware_family === "r10k" || payload.hardware_family === "tk10")) return "r10k";
-  return "standard";
+  if (version.startsWith("R24")) return "standard";
+  return "r10k";
 }
 
 function isPlainObject(value) {
@@ -910,7 +907,10 @@ function batteryIdentity(payload) {
     last_source: payload.source === "service" ? "service" : payload.source === "user" ? "user" : null,
     assembler_name: sanitizeIdentity(payload.assembler_name),
     bms_sn: sanitizeIdentity(payload.bms_sn),
-    bms_version: parseBmsHardwareVersion(payload) || null,
+    bms_version: sanitizeIdentity(payload.bms_version)
+      || sanitizeIdentity(payload.bms_hw_version)
+      || parseBmsHardwareVersion(payload)
+      || null,
     bluetooth_id: stableBluetoothId(payload),
   };
 }
