@@ -1,7 +1,17 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.exists()) {
+        file.inputStream().use { load(it) }
+    }
+}
+val bmsApiKey = localProperties.getProperty("BMS_API_KEY", "").orEmpty()
 
 android {
     namespace = "ru.liferych.bms"
@@ -11,8 +21,9 @@ android {
         applicationId = "ru.liferych.bms"
         minSdk = 23
         targetSdk = 35
-        versionCode = 96
-        versionName = "0.2.36"
+        versionCode = 98
+        versionName = "0.2.38"
+        buildConfigField("String", "BMS_API_KEY", "\"${bmsApiKey.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
     }
 
     buildFeatures {

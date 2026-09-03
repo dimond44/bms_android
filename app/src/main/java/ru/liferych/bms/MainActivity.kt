@@ -54,15 +54,16 @@ private const val REQUEST_ADDRESS: Byte = 0x40
 private const val DATA_LEN: Byte = 0x08
 private const val BLE_LOG_TAG = "LiferychBmsBle"
 
-private const val DEFAULT_ADMIN_SERVER_BASE_URL = "http://192.168.70.142:3000"
+private const val DEFAULT_ADMIN_SERVER_BASE_URL = "http://5.3.87.2:3101"
 private const val LOCAL_UPLOAD_PATH = "/api/upload.php"
 private const val LOCAL_CONFIG_UPLOAD_PATH = "/api/config_upload.php"
 private const val LOCAL_SERVICE_REPORT_PATH = "/api/v1/service-report"
 private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_submit.php"
 private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
 private const val SERVER_WARRANTY_UPDATE_URL = "http://dimond44.xsph.ru/api/warranty_update.php"
-private const val SERVER_API_KEY = "change_me_api_key_2026"
-private const val APP_VERSION = "0.2.36"
+/** Ключ только для warranty PHP на xsph.ru, не для BMS API. */
+private const val WARRANTY_API_KEY = "change_me_api_key_2026"
+private const val APP_VERSION = "0.2.38"
 private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
 private const val CONFIG_UPLOAD_INTERVAL_MS = 300000L
@@ -2810,7 +2811,7 @@ class MainActivity : ComponentActivity() {
             else -> "partial"
         }
         val body = JSONObject().apply {
-            put("api_key", SERVER_API_KEY)
+            put("api_key", BmsApiConfig.API_KEY)
             put("bms_uid", bmsUid())
             put("bluetooth_name", dalyBluetoothDeviceId())
             put("bluetooth_address", selectedAddress ?: "")
@@ -4318,9 +4319,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun adminServerBaseUrl(): String {
-        return normalizeAdminServerBaseUrl(
-            serverPrefs.getString("base_url", DEFAULT_ADMIN_SERVER_BASE_URL).orEmpty()
-        )
+        val saved = serverPrefs.getString("base_url", DEFAULT_ADMIN_SERVER_BASE_URL).orEmpty()
+        val normalized = normalizeAdminServerBaseUrl(saved)
+        if (normalized != saved.trim().trimEnd('/')) {
+            serverPrefs.edit().putString("base_url", normalized).apply()
+        }
+        return normalized
     }
 
     private fun saveAdminServerBaseUrl(input: String) {
@@ -4333,9 +4337,27 @@ class MainActivity : ComponentActivity() {
         return adminServerBaseUrl().trimEnd('/') + path
     }
 
+    private fun applyBmsApiAuth(conn: HttpURLConnection) {
+        conn.setRequestProperty("x-api-key", BmsApiConfig.API_KEY)
+    }
+
+    private fun putBmsApiKey(body: JSONObject) {
+        body.put("api_key", BmsApiConfig.API_KEY)
+    }
+
+    private fun isLegacyLocalAdminServerUrl(value: String): Boolean {
+        val normalized = value.trim().trimEnd('/').lowercase()
+        return normalized.isBlank() ||
+            normalized == "http://192.168.70.142:3000" ||
+            normalized == "http://localhost:3000" ||
+            normalized == "http://127.0.0.1:3000"
+    }
+
     private fun normalizeAdminServerBaseUrl(input: String): String {
         var value = input.trim()
-        if (value.isBlank()) value = DEFAULT_ADMIN_SERVER_BASE_URL
+        if (value.isBlank() || isLegacyLocalAdminServerUrl(value)) {
+            value = DEFAULT_ADMIN_SERVER_BASE_URL
+        }
         if (!value.startsWith("http://", ignoreCase = true) &&
             !value.startsWith("https://", ignoreCase = true)
         ) {
@@ -4426,7 +4448,7 @@ class MainActivity : ComponentActivity() {
         val adminServerUrl = field(
             "Адрес локальной админки",
             adminServerBaseUrl(),
-            "http://192.168.70.142:3000"
+            DEFAULT_ADMIN_SERVER_BASE_URL
         )
         profileCard.addView(TextView(this).apply {
             text = "Телеметрия BMS будет отправляться на этот компьютер по адресу ${LOCAL_UPLOAD_PATH}. Если работаете с другого ПК, поменяйте IP и нажмите «Сохранить»."
@@ -4503,7 +4525,7 @@ class MainActivity : ComponentActivity() {
         })
         val adminServerUrl = EditText(this).apply {
             setText(adminServerBaseUrl())
-            hint = "http://192.168.70.142:3000"
+            hint = DEFAULT_ADMIN_SERVER_BASE_URL
             textSize = 15f
             setSingleLine(true)
             setPadding(dp(12), 0, dp(12), 0)
@@ -4883,7 +4905,7 @@ class MainActivity : ComponentActivity() {
         thread {
             try {
                 val body = JSONObject().apply {
-                    put("api_key", SERVER_API_KEY)
+                    put("api_key", WARRANTY_API_KEY)
                     put("bms_uid", uid)
                     put("all_by_bms", true)
                 }.toString()
@@ -5059,7 +5081,7 @@ class MainActivity : ComponentActivity() {
         val existing = warrantyRequestByLocalId(localId)
 
         val payload = JSONObject()
-        payload.put("api_key", SERVER_API_KEY)
+        payload.put("api_key", WARRANTY_API_KEY)
         payload.put("client_fio", fio)
         payload.put("client_phone", phone)
         payload.put("battery_model", model)
@@ -6998,7 +7020,7 @@ class MainActivity : ComponentActivity() {
                     "Сервер ответил HTTP $code"
                 }
             } catch (e: Exception) {
-                "Нет связи с ${adminServerBaseUrl()}: ${e.message ?: e.toString()}. Телефон и ПК должны быть в одной Wi‑Fi сети."
+                "Нет связи с ${adminServerBaseUrl()}: ${e.message ?: e.toString()}"
             }
             lastUploadStatus = message
             runOnUiThread {
@@ -7031,6 +7053,7 @@ class MainActivity : ComponentActivity() {
                     doOutput = true
                     setRequestProperty("Content-Type", "application/json; charset=utf-8")
                     setRequestProperty("Accept", "application/json")
+                    applyBmsApiAuth(this)
                 }
 
                 conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
@@ -7409,7 +7432,7 @@ class MainActivity : ComponentActivity() {
         thread {
             val encoded = URLEncoder.encode(uid, "UTF-8")
             val body = JSONObject().apply {
-                put("api_key", SERVER_API_KEY)
+                put("api_key", BmsApiConfig.API_KEY)
                 put("status", status)
                 if (actual != null && actual.isFinite()) put("actual", actual)
                 if (!error.isNullOrBlank()) put("error", error)
@@ -7425,7 +7448,7 @@ class MainActivity : ComponentActivity() {
                 connectTimeout = 8000
                 readTimeout = 8000
                 setRequestProperty("Accept", "application/json")
-                setRequestProperty("x-api-key", SERVER_API_KEY)
+                applyBmsApiAuth(this)
                 if (body != null) {
                     doOutput = true
                     setRequestProperty("Content-Type", "application/json; charset=utf-8")
@@ -7839,6 +7862,7 @@ class MainActivity : ComponentActivity() {
                     doOutput = true
                     setRequestProperty("Content-Type", "application/json; charset=utf-8")
                     setRequestProperty("Accept", "application/json")
+                    applyBmsApiAuth(this)
                 }
                 conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
                 val code = conn.responseCode
@@ -7956,7 +7980,7 @@ class MainActivity : ComponentActivity() {
         ensureConfigForUpload()
 
         val obj = JSONObject()
-        obj.put("api_key", SERVER_API_KEY)
+        obj.put("api_key", BmsApiConfig.API_KEY)
         obj.put("bms_uid", bmsUid())
         obj.put("bluetooth_name", dalyBluetoothDeviceId())
         obj.put("bluetooth_address", selectedAddress ?: "")
@@ -8141,7 +8165,7 @@ class MainActivity : ComponentActivity() {
 
     private fun buildUploadJson(): JSONObject {
         val obj = JSONObject()
-        obj.put("api_key", SERVER_API_KEY)
+        obj.put("api_key", BmsApiConfig.API_KEY)
         obj.put("bms_uid", bmsUid())
         obj.put("bluetooth_name", dalyBluetoothDeviceId())
         obj.put("bluetooth_address", selectedAddress ?: "")

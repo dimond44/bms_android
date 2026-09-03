@@ -1,0 +1,6 @@
+## Android SDK
+# sdk.dir=C\:\\Users\\USER\\AppData\\Local\\Android\\Sdk
+
+## BMS API key for http://5.3.87.2:3101
+## Insert the real key from the server. Do not invent a new one.
+BMS_API_KEY=
