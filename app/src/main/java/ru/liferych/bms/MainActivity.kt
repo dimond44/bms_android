@@ -6732,7 +6732,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun isR24Hardware(): Boolean {
-        return bmsHardwareVersion().uppercase().startsWith("R24")
+        val hw = bmsHwVersionText()
+        if (hw.isNotBlank()) return hw.contains("R24", ignoreCase = true)
+        return bmsHardwareVersion().contains("R24", ignoreCase = true)
     }
 
     private fun skipsLimitedTemplateParams(): Boolean = !isR24Hardware()

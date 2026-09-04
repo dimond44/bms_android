@@ -540,6 +540,8 @@ function parseBmsHardwareVersion(battery) {
 
 function isR10kBattery(battery) {
   if (!battery) return true;
+  const hw = String((battery && (battery.bms_hw_version || battery.bms_version)) || "").toUpperCase();
+  if (hw) return !hw.includes("R24");
   return !parseBmsHardwareVersion(battery).startsWith("R24");
 }
 

@@ -82,6 +82,7 @@ h3 { margin-bottom: 0; font-size: 17px; }
 .battery-main { min-width: 0; }
 .battery-name { overflow: hidden; display: block; margin-bottom: 5px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
 .battery-uid { overflow: hidden; display: block; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.battery-version { overflow: hidden; display: block; color: var(--text); font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .family-badge { display: inline-flex; max-width: 100%; margin-top: 6px; margin-right: 6px; padding: 3px 7px; border-radius: 7px; background: color-mix(in srgb, var(--red) 14%, transparent); color: var(--red); font-size: 10px; font-weight: 800; }
 .service-badge { display: inline-flex; max-width: 100%; margin-top: 6px; margin-right: 6px; padding: 3px 7px; border-radius: 7px; background: color-mix(in srgb, var(--yellow) 28%, transparent); color: color-mix(in srgb, var(--yellow-deep) 80%, var(--text)); font-size: 10px; font-weight: 800; }
 .config-badge { display: inline-flex; max-width: 100%; margin-top: 8px; padding: 4px 7px; overflow: hidden; border-radius: 7px; background: var(--surface-2); color: var(--muted); font-size: 10px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }

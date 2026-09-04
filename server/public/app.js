@@ -342,13 +342,13 @@
 
       const main = el("span", "battery-main");
       appendText(main, "span", "battery-name", displayName(battery));
-      appendText(main, "span", "battery-uid", bluetoothDeviceId(battery));
-      if (textOrEmpty(battery.bms_sn)) {
-        appendText(main, "span", "battery-uid", `SN ${battery.bms_sn.trim()}`);
+      const sn = displayBatterySn(battery);
+      if (sn) {
+        appendText(main, "span", "battery-uid", `SN ${sn}`);
       }
       const versionLabel = bmsVersionLabel(battery);
       if (versionLabel) {
-        appendText(main, "span", "battery-uid", `BMS ${versionLabel}`);
+        appendText(main, "span", "battery-version", `BMS ${versionLabel}`);
       }
       if (textOrEmpty(battery.owner_name)) {
         appendText(main, "span", "battery-owner", battery.owner_name.trim());
@@ -1494,10 +1494,15 @@
   }
 
   function bmsVersionLabel(battery) {
-    return textOrEmpty(battery && battery.bms_version);
+    return textOrEmpty(battery && battery.bms_version)
+      || textOrEmpty(battery && battery.bms_hw_version)
+      || parseBmsHardwareVersion(battery);
   }
 
   function isR24Hardware(battery) {
+    const hw = textOrEmpty(battery && battery.bms_hw_version)
+      || textOrEmpty(battery && battery.bms_version);
+    if (hw) return /R24/i.test(hw);
     return parseBmsHardwareVersion(battery).startsWith("R24");
   }
 

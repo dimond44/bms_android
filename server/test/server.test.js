@@ -522,6 +522,35 @@ test("версия R24TK и R24TH проверяют SOC и баланс", async
   assert.equal(thWrite.status, 201);
 });
 
+test("аппаратная строка с R24 без токена TK/TH проверяет SOC и баланс", async () => {
+  const headers = { "content-type": "application/json", "x-api-key": API_KEY };
+  const uid = "hw-string-r24";
+  const telemetry = await fetch(`${baseUrl}/api/v1/telemetry`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...createFullPayload(),
+      bms_uid: uid,
+      bms_sn: "224LG151200441",
+      bms_hw_version: "JHB-R24-V2.1",
+      bms_version: "JHB-R24-V2.1",
+    }),
+  });
+  assert.equal(telemetry.status, 201);
+
+  const batteriesResponse = await fetch(`${baseUrl}/api/v1/batteries`);
+  const battery = (await batteriesResponse.json()).batteries.find((item) => item.bms_uid === uid);
+  assert.equal(battery.bms_version, "JHB-R24-V2.1");
+  assert.equal(battery.hardware_family, "standard");
+
+  const allowed = await fetch(`${baseUrl}/api/v1/batteries/${encodeURIComponent(uid)}/write-commands`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key: "soc_calibration_100", value: 3.65 }),
+  });
+  assert.equal(allowed.status, 201);
+});
+
 test("код модели BMS R24TK1A-8S100A даёт версию R24TK", async () => {
   const headers = { "content-type": "application/json", "x-api-key": API_KEY };
   const uid = "battery-code-r24tk";

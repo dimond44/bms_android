@@ -885,9 +885,9 @@ function parseBmsHardwareVersion(payload) {
 }
 
 function inferHardwareFamily(payload) {
-  const version = parseBmsHardwareVersion(payload);
-  if (version.startsWith("R24")) return "standard";
-  return "r10k";
+  const hw = String((payload && (payload.bms_hw_version || payload.bms_version)) || "").toUpperCase();
+  if (hw) return hw.includes("R24") ? "standard" : "r10k";
+  return parseBmsHardwareVersion(payload).startsWith("R24") ? "standard" : "r10k";
 }
 
 function isPlainObject(value) {
