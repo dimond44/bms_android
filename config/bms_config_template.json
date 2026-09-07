@@ -1,6 +1,6 @@
 {
   "id": "liferych-lfp-default",
-  "version": 6,
+  "version": 7,
   "chemistry": "LiFePO4",
   "supported_series": [4, 8],
   "parameters": [
@@ -32,7 +32,7 @@
     {
       "key": "soc_calibration_0",
       "label": "Калибровка SOC 0%",
-      "register": "0x01C7",
+      "register": "0x0227",
       "scale": 1000,
       "offset": 0,
       "unit": "V",

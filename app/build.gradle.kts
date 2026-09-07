@@ -21,8 +21,8 @@ android {
         applicationId = "ru.liferych.bms"
         minSdk = 23
         targetSdk = 35
-        versionCode = 98
-        versionName = "0.2.38"
+        versionCode = 103
+        versionName = "0.2.43"
         buildConfigField("String", "BMS_API_KEY", "\"${bmsApiKey.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
     }
 

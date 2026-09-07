@@ -54,16 +54,16 @@ private const val REQUEST_ADDRESS: Byte = 0x40
 private const val DATA_LEN: Byte = 0x08
 private const val BLE_LOG_TAG = "LiferychBmsBle"
 
-private const val DEFAULT_ADMIN_SERVER_BASE_URL = "http://5.3.87.2:3101"
-private const val LOCAL_UPLOAD_PATH = "/api/upload.php"
-private const val LOCAL_CONFIG_UPLOAD_PATH = "/api/config_upload.php"
-private const val LOCAL_SERVICE_REPORT_PATH = "/api/v1/service-report"
+private const val DEFAULT_ADMIN_SERVER_BASE_URL = BmsApiConfig.BASE_URL
+private const val UPLOAD_PATH = "/api/upload.php"
+private const val CONFIG_UPLOAD_PATH = "/api/config_upload.php"
+private const val SERVICE_REPORT_PATH = "/api/v1/service-report"
 private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_submit.php"
 private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
 private const val SERVER_WARRANTY_UPDATE_URL = "http://dimond44.xsph.ru/api/warranty_update.php"
 /** Ключ только для warranty PHP на xsph.ru, не для BMS API. */
 private const val WARRANTY_API_KEY = "change_me_api_key_2026"
-private const val APP_VERSION = "0.2.38"
+private val APP_VERSION = BuildConfig.VERSION_NAME
 private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
 private const val CONFIG_UPLOAD_INTERVAL_MS = 300000L
@@ -72,6 +72,9 @@ private const val CONFIG_AUTO_READ_DELAY_MS = 12000L
 private const val TEST_AUTO_WRITE_SOC_ON_CONNECT = false
 private const val TEST_SOC_PERCENT_ON_CONNECT = 90.0
 private const val TEST_SOC_REGISTER_ADDR = 0x0116
+private const val SERVICE_PACK_SOC_PERCENT = 100.0
+private const val SERVICE_SOC_TOLERANCE_PERCENT = 1.0
+private const val SERVICE_CAPACITY_TOLERANCE_AH = 0.6
 private const val HARDWARE_FAMILY_STANDARD = "standard"
 private const val HARDWARE_FAMILY_DL_RED = "dl_red"
 private const val HARDWARE_FAMILY_R10K = "r10k"
@@ -88,7 +91,29 @@ private const val DALY_NOMINAL_CAPACITY_LO_REG = 0x010A
 private const val DALY_REMAINING_CAPACITY_HI_REG = 0x010B
 private const val DALY_REMAINING_CAPACITY_LO_REG = 0x010C
 private const val DALY_PASSWORD_REG_0 = 0x0126
+private const val DALY_SOC_CALIBRATION_0_REG = 0x0227
+private const val DALY_SOC_CALIBRATION_100_REG = 0x0229
+private const val DALY_CELL_OV_ALARM_REG = 0x0130
+private const val DALY_CELL_OV_PROTECT_REG = 0x0131
+private const val DALY_CELL_OV_RECOVERY_REG = 0x0132
 private const val SERVICE_SETTINGS_PASSWORD = "113355"
+private const val SERVICE_WRITE_MAX_RETRY_ROUNDS = 1
+private val SERVICE_TEMPLATE_WRITE_ORDER = listOf(
+    "sleep_timeout",
+    "cell_over_voltage",
+    "cell_under_voltage",
+    "pack_over_voltage",
+    "pack_under_voltage",
+    "charge_high_temp",
+    "charge_low_temp",
+    "discharge_high_temp",
+    "discharge_low_temp",
+    "balance_start_voltage",
+    "balance_stop_voltage",
+    "balance_delta",
+    "soc_calibration_0",
+    "soc_calibration_100"
+)
 private val R10K_SKIPPED_TEMPLATE_KEYS = setOf(
     "soc_calibration_0",
     "soc_calibration_100",
@@ -213,6 +238,17 @@ data class TemplateCheckResult(
     val unverified: List<TemplateCheckItem> = emptyList(),
     val hardwareFamily: String = HARDWARE_FAMILY_STANDARD
 )
+
+private enum class QtcDbStatus {
+    IDLE,
+    WAITING_BMS,
+    CHECKING,
+    IN_DATABASE,
+    SENDING,
+    VERIFYING,
+    ADDED,
+    ERROR
+}
 
 data class SavedBattery(
     val address: String,
@@ -458,6 +494,7 @@ class MainActivity : ComponentActivity() {
     private var serviceWriteProgressBar: ProgressBar? = null
     private var serviceWriteProgressText: TextView? = null
     private var pendingServiceWriteFinalVerify: Boolean = false
+    private var serviceWriteRetryRound: Int = 0
     private var serviceVerifyNeedsReadAfterCurrent: Boolean = false
     private var bluetoothIdValue: TextView? = null
     private var bmsSnValue: TextView? = null
@@ -528,6 +565,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var connectionText: TextView
     private lateinit var manageContentLayout: LinearLayout
     private lateinit var qtcContentLayout: LinearLayout
+    private var qtcDbStatus: QtcDbStatus = QtcDbStatus.IDLE
+    private var qtcDbUid: String = ""
+    private var qtcDbError: String = ""
+    private var qtcDbJobToken: Int = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         Thread.setDefaultUncaughtExceptionHandler { _, e ->
@@ -627,6 +668,19 @@ class MainActivity : ComponentActivity() {
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply { topMargin = dp(8) }
+            )
+            launchTop.addView(
+                TextView(this).apply {
+                    text = BuildConfig.VERSION_NAME
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.rgb(111, 119, 129))
+                    textSize = 12f
+                    typeface = interFont(600)
+                },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(4) }
             )
         }
 
@@ -2164,16 +2218,14 @@ class MainActivity : ComponentActivity() {
             setTextColor(if (assembler.isBlank()) Color.rgb(140, 90, 20) else Color.rgb(16, 17, 20))
         }, marginLp(-1, -2, 0, 0, 0, 10))
 
-        val serverCard = card()
-        serverCard.addView(sectionTitle("Сервер", adminServerBaseUrl()))
         serviceUploadStatusText = TextView(this).apply {
             text = currentUploadStatusText()
             textSize = 13f
             setTextColor(Color.rgb(50, 50, 50))
         }
-        serverCard.addView(serviceUploadStatusText, marginLp(-1, -2, 0, 0, 0, 10))
-        val serverRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        serverRow.addView(TextView(this).apply {
+        content.addView(serviceUploadStatusText, marginLp(-1, -2, 0, 0, 0, 10))
+        val sendRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        sendRow.addView(TextView(this).apply {
             text = "Проверить связь"
             gravity = Gravity.CENTER
             textSize = 14f
@@ -2182,7 +2234,7 @@ class MainActivity : ComponentActivity() {
             background = round(Color.WHITE, dp(12), Color.rgb(223, 229, 235), 1)
             setOnClickListener { pingAdminServer() }
         }, LinearLayout.LayoutParams(0, dp(48), 1f))
-        serverRow.addView(TextView(this).apply {
+        sendRow.addView(TextView(this).apply {
             text = "Отправить сейчас"
             gravity = Gravity.CENTER
             textSize = 14f
@@ -2191,8 +2243,7 @@ class MainActivity : ComponentActivity() {
             background = round(red, dp(12), Color.TRANSPARENT, 0)
             setOnClickListener { uploadCurrentData(force = true) }
         }, marginLp(0, dp(48), 8, 0, 0, 0).apply { weight = 1f })
-        serverCard.addView(serverRow)
-        content.addView(serverCard, marginLp(-1, -2, 0, 0, 0, 12))
+        content.addView(sendRow, marginLp(-1, -2, 0, 0, 0, 12))
 
         val templateCard = card()
         templateCard.addView(sectionTitle("Шаблон настроек", "12В или 24В"))
@@ -2306,14 +2357,17 @@ class MainActivity : ComponentActivity() {
         root.addView(fixedBottomNav("qtc"), LinearLayout.LayoutParams(-1, dp(70)))
         setContentView(root)
         renderQtcContent()
+        ensureQtcBatteryRegistry(fromUser = true)
     }
 
-    private fun renderQtcContent() {
+    private fun renderQtcContent(triggerRegistry: Boolean = true) {
         if (!::qtcContentLayout.isInitialized) return
         qtcContentLayout.removeAllViews()
 
         val result = if (configRegisters.isNotEmpty()) evaluateTemplateCheck() else currentTemplateCheck()
+        qtcContentLayout.addView(qtcDatabaseStatusCard(), marginLp(-1, -2, 0, 0, 0, 12))
         qtcContentLayout.addView(qtcStatusCard(result), marginLp(-1, -2, 0, 0, 0, 12))
+        if (triggerRegistry) ensureQtcBatteryRegistry(fromUser = false)
 
         val mismatches = result?.mismatches.orEmpty()
         val missing = result?.missing.orEmpty()
@@ -2447,6 +2501,200 @@ class MainActivity : ComponentActivity() {
         return t?.let { "$it °C" } ?: "--"
     }
 
+    private fun qtcHasIdentity(): Boolean {
+        if (bluetoothGatt == null) return false
+        val uid = bmsUid().trim()
+        return uid.isNotBlank() && uid != "unknown_bms"
+    }
+
+    private fun qtcDatabaseStatusCard(): LinearLayout {
+        val title: String
+        val detail: String
+        val color: Int
+        val showRetry: Boolean
+        when (qtcDbStatus) {
+            QtcDbStatus.IN_DATABASE -> {
+                title = "✓  АКБ в базе"
+                detail = "Батарея уже зарегистрирована на сервере."
+                color = Color.rgb(28, 160, 55)
+                showRetry = false
+            }
+            QtcDbStatus.ADDED -> {
+                title = "✓  АКБ добавлена в базу"
+                detail = "Регистрация подтверждена сервером."
+                color = Color.rgb(21, 122, 163)
+                showRetry = false
+            }
+            QtcDbStatus.SENDING -> {
+                title = "Отправка на сервер..."
+                detail = "Регистрируем аккумулятор в базе."
+                color = Color.rgb(224, 150, 0)
+                showRetry = false
+            }
+            QtcDbStatus.VERIFYING -> {
+                title = "Проверка базы..."
+                detail = "Подтверждаем регистрацию на сервере."
+                color = Color.rgb(110, 118, 128)
+                showRetry = false
+            }
+            QtcDbStatus.ERROR -> {
+                title = "АКБ не отправлена"
+                detail = qtcDbError.ifBlank { "Нет связи с сервером" }
+                color = Color.rgb(211, 47, 47)
+                showRetry = true
+            }
+            QtcDbStatus.WAITING_BMS -> {
+                title = "Проверка базы..."
+                detail = if (bluetoothGatt == null) {
+                    "Подключите BMS для регистрации в базе."
+                } else {
+                    "Ожидание идентификатора BMS."
+                }
+                color = Color.rgb(110, 118, 128)
+                showRetry = false
+            }
+            else -> {
+                title = "Проверка базы..."
+                detail = "Сверяем аккумулятор с серверной базой."
+                color = Color.rgb(110, 118, 128)
+                showRetry = false
+            }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = round(Color.argb(28, Color.red(color), Color.green(color), Color.blue(color)), dp(12), color, 1)
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 15f
+                typeface = interFont(740)
+                setTextColor(color)
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = detail
+                textSize = 12f
+                setTextColor(Color.rgb(75, 79, 84))
+                setPadding(0, dp(3), 0, 0)
+            })
+            if (showRetry) {
+                addView(TextView(this@MainActivity).apply {
+                    text = "Повторить"
+                    gravity = Gravity.CENTER
+                    textSize = 14f
+                    typeface = interFont(740)
+                    setTextColor(Color.rgb(16, 17, 20))
+                    background = round(Color.WHITE, dp(12), color, 1)
+                    setOnClickListener { ensureQtcBatteryRegistry(fromUser = true, retry = true) }
+                }, marginLp(-1, dp(44), 0, 8, 0, 0))
+            }
+        }
+    }
+
+    private fun ensureQtcBatteryRegistry(fromUser: Boolean, retry: Boolean = false) {
+        if (!isServiceApp() || screenState != "qtc") return
+        if (!qtcHasIdentity()) {
+            qtcDbStatus = QtcDbStatus.WAITING_BMS
+            qtcDbError = ""
+            return
+        }
+        val uid = bmsUid().trim()
+        if (uid != qtcDbUid) {
+            qtcDbUid = uid
+            qtcDbError = ""
+            qtcDbStatus = QtcDbStatus.CHECKING
+            startQtcBatteryRegistryJob(uid)
+            return
+        }
+        if (retry) {
+            qtcDbError = ""
+            qtcDbStatus = QtcDbStatus.CHECKING
+            startQtcBatteryRegistryJob(uid)
+            renderQtcContent(triggerRegistry = false)
+            return
+        }
+        if (qtcDbStatus == QtcDbStatus.CHECKING ||
+            qtcDbStatus == QtcDbStatus.SENDING ||
+            qtcDbStatus == QtcDbStatus.VERIFYING
+        ) {
+            return
+        }
+        if (!fromUser && qtcDbStatus != QtcDbStatus.IDLE && qtcDbStatus != QtcDbStatus.WAITING_BMS) {
+            return
+        }
+        qtcDbError = ""
+        qtcDbStatus = QtcDbStatus.CHECKING
+        startQtcBatteryRegistryJob(uid)
+    }
+
+    private fun startQtcBatteryRegistryJob(uid: String) {
+        val token = ++qtcDbJobToken
+        thread {
+            runQtcBatteryRegistry(uid, token)
+        }
+    }
+
+    private fun runQtcBatteryRegistry(uid: String, token: Int) {
+        fun stillCurrent(): Boolean {
+            return token == qtcDbJobToken && uid == qtcDbUid && screenState == "qtc"
+        }
+        fun publish(status: QtcDbStatus, error: String = "") {
+            if (!stillCurrent()) return
+            qtcDbStatus = status
+            qtcDbError = error
+            runOnUiThread {
+                if (stillCurrent() && ::qtcContentLayout.isInitialized) {
+                    renderQtcContent(triggerRegistry = false)
+                }
+            }
+        }
+
+        publish(QtcDbStatus.CHECKING)
+        when (val lookup = lookupBatteryOnServer(uid)) {
+            is QtcLookup.Exists -> {
+                publish(QtcDbStatus.IN_DATABASE)
+                return
+            }
+            is QtcLookup.Failed -> {
+                publish(QtcDbStatus.ERROR, lookup.reason)
+                return
+            }
+            QtcLookup.Missing -> Unit
+        }
+
+        if (!stillCurrent()) return
+        publish(QtcDbStatus.SENDING)
+        val sent = postCurrentTelemetry()
+        if (!stillCurrent()) return
+        if (!sent.ok) {
+            publish(QtcDbStatus.ERROR, sent.message)
+            return
+        }
+
+        publish(QtcDbStatus.VERIFYING)
+        when (val verify = lookupBatteryOnServer(uid)) {
+            is QtcLookup.Exists -> publish(QtcDbStatus.ADDED)
+            is QtcLookup.Missing -> publish(QtcDbStatus.ERROR, "Сервер не подтвердил регистрацию")
+            is QtcLookup.Failed -> publish(QtcDbStatus.ERROR, verify.reason)
+        }
+    }
+
+    private sealed class QtcLookup {
+        object Exists : QtcLookup()
+        object Missing : QtcLookup()
+        data class Failed(val reason: String) : QtcLookup()
+    }
+
+    private fun lookupBatteryOnServer(uid: String): QtcLookup {
+        val encoded = URLEncoder.encode(uid, "UTF-8")
+        val json = adminJsonRequest("GET", "/api/v1/batteries/$encoded/telemetry?limit=1")
+            ?: return QtcLookup.Failed("Нет связи с сервером")
+        if (json.optBoolean("ok")) return QtcLookup.Exists
+        return when (json.optString("error")) {
+            "battery_not_found" -> QtcLookup.Missing
+            else -> QtcLookup.Failed("Нет связи с сервером")
+        }
+    }
+
     private fun serviceWriteSummaryText(): String {
         val ok = serviceWriteResults.count { it.ok }
         return "Успешно $ok из ${serviceWriteResults.size}"
@@ -2499,77 +2747,19 @@ class MainActivity : ComponentActivity() {
         var id = 1
         serviceWriteResults.clear()
         serviceWriteCapacityAh = capacityAh
+        serviceWriteRetryRound = 0
         id = enqueueSeriesCountWrite(queue, series, id)
-        for (parameter in template.parameters) {
+        for (parameter in orderedTemplateParameters(template.parameters)) {
             if (parameter.key == "series_cell_count") continue
             if (shouldSkipTemplateParameter(parameter, family)) continue
             val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
-            val raw = Math.round((expected - parameter.offset) * parameter.scale).toInt()
-            if (raw < 0 || raw > 0xFFFF) continue
-            if (registerMatchesExpected(parameter.register, expected, parameter.scale, parameter.offset, parameter.tolerance)) {
-                serviceWriteResults += ServiceWriteResult(
-                    key = parameter.key,
-                    label = parameter.label,
-                    expected = expected,
-                    actual = scaledRegisterValue(parameter.register, parameter.scale, parameter.offset),
-                    unit = parameter.unit,
-                    ok = true,
-                    error = null
-                )
-                continue
-            }
-            queue.add(
-                RemoteWriteCommand(
-                    id = id++,
-                    key = parameter.key,
-                    label = parameter.label,
-                    register = parameter.register,
-                    rawValue = raw,
-                    value = expected,
-                    scale = parameter.scale,
-                    offset = parameter.offset,
-                    unit = parameter.unit,
-                    localOnly = true
-                )
-            )
+            val command = templateParameterWriteCommand(id, parameter, expected) ?: continue
+            queue.add(command)
+            id++
         }
-        if (capacityAlreadyMatches(capacityAh)) {
-            serviceWriteResults += ServiceWriteResult(
-                key = "nominal_capacity",
-                label = "Номинальная емкость",
-                expected = capacityAh,
-                actual = currentNominalCapacityAh(),
-                unit = "Ah",
-                ok = true,
-                error = null
-            )
-        } else {
-            val milliAh = Math.round(capacityAh * 1000.0).toInt().coerceIn(1, 0x7FFFFFFF)
-            val capHi = (milliAh ushr 16) and 0xFFFF
-            val capLo = milliAh and 0xFFFF
-            queue.add(
-                RemoteWriteCommand(
-                    id = id,
-                    key = "nominal_capacity",
-                    label = "Номинальная емкость",
-                    register = DALY_NOMINAL_CAPACITY_HI_REG,
-                    rawValue = milliAh,
-                    value = capacityAh,
-                    scale = 1000.0,
-                    offset = 0.0,
-                    unit = "Ah",
-                    localOnly = true,
-                    displayValue = capacityAh,
-                    writeFrames = listOf(
-                        buildModbusWriteSingleRequest(0x81, DALY_REMAINING_CAPACITY_HI_REG, capHi),
-                        buildModbusWriteSingleRequest(0x81, DALY_REMAINING_CAPACITY_LO_REG, capLo),
-                        buildModbusWriteSingleRequest(0x81, DALY_NOMINAL_CAPACITY_HI_REG, capHi),
-                        buildModbusWriteSingleRequest(0x81, DALY_NOMINAL_CAPACITY_LO_REG, capLo)
-                    )
-                )
-            )
-        }
-        enqueueServicePasswordWrite(queue, id + 1)
+        id = enqueueServiceCapacityWrite(queue, capacityAh, id)
+        id = enqueueServiceSocWrite(queue, capacityAh, id)
+        enqueueServicePasswordWrite(queue, id)
         if (queue.isEmpty()) {
             serviceWriteActive = false
             serviceWriteTotal = 0
@@ -2589,6 +2779,113 @@ class MainActivity : ComponentActivity() {
         showServiceScreen()
         val first = serviceWriteQueue.poll()
         if (first != null) startRemoteWrite(first)
+    }
+
+    private fun capacityRegisterFrames(capacityAh: Double): List<ByteArray> {
+        val milliAh = Math.round(capacityAh * 1000.0).toInt().coerceIn(1, 0x7FFFFFFF)
+        val capHi = (milliAh ushr 16) and 0xFFFF
+        val capLo = milliAh and 0xFFFF
+        return listOf(
+            buildModbusWriteSingleRequest(0x81, DALY_REMAINING_CAPACITY_HI_REG, capHi),
+            buildModbusWriteSingleRequest(0x81, DALY_REMAINING_CAPACITY_LO_REG, capLo),
+            buildModbusWriteSingleRequest(0x81, DALY_NOMINAL_CAPACITY_HI_REG, capHi),
+            buildModbusWriteSingleRequest(0x81, DALY_NOMINAL_CAPACITY_LO_REG, capLo)
+        )
+    }
+
+    private fun remainingCapacityFrames(capacityAh: Double): List<ByteArray> {
+        val milliAh = Math.round(capacityAh * 1000.0).toInt().coerceIn(1, 0x7FFFFFFF)
+        val capHi = (milliAh ushr 16) and 0xFFFF
+        val capLo = milliAh and 0xFFFF
+        return listOf(
+            buildModbusWriteSingleRequest(0x81, DALY_REMAINING_CAPACITY_HI_REG, capHi),
+            buildModbusWriteSingleRequest(0x81, DALY_REMAINING_CAPACITY_LO_REG, capLo)
+        )
+    }
+
+    private fun socWriteFrame(percent: Double = SERVICE_PACK_SOC_PERCENT): ByteArray {
+        val raw = Math.round(percent * 10.0).toInt().coerceIn(0, 1000)
+        return buildModbusWriteSingleRequest(0x81, TEST_SOC_REGISTER_ADDR, raw)
+    }
+
+    private fun enqueueServiceCapacityWrite(
+        queue: java.util.ArrayDeque<RemoteWriteCommand>,
+        capacityAh: Double,
+        nextId: Int
+    ): Int {
+        if (packGaugeAlreadyProgrammed(capacityAh) && capacityAlreadyMatches(capacityAh)) {
+            upsertServiceWriteResult(
+                ServiceWriteResult(
+                    key = "nominal_capacity",
+                    label = "Номинальная емкость",
+                    expected = capacityAh,
+                    actual = data.remainingAh ?: currentNominalCapacityAh(),
+                    unit = "Ah",
+                    ok = true,
+                    error = null
+                )
+            )
+            return nextId
+        }
+        val milliAh = Math.round(capacityAh * 1000.0).toInt().coerceIn(1, 0x7FFFFFFF)
+        queue.add(
+            RemoteWriteCommand(
+                id = nextId,
+                key = "nominal_capacity",
+                label = "Номинальная емкость",
+                register = DALY_NOMINAL_CAPACITY_HI_REG,
+                rawValue = milliAh,
+                value = capacityAh,
+                scale = 1000.0,
+                offset = 0.0,
+                unit = "Ah",
+                localOnly = true,
+                displayValue = capacityAh,
+                writeFrames = capacityRegisterFrames(capacityAh)
+            )
+        )
+        return nextId + 1
+    }
+
+    private fun enqueueServiceSocWrite(
+        queue: java.util.ArrayDeque<RemoteWriteCommand>,
+        capacityAh: Double,
+        nextId: Int
+    ): Int {
+        if (packGaugeAlreadyProgrammed(capacityAh)) {
+            upsertServiceWriteResult(
+                ServiceWriteResult(
+                    key = "runtime_soc",
+                    label = "SOC",
+                    expected = SERVICE_PACK_SOC_PERCENT,
+                    actual = data.soc,
+                    unit = "%",
+                    ok = true,
+                    error = null
+                )
+            )
+            return nextId
+        }
+        val raw = Math.round(SERVICE_PACK_SOC_PERCENT * 10.0).toInt().coerceIn(0, 1000)
+        queue.add(
+            RemoteWriteCommand(
+                id = nextId,
+                key = "runtime_soc",
+                label = "SOC",
+                register = TEST_SOC_REGISTER_ADDR,
+                rawValue = raw,
+                value = SERVICE_PACK_SOC_PERCENT,
+                scale = 10.0,
+                offset = 0.0,
+                unit = "%",
+                localOnly = true,
+                displayValue = SERVICE_PACK_SOC_PERCENT,
+                writeFrames = listOf(socWriteFrame()) +
+                    remainingCapacityFrames(capacityAh) +
+                    listOf(socWriteFrame())
+            )
+        )
+        return nextId + 1
     }
 
     private fun enqueueSeriesCountWrite(
@@ -2624,6 +2921,91 @@ class MainActivity : ComponentActivity() {
             )
         )
         return nextId + 1
+    }
+
+    private fun orderedTemplateParameters(parameters: List<BmsTemplateParameter>): List<BmsTemplateParameter> {
+        return parameters.sortedBy { parameter ->
+            val index = SERVICE_TEMPLATE_WRITE_ORDER.indexOf(parameter.key)
+            if (index >= 0) index else SERVICE_TEMPLATE_WRITE_ORDER.size
+        }
+    }
+
+    private fun templateParameterWriteFrames(parameter: BmsTemplateParameter, raw: Int): List<ByteArray>? {
+        val write = buildModbusWriteSingleRequest(0x81, parameter.register, raw)
+        return when (parameter.key) {
+            "cell_over_voltage" -> {
+                val side = (raw - 50).coerceIn(0, 0xFFFF)
+                listOf(
+                    buildModbusWriteSingleRequest(0x81, DALY_CELL_OV_ALARM_REG, side),
+                    buildModbusWriteSingleRequest(0x81, DALY_CELL_OV_PROTECT_REG, raw),
+                    buildModbusWriteSingleRequest(0x81, DALY_CELL_OV_RECOVERY_REG, side)
+                )
+            }
+            "soc_calibration_0", "soc_calibration_100" -> listOf(write, write)
+            else -> null
+        }
+    }
+
+    private fun templateParameterWriteCommand(
+        id: Int,
+        parameter: BmsTemplateParameter,
+        expected: Double
+    ): RemoteWriteCommand? {
+        val raw = Math.round((expected - parameter.offset) * parameter.scale).toInt()
+        if (raw < 0 || raw > 0xFFFF) return null
+        return RemoteWriteCommand(
+            id = id,
+            key = parameter.key,
+            label = parameter.label,
+            register = parameter.register,
+            rawValue = raw,
+            value = expected,
+            scale = parameter.scale,
+            offset = parameter.offset,
+            unit = parameter.unit,
+            localOnly = true,
+            writeFrames = templateParameterWriteFrames(parameter, raw)
+        )
+    }
+
+    private fun templateParameterMatches(parameter: BmsTemplateParameter, expected: Double): Boolean {
+        val actual = templateParameterActual(parameter) ?: return false
+        return templateParameterHasActual(parameter) &&
+            kotlin.math.abs(actual - expected) <= parameter.tolerance
+    }
+
+    private fun enqueueServiceTemplateRetryIfNeeded(): Boolean {
+        if (serviceWriteRetryRound >= SERVICE_WRITE_MAX_RETRY_ROUNDS) return false
+        refreshServiceTemplateParamResults()
+        val series = if (serviceTemplateKey == "24v") 8 else 4
+        val family = currentHardwareFamily()
+        val template = try {
+            val fileName = if (serviceTemplateKey == "24v") "service_template_24v.json" else "service_template_12v.json"
+            loadBmsConfigTemplate(fileName)
+        } catch (_: Exception) {
+            return false
+        }
+        val queue = java.util.ArrayDeque<RemoteWriteCommand>()
+        var id = 1000 + serviceWriteRetryRound * 100
+        for (parameter in orderedTemplateParameters(template.parameters)) {
+            if (parameter.key == "series_cell_count") continue
+            if (shouldSkipTemplateParameter(parameter, family)) continue
+            val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
+            if (templateParameterMatches(parameter, expected)) continue
+            val command = templateParameterWriteCommand(id++, parameter, expected) ?: continue
+            queue.add(command)
+        }
+        if (queue.isEmpty()) return false
+        serviceWriteRetryRound++
+        serviceWriteQueue = queue
+        serviceWriteTotal += queue.size
+        serviceWriteActive = true
+        pendingServiceWriteFinalVerify = false
+        updateServiceWriteProgressUi()
+        toast("Повторная запись ${queue.size} параметров по шаблону")
+        val first = serviceWriteQueue.poll()
+        if (first != null) startRemoteWrite(first)
+        return true
     }
 
     private fun templateParameterHasActual(parameter: BmsTemplateParameter): Boolean {
@@ -2689,22 +3071,28 @@ class MainActivity : ComponentActivity() {
         actual: Double?,
         error: String?
     ) {
-        if (command.key != "nominal_capacity" && command.key != "settings_password") {
-            serviceWriteResults += ServiceWriteResult(
-                key = command.key,
-                label = command.label,
-                expected = command.displayValue ?: command.value,
-                actual = actual,
-                unit = command.unit,
-                ok = ok,
-                error = if (ok) null else error
+        if (
+            command.key != "nominal_capacity" &&
+            command.key != "settings_password" &&
+            command.key != "runtime_soc"
+        ) {
+            upsertServiceWriteResult(
+                ServiceWriteResult(
+                    key = command.key,
+                    label = command.label,
+                    expected = command.displayValue ?: command.value,
+                    actual = actual,
+                    unit = command.unit,
+                    ok = ok,
+                    error = if (ok) null else error
+                )
             )
         }
         serviceWriteDone++
         updateServiceWriteProgressUi()
         val next = serviceWriteQueue.poll()
         if (next != null) {
-            mainHandler.postDelayed({ startRemoteWrite(next) }, 120L)
+            mainHandler.postDelayed({ startRemoteWrite(next) }, 400L)
         } else {
             serviceWriteDone = serviceWriteTotal
             updateServiceWriteProgressUi()
@@ -2739,10 +3127,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun finalizeServiceWriteResults() {
+        refreshServiceTemplateParamResults()
         val target = serviceWriteCapacityAh
         if (target != null) {
-            val actual = configCapacityAhFromHiLo(DALY_REMAINING_CAPACITY_HI_REG, DALY_REMAINING_CAPACITY_LO_REG)
+            val remaining = data.remainingAh
+            val settings = configCapacityAhFromHiLo(DALY_REMAINING_CAPACITY_HI_REG, DALY_REMAINING_CAPACITY_LO_REG)
                 ?: configCapacityAhFromHiLo(DALY_NOMINAL_CAPACITY_HI_REG, DALY_NOMINAL_CAPACITY_LO_REG)
+            val actual = remaining ?: settings
+            val ok = remainingMatchesTarget(target) ||
+                (capacityMatchesTarget(target) && runtimeSocIsFull())
             upsertServiceWriteResult(
                 ServiceWriteResult(
                     key = "nominal_capacity",
@@ -2750,8 +3143,19 @@ class MainActivity : ComponentActivity() {
                     expected = target,
                     actual = actual,
                     unit = "Ah",
-                    ok = capacityMatchesTarget(target),
-                    error = if (capacityMatchesTarget(target)) null else "not_confirmed"
+                    ok = ok,
+                    error = if (ok) null else "not_confirmed"
+                )
+            )
+            upsertServiceWriteResult(
+                ServiceWriteResult(
+                    key = "runtime_soc",
+                    label = "SOC",
+                    expected = SERVICE_PACK_SOC_PERCENT,
+                    actual = data.soc,
+                    unit = "%",
+                    ok = runtimeSocIsFull(),
+                    error = if (runtimeSocIsFull()) null else "not_confirmed"
                 )
             )
         }
@@ -2780,6 +3184,37 @@ class MainActivity : ComponentActivity() {
                 error = if (data.cellCount == expectedSeries) null else "not_confirmed"
             )
         )
+    }
+
+    private fun refreshServiceTemplateParamResults() {
+        val series = if (serviceTemplateKey == "24v") 8 else 4
+        val family = currentHardwareFamily()
+        val template = try {
+            val fileName = if (serviceTemplateKey == "24v") "service_template_24v.json" else "service_template_12v.json"
+            loadBmsConfigTemplate(fileName)
+        } catch (_: Exception) {
+            return
+        }
+        for (parameter in template.parameters) {
+            if (parameter.key == "series_cell_count") continue
+            if (shouldSkipTemplateParameter(parameter, family)) continue
+            val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
+            val actual = templateParameterActual(parameter)
+            val hasActual = templateParameterHasActual(parameter)
+            val ok = hasActual && actual != null &&
+                kotlin.math.abs(actual - expected) <= parameter.tolerance
+            upsertServiceWriteResult(
+                ServiceWriteResult(
+                    key = parameter.key,
+                    label = parameter.label,
+                    expected = expected,
+                    actual = actual,
+                    unit = parameter.unit,
+                    ok = ok,
+                    error = if (ok) null else "not_confirmed"
+                )
+            )
+        }
     }
 
     private fun upsertServiceWriteResult(result: ServiceWriteResult) {
@@ -2830,7 +3265,7 @@ class MainActivity : ComponentActivity() {
             put("items", items)
         }
         thread {
-            adminJsonRequest("POST", LOCAL_SERVICE_REPORT_PATH, body)
+            adminJsonRequest("POST", SERVICE_REPORT_PATH, body)
         }
     }
 
@@ -2971,8 +3406,8 @@ class MainActivity : ComponentActivity() {
                 "Номинальная емкость" to nominalCapacityText(),
                 "Время ожидания сна" to regText(0x0115, 0.1, "S"),
                 "Настройка SOC" to fmtPct(data.soc),
-                "Калибр. SOC 0" to dlUnsupportedOr(regText(0x01C7, 1000.0, "V")),
-                "Калибр. SOC 100" to dlUnsupportedOr(regText(0x0229, 1000.0, "V")),
+                "Калибр. SOC 0" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_0_REG, 1000.0, "V")),
+                "Калибр. SOC 100" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V")),
                 "Переключатель зарядки" to mosText(data.chargeMos),
                 "Переключатель разрядки" to mosText(data.dischargeMos),
                 "Изменить пароль настроек" to "только чтение",
@@ -3153,8 +3588,8 @@ class MainActivity : ComponentActivity() {
                 "Номинальная емкость" to nominalCapacityText(),
                 "Время ожидания сна" to regText(0x0115, 0.1, "S"),
                 "Настройка SOC" to fmtPct(data.soc),
-                "Калибр. SOC 0" to dlUnsupportedOr(regText(0x01C7, 1000.0, "V")),
-                "Калибр. SOC 100" to dlUnsupportedOr(regText(0x0229, 1000.0, "V")),
+                "Калибр. SOC 0" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_0_REG, 1000.0, "V")),
+                "Калибр. SOC 100" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V")),
                 "Адрес подчиненной платы" to regText(0x020F, null, ""),
                 "Тип инвертора" to "не проверяется",
                 "Способ связи" to "не проверяется",
@@ -4319,7 +4754,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun adminServerBaseUrl(): String {
-        val saved = serverPrefs.getString("base_url", DEFAULT_ADMIN_SERVER_BASE_URL).orEmpty()
+        if (isServiceApp()) {
+            return normalizeAdminServerBaseUrl(BmsApiConfig.BASE_URL)
+        }
+        val saved = serverPrefs.getString("base_url", BmsApiConfig.BASE_URL).orEmpty()
         val normalized = normalizeAdminServerBaseUrl(saved)
         if (normalized != saved.trim().trimEnd('/')) {
             serverPrefs.edit().putString("base_url", normalized).apply()
@@ -4328,6 +4766,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveAdminServerBaseUrl(input: String) {
+        if (isServiceApp()) return
         serverPrefs.edit()
             .putString("base_url", normalizeAdminServerBaseUrl(input))
             .apply()
@@ -4356,7 +4795,7 @@ class MainActivity : ComponentActivity() {
     private fun normalizeAdminServerBaseUrl(input: String): String {
         var value = input.trim()
         if (value.isBlank() || isLegacyLocalAdminServerUrl(value)) {
-            value = DEFAULT_ADMIN_SERVER_BASE_URL
+            value = BmsApiConfig.BASE_URL
         }
         if (!value.startsWith("http://", ignoreCase = true) &&
             !value.startsWith("https://", ignoreCase = true)
@@ -4446,12 +4885,12 @@ class MainActivity : ComponentActivity() {
         val email = field("Email", prefs.getString("email", "") ?: "", "name@example.ru")
         val birth = field("Дата рождения", prefs.getString("birth", "") ?: "", "ДД.ММ.ГГГГ")
         val adminServerUrl = field(
-            "Адрес локальной админки",
+            "Адрес сервера",
             adminServerBaseUrl(),
             DEFAULT_ADMIN_SERVER_BASE_URL
         )
         profileCard.addView(TextView(this).apply {
-            text = "Телеметрия BMS будет отправляться на этот компьютер по адресу ${LOCAL_UPLOAD_PATH}. Если работаете с другого ПК, поменяйте IP и нажмите «Сохранить»."
+            text = "Телеметрия BMS отправляется на сервер по адресу ${UPLOAD_PATH}. Обычно менять не нужно."
             textSize = 12f
             setTextColor(Color.rgb(111, 119, 129))
             setPadding(0, dp(8), 0, 0)
@@ -4470,7 +4909,7 @@ class MainActivity : ComponentActivity() {
                     .putString("email", email.text.toString())
                     .putString("birth", birth.text.toString()).apply()
                 saveAdminServerBaseUrl(adminServerUrl.text.toString())
-                toast("Профиль и адрес админки сохранены")
+                toast("Профиль и адрес сервера сохранены")
             }
         }, marginLp(-1, dp(54), 0, 14, 0, 0))
         scroll.addView(content)
@@ -4517,23 +4956,7 @@ class MainActivity : ComponentActivity() {
         }
         profileCard.addView(name, LinearLayout.LayoutParams(-1, dp(52)))
         profileCard.addView(TextView(this).apply {
-            text = "Адрес локальной админки"
-            textSize = 12f
-            typeface = interFont(700)
-            setTextColor(Color.rgb(111, 119, 129))
-            setPadding(0, dp(12), 0, dp(5))
-        })
-        val adminServerUrl = EditText(this).apply {
-            setText(adminServerBaseUrl())
-            hint = DEFAULT_ADMIN_SERVER_BASE_URL
-            textSize = 15f
-            setSingleLine(true)
-            setPadding(dp(12), 0, dp(12), 0)
-            background = round(Color.rgb(246, 247, 249), dp(12), Color.rgb(223, 229, 235), 1)
-        }
-        profileCard.addView(adminServerUrl, LinearLayout.LayoutParams(-1, dp(52)))
-        profileCard.addView(TextView(this).apply {
-            text = "Телеметрия уходит на этот компьютер даже без имени сборщика. Имя нужно только когда записываете шаблон 12В/24В."
+            text = "Имя сборщика нужно только при записи шаблона 12В/24В. Телеметрия на сервер уходит и без имени."
             textSize = 12f
             setTextColor(Color.rgb(111, 119, 129))
             setPadding(0, dp(8), 0, 0)
@@ -4549,16 +4972,22 @@ class MainActivity : ComponentActivity() {
             setOnClickListener {
                 val assembler = name.text.toString().trim()
                 servicePrefs.edit().putString("assembler_name", assembler).apply()
-                saveAdminServerBaseUrl(adminServerUrl.text.toString())
                 toast(
                     if (assembler.isBlank()) {
-                        "Адрес сохранён. Имя сборщика нужно только для записи шаблона."
+                        "Имя сборщика нужно только для записи шаблона."
                     } else {
                         "Профиль сборщика сохранён"
                     }
                 )
             }
         }, marginLp(-1, dp(54), 0, 14, 0, 0))
+        content.addView(TextView(this).apply {
+            text = "Версия ${BuildConfig.VERSION_NAME}"
+            gravity = Gravity.CENTER
+            textSize = 13f
+            typeface = interFont(600)
+            setTextColor(Color.rgb(111, 119, 129))
+        }, marginLp(-1, -2, 0, 16, 0, 0))
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(fixedBottomNav("profile"), LinearLayout.LayoutParams(-1, dp(70)))
@@ -5089,7 +5518,7 @@ class MainActivity : ComponentActivity() {
         payload.put("bms_uid", bmsUid())
         payload.put("bluetooth_name", dalyBluetoothDeviceId())
         payload.put("bluetooth_address", selectedAddress ?: "")
-        payload.put("app_version", "v57-step-soc-write")
+        payload.put("app_version", APP_VERSION)
         payload.put("battery_snapshot", buildUploadJson())
         if (configRegisters.isNotEmpty()) payload.put("config_snapshot", buildConfigUploadJson())
 
@@ -5657,6 +6086,11 @@ class MainActivity : ComponentActivity() {
         polling = false
         pollLoopToken++
         resetRemoteWriteState()
+        qtcDbJobToken++
+        if (isServiceApp()) {
+            qtcDbStatus = QtcDbStatus.WAITING_BMS
+            qtcDbError = ""
+        }
         bluetoothGatt?.disconnect()
         bluetoothGatt?.close()
         bluetoothGatt = null
@@ -6654,7 +7088,10 @@ class MainActivity : ComponentActivity() {
         return if (ah > 0.0 && ah < 5000.0) ah else null
     }
 
-    private fun capacityMatchesTarget(targetAh: Double, tolerance: Double = 0.6): Boolean {
+    private fun capacityMatchesTarget(
+        targetAh: Double,
+        tolerance: Double = SERVICE_CAPACITY_TOLERANCE_AH
+    ): Boolean {
         for (pair in listOf(
             DALY_NOMINAL_CAPACITY_HI_REG to DALY_NOMINAL_CAPACITY_LO_REG,
             DALY_REMAINING_CAPACITY_HI_REG to DALY_REMAINING_CAPACITY_LO_REG
@@ -6698,8 +7135,22 @@ class MainActivity : ComponentActivity() {
         return data.estimatedFullAh
     }
 
+    private fun remainingMatchesTarget(targetAh: Double): Boolean {
+        val rem = data.remainingAh ?: return false
+        return kotlin.math.abs(rem - targetAh) <= SERVICE_CAPACITY_TOLERANCE_AH
+    }
+
+    private fun runtimeSocIsFull(): Boolean {
+        val soc = data.soc ?: return false
+        return soc >= SERVICE_PACK_SOC_PERCENT - SERVICE_SOC_TOLERANCE_PERCENT
+    }
+
+    private fun packGaugeAlreadyProgrammed(targetAh: Double): Boolean {
+        return remainingMatchesTarget(targetAh) && runtimeSocIsFull()
+    }
+
     private fun capacityAlreadyMatches(targetAh: Double): Boolean {
-        fun close(v: Double?) = v != null && kotlin.math.abs(v - targetAh) <= 0.6
+        fun close(v: Double?) = v != null && kotlin.math.abs(v - targetAh) <= SERVICE_CAPACITY_TOLERANCE_AH
         return close(configCapacityAhFromHiLo(DALY_REMAINING_CAPACITY_HI_REG, DALY_REMAINING_CAPACITY_LO_REG)) &&
             close(configCapacityAhFromHiLo(DALY_NOMINAL_CAPACITY_HI_REG, DALY_NOMINAL_CAPACITY_LO_REG))
     }
@@ -6710,12 +7161,16 @@ class MainActivity : ComponentActivity() {
         }
         if (command.key == "nominal_capacity") {
             val target = command.displayValue ?: serviceWriteCapacityAh ?: return false
-            return capacityAlreadyMatches(target)
+            return packGaugeAlreadyProgrammed(target) && capacityAlreadyMatches(target)
+        }
+        if (command.key == "runtime_soc") {
+            val target = serviceWriteCapacityAh ?: return false
+            return packGaugeAlreadyProgrammed(target)
         }
         val raw = configRegisters[command.register] ?: return false
         if (raw == command.rawValue) return true
         val actual = (raw.toDouble() / command.scale) + command.offset
-        return kotlin.math.abs(actual - command.value) <= 0.05
+        return kotlin.math.abs(actual - command.value) < 0.005
     }
 
     private fun advertisedBluetoothName(): String {
@@ -6987,7 +7442,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun currentUploadStatusText(): String {
-        return "$lastUploadStatus\n${adminServerBaseUrl()}$LOCAL_UPLOAD_PATH"
+        return if (isServiceApp()) lastUploadStatus
+        else "$lastUploadStatus\n${adminServerBaseUrl()}$UPLOAD_PATH"
     }
 
     private fun refreshUploadStatusUi() {
@@ -7022,7 +7478,8 @@ class MainActivity : ComponentActivity() {
                     "Сервер ответил HTTP $code"
                 }
             } catch (e: Exception) {
-                "Нет связи с ${adminServerBaseUrl()}: ${e.message ?: e.toString()}"
+                if (isServiceApp()) "Нет связи с сервером"
+                else "Нет связи с ${adminServerBaseUrl()}: ${e.message ?: e.toString()}"
             }
             lastUploadStatus = message
             runOnUiThread {
@@ -7039,57 +7496,40 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis()
         if (!force && now - lastUploadAt < UPLOAD_INTERVAL_MS) return
 
-        val payload = buildUploadJson()
         uploading = true
         lastUploadStatus = "Отправка..."
         refreshUploadStatusUi()
 
         thread {
-            var statusMessage = ""
-            var ok = false
-            try {
-                val conn = (URL(adminServerUrl(LOCAL_UPLOAD_PATH)).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    connectTimeout = 8000
-                    readTimeout = 8000
-                    doOutput = true
-                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                    setRequestProperty("Accept", "application/json")
-                    applyBmsApiAuth(this)
-                }
-
-                conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-
-                val code = conn.responseCode
-                val response = try {
-                    if (code in 200..299) conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
-                    else conn.errorStream?.bufferedReader(Charsets.UTF_8)?.readText() ?: ""
-                } catch (_: Exception) {
-                    ""
-                }
-
-                if (code in 200..299 && response.contains("\"ok\":true")) {
-                    ok = true
-                    lastUploadAt = System.currentTimeMillis()
-                    val logId = Regex("\"log_id\"\\s*:\\s*(\\d+)").find(response)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                    lastLogId = logId
-                    statusMessage = "Успешно отправлено${logId?.let { ", log_id=$it" } ?: ""}"
-                } else {
-                    statusMessage = "Ошибка сервера HTTP $code: ${response.take(160)}"
-                }
-                conn.disconnect()
-            } catch (e: Exception) {
-                statusMessage = "Ошибка отправки: ${e.message ?: e.toString()}"
-            } finally {
-                uploading = false
-                lastUploadStatus = statusMessage
-                runOnUiThread {
-                    refreshUploadStatusUi()
-                    if (force || (isServiceApp() && !ok)) toast(lastUploadStatus)
-                    if (screenState == "journal") showJournalScreen()
-                }
+            val result = postCurrentTelemetry()
+            uploading = false
+            lastUploadStatus = result.message
+            runOnUiThread {
+                refreshUploadStatusUi()
+                if (force || (isServiceApp() && !result.ok)) toast(lastUploadStatus)
+                if (screenState == "journal") showJournalScreen()
             }
         }
+    }
+
+    private data class TelemetryPostResult(val ok: Boolean, val message: String)
+
+    private fun postCurrentTelemetry(): TelemetryPostResult {
+        val json = adminJsonRequest("POST", UPLOAD_PATH, buildUploadJson())
+        if (json != null && json.optBoolean("ok")) {
+            lastUploadAt = System.currentTimeMillis()
+            val logId = json.optInt("log_id", 0).takeIf { it > 0 }
+            lastLogId = logId
+            return TelemetryPostResult(true, "Успешно отправлено${logId?.let { ", log_id=$it" } ?: ""}")
+        }
+        val error = json?.optString("error").orEmpty()
+        val message = when {
+            json == null -> "Нет связи с сервером"
+            error == "unauthorized" -> "Нет связи с сервером"
+            error.isNotBlank() -> "Ошибка сервера: $error"
+            else -> "Нет связи с сервером"
+        }
+        return TelemetryPostResult(false, message)
     }
 
     private fun originalDalyConfigReadRequests(): List<ConfigReadRequest> {
@@ -7107,7 +7547,8 @@ class MainActivity : ComponentActivity() {
             ConfigReadRequest("dl_settings_0151_0177", 0x81, 0x0151, 0x27),
             ConfigReadRequest("dl_settings_01C3_0212", 0x81, 0x01C3, 0x50),
             ConfigReadRequest("dl_balance_0220_022A", 0x81, 0x0220, 0x0B),
-            ConfigReadRequest("dl_soc100_0229", 0x81, 0x0229, 0x01),
+            ConfigReadRequest("dl_soc0_0227", 0x81, DALY_SOC_CALIBRATION_0_REG, 0x01),
+            ConfigReadRequest("dl_soc100_0229", 0x81, DALY_SOC_CALIBRATION_100_REG, 0x01),
             ConfigReadRequest("dl_comm_024B_024C", 0x81, 0x024B, 0x02)
         )
     }
@@ -7271,7 +7712,10 @@ class MainActivity : ComponentActivity() {
             completeServiceWriteStep(command, false, null, "no_ble")
             return
         }
-        if (remoteWriteAlreadyMatches(command)) {
+        if (
+            remoteWriteAlreadyMatches(command) &&
+            command.key in setOf("nominal_capacity", "runtime_soc", "settings_password", "series_cell_count")
+        ) {
             completeServiceWriteStep(
                 command,
                 true,
@@ -7288,6 +7732,7 @@ class MainActivity : ComponentActivity() {
         remoteWriteInProgress = true
         pendingRemoteWrite = command
         pollLoopToken++
+        toast("Запись: ${command.label} = ${formatTemplateNumber(command.displayValue ?: command.value)} ${command.unit}".trim())
 
         val timeFrame = buildDalyTimeFrame()
         val openFrame = buildModbusWriteSingleRequest(0x81, 0x0174, 0x00A2)
@@ -7295,29 +7740,54 @@ class MainActivity : ComponentActivity() {
             buildModbusWriteSingleRequest(0x81, command.register, command.rawValue)
         )
 
+        fun afterFramesWritten() {
+            if (command.key == "nominal_capacity" || command.key == "runtime_soc") {
+                probeRuntimeGauge {
+                    remoteWriteInProgress = false
+                    pendingRemoteWrite = null
+                    val actual = if (command.key == "runtime_soc") data.soc else data.remainingAh
+                    completeServiceWriteStep(command, true, actual, null)
+                }
+                return
+            }
+            remoteWriteInProgress = false
+            pendingRemoteWrite = null
+            completeServiceWriteStep(command, true, command.displayValue ?: command.value, null)
+        }
+
         fun writeFrameAt(index: Int) {
             if (index >= writeFrames.size) {
-                remoteWriteInProgress = false
-                pendingRemoteWrite = null
-                completeServiceWriteStep(
-                    command,
-                    true,
-                    command.displayValue ?: command.value,
-                    null
-                )
+                writeBleFrame(openFrame)
+                mainHandler.postDelayed({ afterFramesWritten() }, 200L)
                 return
             }
             writeBleFrame(timeFrame)
             mainHandler.postDelayed({
-                writeBleFrame(writeFrames[index])
+                writeBleFrame(openFrame)
                 mainHandler.postDelayed({
-                    writeBleFrame(openFrame)
-                    mainHandler.postDelayed({ writeFrameAt(index + 1) }, 120L)
-                }, 120L)
-            }, 80L)
+                    if (!writeBleFrame(writeFrames[index])) {
+                        remoteWriteInProgress = false
+                        pendingRemoteWrite = null
+                        completeServiceWriteStep(command, false, null, "ble_write_failed")
+                        return@postDelayed
+                    }
+                    mainHandler.postDelayed({ writeFrameAt(index + 1) }, 200L)
+                }, 250L)
+            }, 140L)
         }
 
         writeFrameAt(0)
+    }
+
+    private fun probeRuntimeGauge(done: () -> Unit) {
+        writeBleFrame(buildRequest(0x90))
+        mainHandler.postDelayed({
+            writeBleFrame(buildRequest(0x93))
+            mainHandler.postDelayed({
+                updateDerived()
+                done()
+            }, 450L)
+        }, 220L)
     }
 
     @SuppressLint("MissingPermission")
@@ -7373,10 +7843,17 @@ class MainActivity : ComponentActivity() {
         }
         val raw = configRegisters[command.register]
         val actual = raw?.let { (it.toDouble() / command.scale) + command.offset }
-        val ok = raw != null && (
-            raw == command.rawValue ||
-                (actual != null && kotlin.math.abs(actual - command.value) <= 0.05)
-            )
+        val ok = if (command.localOnly) {
+            raw != null && (
+                raw == command.rawValue ||
+                    (actual != null && kotlin.math.abs(actual - command.value) < 0.005)
+                )
+        } else {
+            raw != null && (
+                raw == command.rawValue ||
+                    (actual != null && kotlin.math.abs(actual - command.value) <= 0.05)
+                )
+        }
         configRaw["remote_write_verify"] = if (ok) {
             "OK raw=$raw actual=$actual"
         } else {
@@ -7647,12 +8124,15 @@ class MainActivity : ComponentActivity() {
             }
 
             if (pendingServiceWriteFinalVerify) {
-                finishServiceBatchWrite()
-                mainHandler.postDelayed({
-                    rememberCurrentBmsState()
-                    uploadConfigSnapshot(force = true)
-                }, 1200)
-                mainHandler.postDelayed({ pollOnce() }, 800)
+                probeRuntimeGauge {
+                    if (enqueueServiceTemplateRetryIfNeeded()) return@probeRuntimeGauge
+                    finishServiceBatchWrite()
+                    mainHandler.postDelayed({
+                        rememberCurrentBmsState()
+                        uploadConfigSnapshot(force = true)
+                    }, 1200)
+                    mainHandler.postDelayed({ pollOnce() }, 800)
+                }
                 return
             }
 
@@ -7857,7 +8337,7 @@ class MainActivity : ComponentActivity() {
 
         thread {
             try {
-                val conn = (URL(adminServerUrl(LOCAL_CONFIG_UPLOAD_PATH)).openConnection() as HttpURLConnection).apply {
+                val conn = (URL(adminServerUrl(CONFIG_UPLOAD_PATH)).openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     connectTimeout = 8000
                     readTimeout = 8000
@@ -8004,8 +8484,8 @@ class MainActivity : ComponentActivity() {
         general.put("Источник емкости", nominalCapacitySource())
         general.put("Время ожидания сна", regText(0x0115, 0.1, "S"))
         general.put("Настройка SOC", currentSocTextForConfig())
-        general.put("Калибр. SOC 0", regText(0x01C7, 1000.0, "V"))
-        general.put("Калибр. SOC 100", regText(0x0229, 1000.0, "V"))
+        general.put("Калибр. SOC 0", regText(DALY_SOC_CALIBRATION_0_REG, 1000.0, "V"))
+        general.put("Калибр. SOC 100", regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V"))
         general.put("Переключатель зарядки", currentChargeMosTextForConfig())
         general.put("Переключатель разрядки", currentDischargeMosTextForConfig())
         general.put("Отправить данные в облако", "OFF")
@@ -8019,8 +8499,8 @@ class MainActivity : ComponentActivity() {
         general.put("sleep_time_s_num", configRegScaled(0x0115, 0.1) ?: JSONObject.NULL)
         general.put("soc_percent", currentSocTextForConfig())
         general.put("soc_percent_num", data.soc ?: lastKnownSoc ?: JSONObject.NULL)
-        general.put("soc_calibration_0_v", regText(0x01C7, 1000.0, "V"))
-        general.put("soc_calibration_100_v", regText(0x0229, 1000.0, "V"))
+        general.put("soc_calibration_0_v", regText(DALY_SOC_CALIBRATION_0_REG, 1000.0, "V"))
+        general.put("soc_calibration_100_v", regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V"))
         general.put("charge_mos_state_from_0x93", currentChargeMosTextForConfig())
         general.put("discharge_mos_state_from_0x93", currentDischargeMosTextForConfig())
         general.put("charge_mos_state_num", mosStateNumForSite(currentChargeMosTextForConfig()))
@@ -8088,7 +8568,7 @@ class MainActivity : ComponentActivity() {
         val balancing = JSONObject()
 
         // Живые уставки балансировки: старт 0x011A (мВ), разность 0x011B (мВ).
-        // 0x0227 на этой BMS фиксированно 2.5 В, 0x01FA пустой, 0x0156 — чужой регистр (15).
+        // SOC 0% — 0x0227 (завод 2.7 В), SOC 100% — 0x0229. 0x01C7 — отключение (~2.2 В), не калибровка SOC.
         balancing.put("Напряжение включения балансировки", regVoltageOneDecimal(0x011A))
         balancing.put("Напряжение отключения балансировки", regText(0x01FB, 1000.0, "V"))
         balancing.put("Перепад напряжения при открытии балансировки", regText(0x011B, null, "mV"))
@@ -8114,8 +8594,8 @@ class MainActivity : ComponentActivity() {
         cellParams.put("Источник емкости", nominalCapacitySource())
         cellParams.put("Время ожидания сна", regText(0x0115, 0.1, "S"))
         cellParams.put("Настройка SOC", currentSocTextForConfig())
-        cellParams.put("Калибр. SOC 0", regText(0x01C7, 1000.0, "V"))
-        cellParams.put("Калибр. SOC 100", regText(0x0229, 1000.0, "V"))
+        cellParams.put("Калибр. SOC 0", regText(DALY_SOC_CALIBRATION_0_REG, 1000.0, "V"))
+        cellParams.put("Калибр. SOC 100", regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V"))
         cellParams.put("Адрес подчиненной платы", regText(0x020F, null, ""))
         cellParams.put("Тип инвертора", regText(0x024B, null, ""))
         cellParams.put("Способ связи", regText(0x024C, null, ""))
@@ -8128,8 +8608,8 @@ class MainActivity : ComponentActivity() {
         cellParams.put("daly_raw_capacity_registers", rawCapacityRegistersJson())
         cellParams.put("sleep_time_s", regText(0x0115, 0.1, "S"))
         cellParams.put("soc_percent", currentSocTextForConfig())
-        cellParams.put("soc_calibration_0_v", regText(0x01C7, 1000.0, "V"))
-        cellParams.put("soc_calibration_100_v", regText(0x0229, 1000.0, "V"))
+        cellParams.put("soc_calibration_0_v", regText(DALY_SOC_CALIBRATION_0_REG, 1000.0, "V"))
+        cellParams.put("soc_calibration_100_v", regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V"))
         cellParams.put("slave_board_address", regText(0x020F, null, ""))
         cellParams.put("inverter_type", regText(0x024B, null, ""))
         cellParams.put("communication_method", regText(0x024C, null, ""))

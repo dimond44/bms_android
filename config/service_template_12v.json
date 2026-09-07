@@ -1,6 +1,6 @@
 {
   "id": "liferych-lfp-12v",
-  "version": 2,
+  "version": 3,
   "chemistry": "LiFePO4",
   "series_count": 4,
   "pack_voltage": 12,
@@ -31,7 +31,7 @@
     {
       "key": "soc_calibration_0",
       "label": "Калибровка SOC 0%",
-      "register": "0x01C7",
+      "register": "0x0227",
       "scale": 1000,
       "offset": 0,
       "unit": "V",

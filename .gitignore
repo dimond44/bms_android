@@ -9,8 +9,4 @@ captures/
 .cxx/
 app/build/
 .tools/
-server/node_modules/
-server/data/*
-!server/data/bms.sqlite
-server/.env
 

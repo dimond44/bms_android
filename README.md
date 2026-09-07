@@ -24,17 +24,48 @@
 
 В Android Studio: **Build → Build App Bundle(s) / APK(s) → Build APK(s)**.
 
-Готовый файл появится в `app/build/outputs/apk/debug/app-debug.apk`.
+Или из терминала:
+
+```bash
+./gradlew assembleUserDebug assembleServiceDebug
+```
+
+Готовый файл появится в `app/build/outputs/apk/user/debug/` или `app/build/outputs/apk/service/debug/`.
+
+### Публикация в АРМ (раздел ПО)
+
+После сборки скопируйте актуальные APK в АРМ:
+
+```bash
+./scripts/build-and-publish.sh -m "краткое описание; ещё пункт"
+```
+
+Скрипт собирает user+service debug APK и вызывает `publish-to-arm.sh`. Можно сначала собрать вручную, затем опубликовать:
+
+```bash
+./gradlew assembleUserDebug assembleServiceDebug
+./scripts/publish-to-arm.sh -m "краткое описание; ещё пункт"
+```
+
+Скрипт читает версию из `app/build.gradle.kts`, кладёт APK в `/srv/projects/arm-liferych/public/releases/` и обновляет `software-releases.json`. В АРМ откройте раздел **ПО**.
 
 Проект использует JDK 17, Android Gradle Plugin 8.7.3, Kotlin 2.0.21, `compileSdk 35` и `minSdk 23`.
 
 ## Важное перед выпуском
 
-В `MainActivity.kt` пока сохранены тестовый API-ключ и HTTP-адрес существующего сервера из исходного проекта. Перед публикацией замените ключ, настройте HTTPS и вынесите секрет из исходного кода.
+API-ключ BMS задаётся в `local.properties` (`BMS_API_KEY`). Адрес сервера по умолчанию — `http://5.3.87.2:3101`. Перед публикацией настройте HTTPS и не коммитьте секреты.
+
+## Сборки
+
+- клиент: `userDebug` / `userRelease` (`ru.liferych.bms`);
+- сервис: `serviceDebug` / `serviceRelease` (`ru.liferych.bms.service`).
+
+Текущая версия: **0.2.43** (`versionCode` 103).
 
 ## Основные файлы
 
 - `app/src/main/java/ru/liferych/bms/MainActivity.kt` — интерфейс, BLE и протокол Daly;
 - `app/src/main/AndroidManifest.xml` — разрешения Bluetooth, интернет и медиа;
 - `app/src/main/res/drawable/` — логотипы и значок приложения;
-- `app/build.gradle.kts` — параметры Android-приложения.
+- `app/build.gradle.kts` — параметры Android-приложения;
+- `config/` — шаблоны конфигурации BMS.
