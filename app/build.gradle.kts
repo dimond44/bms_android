@@ -21,8 +21,9 @@ android {
         applicationId = "ru.liferych.bms"
         minSdk = 23
         targetSdk = 35
-        versionCode = 103
-        versionName = "0.2.43"
+        // Базовые значения; фактические версии задаются в productFlavors отдельно.
+        versionCode = 1
+        versionName = "0.0.0"
         buildConfigField("String", "BMS_API_KEY", "\"${bmsApiKey.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
     }
 
@@ -36,12 +37,16 @@ android {
             dimension = "role"
             isDefault = true
             applicationId = "ru.liferych.bms"
+            versionCode = 106
+            versionName = "0.2.46"
             resValue("string", "app_name", "ЛИФЕРЫЧ BMS")
             buildConfigField("boolean", "IS_SERVICE", "false")
         }
         create("service") {
             dimension = "role"
             applicationId = "ru.liferych.bms.service"
+            versionCode = 104
+            versionName = "0.2.44"
             resValue("string", "app_name", "ЛИФЕРЫЧ Сервис")
             buildConfigField("boolean", "IS_SERVICE", "true")
         }

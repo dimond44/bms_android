@@ -58,11 +58,8 @@ private const val DEFAULT_ADMIN_SERVER_BASE_URL = BmsApiConfig.BASE_URL
 private const val UPLOAD_PATH = "/api/upload.php"
 private const val CONFIG_UPLOAD_PATH = "/api/config_upload.php"
 private const val SERVICE_REPORT_PATH = "/api/v1/service-report"
-private const val SERVER_WARRANTY_URL = "http://dimond44.xsph.ru/api/warranty_submit.php"
-private const val SERVER_WARRANTY_LIST_URL = "http://dimond44.xsph.ru/api/warranty_list.php"
-private const val SERVER_WARRANTY_UPDATE_URL = "http://dimond44.xsph.ru/api/warranty_update.php"
-/** Ключ только для warranty PHP на xsph.ru, не для BMS API. */
-private const val WARRANTY_API_KEY = "change_me_api_key_2026"
+private const val WARRANTY_SUBMIT_PATH = "/api/warranty_submit.php"
+private const val WARRANTY_LIST_PATH = "/api/warranty_list.php"
 private val APP_VERSION = BuildConfig.VERSION_NAME
 private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
@@ -98,6 +95,8 @@ private const val DALY_CELL_OV_PROTECT_REG = 0x0131
 private const val DALY_CELL_OV_RECOVERY_REG = 0x0132
 private const val SERVICE_SETTINGS_PASSWORD = "113355"
 private const val SERVICE_WRITE_MAX_RETRY_ROUNDS = 1
+private const val SERVICE_WRITE_VERIFY_MAX_ATTEMPTS = 2
+private const val SERVICE_WRITE_VERIFY_RETRY_DELAY_MS = 700L
 private val SERVICE_TEMPLATE_WRITE_ORDER = listOf(
     "sleep_timeout",
     "cell_over_voltage",
@@ -181,7 +180,8 @@ data class RemoteWriteCommand(
     val unit: String,
     val localOnly: Boolean = false,
     val displayValue: Double? = null,
-    val writeFrames: List<ByteArray>? = null
+    val writeFrames: List<ByteArray>? = null,
+    var verifyAttempt: Int = 0
 )
 
 data class ServiceWriteResult(
@@ -402,6 +402,8 @@ class MainActivity : ComponentActivity() {
     private val batteryPrefs by lazy {
         getSharedPreferences("saved_batteries", MODE_PRIVATE)
     }
+    /** Только для сервисного приложения: список АКБ текущей сессии (не сохраняется). */
+    private val sessionBatteries: MutableList<SavedBattery> = mutableListOf()
     private val serverPrefs by lazy {
         getSharedPreferences("admin_server_settings", MODE_PRIVATE)
     }
@@ -584,7 +586,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         configPrefs = getSharedPreferences(CONFIG_PREFS_NAME, MODE_PRIVATE)
         supportPrefs = getSharedPreferences("warranty_requests_cache", MODE_PRIVATE)
-        ensureTestBattery()
+        if (isServiceApp()) {
+            // Старый persistent-список сервисного приложения больше не используем.
+            batteryPrefs.edit().clear().apply()
+            sessionBatteries.clear()
+        } else {
+            removeTestBatteryIfPresent()
+        }
         val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = manager.adapter
         requestBlePermissions()
@@ -1210,9 +1218,7 @@ class MainActivity : ComponentActivity() {
             contentDescription = "Добавить батарею"
             background = round(Color.rgb(246, 247, 249), dp(19), Color.rgb(223, 229, 235), 1)
             setOnClickListener {
-                disconnectGatt()
-                showSearchScreen()
-                startScan()
+                beginAddBatteryFlow()
             }
         }, LinearLayout.LayoutParams(dp(38), dp(38)))
         root.addView(top, LinearLayout.LayoutParams(-1, dp(74)))
@@ -1223,41 +1229,11 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(16), 0, dp(16), dp(14))
         }
         content.addView(TextView(this).apply {
-            text = "Мои батареи"
+            text = if (isServiceApp()) "Рабочие АКБ" else "Мои батареи"
             textSize = 22f
             setTextColor(Color.rgb(16, 17, 20))
             typeface = interFont(750)
         }, marginLp(-1, -2, 0, 4, 0, 14))
-        content.addView(TextView(this).apply {
-            text = "Добавленные устройства"
-            textSize = 13f
-            setTextColor(Color.rgb(16, 17, 20))
-            typeface = interFont(760)
-        }, marginLp(-1, -2, 0, 0, 0, 8))
-
-        val saved = loadSavedBatteries()
-        saved.forEach { battery ->
-            content.addView(savedBatteryCard(battery), marginLp(-1, -2, 0, 0, 0, 10))
-        }
-
-        if (saved.isEmpty()) {
-            content.addView(TextView(this).apply {
-                text = "Сохранённых батарей пока нет"
-                textSize = 15f
-                gravity = Gravity.CENTER
-                setTextColor(Color.rgb(111, 119, 129))
-                background = round(Color.rgb(246, 247, 249), dp(16), Color.rgb(223, 229, 235), 1)
-                setPadding(dp(16), dp(24), dp(16), dp(24))
-            }, marginLp(-1, -2, 0, 0, 0, 10))
-        }
-
-        content.addView(TextView(this).apply {
-            text = "Нажмите на батарею, чтобы открыть её параметры. Удерживайте карточку, чтобы задать имя. Если батарей ещё нет, нажмите кнопку ниже."
-            textSize = 12f
-            setTextColor(Color.rgb(111, 119, 129))
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = round(Color.rgb(251, 251, 252), dp(14), Color.rgb(202, 211, 220), 1)
-        }, marginLp(-1, -2, 0, 2, 0, 10))
 
         val addButton = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -1277,7 +1253,7 @@ class MainActivity : ComponentActivity() {
                 background = round(Color.argb(120, 255, 255, 255), dp(11), Color.rgb(210, 180, 60), 1)
             }, LinearLayout.LayoutParams(dp(36), dp(36)))
             addView(TextView(this@MainActivity).apply {
-                text = "ДОБАВИТЬ БАТАРЕЮ"
+                text = if (isServiceApp()) "+ ДОБАВИТЬ АКБ" else "ДОБАВИТЬ БАТАРЕЮ"
                 textSize = 15f
                 gravity = Gravity.CENTER
                 setTextColor(Color.rgb(16, 17, 20))
@@ -1285,14 +1261,55 @@ class MainActivity : ComponentActivity() {
             }, LinearLayout.LayoutParams(0, -1, 1f))
             addView(Space(this@MainActivity), LinearLayout.LayoutParams(dp(36), 1))
             setOnClickListener {
-                disconnectGatt()
-                showSearchScreen()
-                startScan()
+                beginAddBatteryFlow()
             }
         }
         content.addView(addButton, LinearLayout.LayoutParams(-1, dp(56)).apply {
-            topMargin = dp(4)
+            bottomMargin = dp(14)
         })
+
+        content.addView(TextView(this).apply {
+            text = if (isServiceApp()) {
+                "Добавленные в текущей сессии АКБ"
+            } else {
+                "Добавленные устройства"
+            }
+            textSize = 13f
+            setTextColor(Color.rgb(16, 17, 20))
+            typeface = interFont(760)
+        }, marginLp(-1, -2, 0, 0, 0, 8))
+
+        val saved = loadSavedBatteries()
+        saved.forEach { battery ->
+            content.addView(savedBatteryCard(battery), marginLp(-1, -2, 0, 0, 0, 10))
+        }
+
+        if (saved.isEmpty()) {
+            content.addView(TextView(this).apply {
+                text = if (isServiceApp()) {
+                    "В этой сессии АКБ ещё не добавлены"
+                } else {
+                    "Сохранённых батарей пока нет"
+                }
+                textSize = 15f
+                gravity = Gravity.CENTER
+                setTextColor(Color.rgb(111, 119, 129))
+                background = round(Color.rgb(246, 247, 249), dp(16), Color.rgb(223, 229, 235), 1)
+                setPadding(dp(16), dp(24), dp(16), dp(24))
+            }, marginLp(-1, -2, 0, 0, 0, 10))
+        }
+
+        content.addView(TextView(this).apply {
+            text = if (isServiceApp()) {
+                "Список только для текущей сессии. После закрытия приложения он очищается. Успешно настроенные АКБ убираются автоматически."
+            } else {
+                "Нажмите на батарею, чтобы открыть её параметры. Удерживайте карточку, чтобы задать имя. Если батарей ещё нет, нажмите кнопку выше."
+            }
+            textSize = 12f
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = round(Color.rgb(251, 251, 252), dp(14), Color.rgb(202, 211, 220), 1)
+        }, marginLp(-1, -2, 0, 2, 0, 10))
 
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -1519,21 +1536,106 @@ class MainActivity : ComponentActivity() {
         connectSelectedDevice()
     }
 
-    private fun ensureTestBattery() {
-        if (batteryPrefs.getBoolean("test_battery_seeded", false)) return
-        val saved = loadSavedBatteries().toMutableList()
-        if (saved.none { it.address == TEST_BATTERY_ADDRESS }) {
-            saved += SavedBattery(
-                address = TEST_BATTERY_ADDRESS,
-                bluetoothName = "TEST_BMS_12V",
-                customName = "Тестовая батарея 12 В",
-                soc = 96.0,
-                capacityAh = 105.0,
-                lastSeenAt = System.currentTimeMillis()
-            )
-            saveBatteries(saved)
+    private fun removeTestBatteryIfPresent() {
+        val saved = loadSavedBatteries()
+        val filtered = saved.filterNot { it.address == TEST_BATTERY_ADDRESS }
+        if (filtered.size != saved.size) {
+            saveBatteries(filtered)
         }
+        // Больше не сидируем демо-АКБ.
         batteryPrefs.edit().putBoolean("test_battery_seeded", true).apply()
+    }
+
+    private fun userProfilePrefs(): SharedPreferences {
+        return getSharedPreferences("user_profile", MODE_PRIVATE)
+    }
+
+    private fun profileFullName(): String {
+        return userProfilePrefs().getString("name", "")?.trim().orEmpty()
+    }
+
+    private fun profilePhoneStored(): String {
+        return userProfilePrefs().getString("phone", "")?.trim().orEmpty()
+    }
+
+    private fun profilePhoneDigits(phone: String = profilePhoneStored()): String {
+        var digits = phone.filter { it.isDigit() }
+        if (digits.startsWith("8") && digits.length == 11) {
+            digits = "7" + digits.drop(1)
+        } else if (digits.length == 10 && !digits.startsWith("7")) {
+            digits = "7$digits"
+        }
+        return digits
+    }
+
+    private fun isValidRuPhone(phone: String): Boolean {
+        val digits = profilePhoneDigits(phone)
+        return digits.length == 11 && digits.startsWith("7")
+    }
+
+    /** Единая проверка заполненности профиля пользователя (ФИО + телефон). */
+    private fun isProfileComplete(): Boolean {
+        if (isServiceApp()) return true
+        return profileFullName().isNotBlank() && isValidRuPhone(profilePhoneStored())
+    }
+
+    private fun formatRuPhoneMask(input: String): String {
+        var digits = input.filter { it.isDigit() }
+        when {
+            digits.isEmpty() -> return "+7"
+            digits.startsWith("8") -> digits = "7" + digits.drop(1)
+            !digits.startsWith("7") -> digits = "7$digits"
+        }
+        digits = digits.take(11)
+        val n = digits.drop(1)
+        return buildString {
+            append("+7")
+            if (n.isEmpty()) return@buildString
+            append(" (")
+            append(n.take(3))
+            if (n.length < 3) return@buildString
+            append(") ")
+            append(n.drop(3).take(3))
+            if (n.length <= 6) return@buildString
+            append("-")
+            append(n.drop(6).take(2))
+            if (n.length <= 8) return@buildString
+            append("-")
+            append(n.drop(8).take(2))
+        }
+    }
+
+    private fun attachRuPhoneMask(edit: EditText) {
+        edit.inputType = android.text.InputType.TYPE_CLASS_PHONE
+        var selfChange = false
+        edit.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) {
+                if (selfChange) return
+                val formatted = formatRuPhoneMask(s?.toString().orEmpty())
+                if (formatted == s?.toString()) return
+                selfChange = true
+                edit.setText(formatted)
+                edit.setSelection(formatted.length.coerceAtMost(edit.text?.length ?: 0))
+                selfChange = false
+            }
+        })
+    }
+
+    private fun beginAddBatteryFlow() {
+        if (!isProfileComplete()) {
+            AlertDialog.Builder(this)
+                .setTitle("Сначала заполните профиль")
+                .setMessage("Для добавления АКБ необходимо указать ФИО и номер телефона.")
+                .setPositiveButton("Перейти в профиль") { _, _ -> showProfileScreen() }
+                .setNegativeButton("Отмена", null)
+                .show()
+            return
+        }
+        disconnectGatt()
+        showSearchScreen()
+        startScan()
     }
 
     private fun openTestBattery(battery: SavedBattery, displayName: String) {
@@ -1575,6 +1677,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadSavedBatteries(): List<SavedBattery> {
+        if (isServiceApp()) {
+            return sessionBatteries.sortedByDescending { it.lastSeenAt }
+        }
         val result = mutableListOf<SavedBattery>()
         val array = try {
             JSONArray(batteryPrefs.getString("items", "[]") ?: "[]")
@@ -1602,6 +1707,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveBatteries(items: List<SavedBattery>) {
+        if (isServiceApp()) {
+            sessionBatteries.clear()
+            sessionBatteries.addAll(items)
+            return
+        }
         val array = JSONArray()
         items.forEach { battery ->
             array.put(JSONObject().apply {
@@ -1614,6 +1724,12 @@ class MainActivity : ComponentActivity() {
             })
         }
         batteryPrefs.edit().putString("items", array.toString()).apply()
+    }
+
+    private fun removeCurrentSessionBattery() {
+        if (!isServiceApp()) return
+        val address = selectedAddress ?: return
+        sessionBatteries.removeAll { it.address.equals(address, ignoreCase = true) }
     }
 
     private fun saveCurrentBattery(force: Boolean = false) {
@@ -1640,6 +1756,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showSearchScreen() {
+        if (!isProfileComplete()) {
+            beginAddBatteryFlow()
+            return
+        }
         screenState = "search"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1908,7 +2028,7 @@ class MainActivity : ComponentActivity() {
         val snMetric = metricBox("", displayFactorySn().ifBlank { "--" }, "Заводской номер", "SN", 13f, true)
         bmsSnValue = snMetric.second
         snRow.addView(snMetric.first, marginLp(0, -1, 0, 0, 4, 0).apply { weight = 1.3f })
-        val versionMetric = metricBox("", displayBmsVersion().ifBlank { "--" }, "Версия BMS", "A5 0x63", 12f, true)
+        val versionMetric = metricBox("", displayBmsVersion().ifBlank { "--" }, "Версия BMS", "Аппаратная версия", 12f, true)
         bmsVersionValue = versionMetric.second
         snRow.addView(versionMetric.first, marginLp(0, -1, 4, 0, 0, 0).apply { weight = 1f })
         content.addView(snRow, marginLp(-1, -2, 0, 8, 0, 0))
@@ -2319,6 +2439,31 @@ class MainActivity : ComponentActivity() {
             visibility = if (serviceWriteActive) View.VISIBLE else View.GONE
         }
         content.addView(serviceWriteProgressBar, marginLp(-1, dp(10), 0, 0, 0, 10))
+
+        if (serviceWriteResults.isNotEmpty() && !serviceWriteActive) {
+            val failed = serviceWriteResults.count { !it.ok }
+            val summaryCard = card()
+            summaryCard.addView(sectionTitle(
+                if (failed == 0) "Настройка завершена" else "Настройка не завершена",
+                if (failed == 0) {
+                    "Все параметры записаны и проверены чтением из BMS"
+                } else {
+                    "Не удалось подтвердить $failed параметр(ов). АКБ остаётся в списке сессии."
+                }
+            ))
+            serviceWriteResults.forEach { item ->
+                summaryCard.addView(TextView(this).apply {
+                    text = formatServiceWriteResultLine(item)
+                    textSize = 13f
+                    typeface = interFont(if (item.ok) 650 else 700)
+                    setTextColor(
+                        if (item.ok) Color.rgb(31, 120, 70) else Color.rgb(180, 40, 40)
+                    )
+                    setPadding(0, dp(6), 0, dp(6))
+                })
+            }
+            content.addView(summaryCard, marginLp(-1, -2, 0, 0, 0, 12))
+        }
 
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -3116,14 +3261,26 @@ class MainActivity : ComponentActivity() {
         finalizeServiceWriteResults()
         uploadServiceReport()
         val failed = serviceWriteResults.count { !it.ok }
-        toast(
-            when {
-                serviceWriteResults.isEmpty() -> "Запись завершена"
-                failed == 0 -> "Шаблон записан"
-                else -> "Запись завершена с ошибками ($failed)"
-            }
-        )
+        if (serviceWriteResults.isNotEmpty() && failed == 0) {
+            removeCurrentSessionBattery()
+            toast("Настройка BMS успешно завершена. Все параметры записаны и проверены.")
+        } else if (failed > 0) {
+            toast("Настройка BMS НЕ завершена. Не удалось подтвердить $failed параметр(ов).")
+        } else {
+            toast("Запись завершена")
+        }
         showServiceScreen()
+    }
+
+    private fun formatServiceWriteResultLine(item: ServiceWriteResult): String {
+        val expected = item.expected?.let { formatTemplateNumber(it) } ?: "—"
+        val actual = item.actual?.let { formatTemplateNumber(it) } ?: "—"
+        val unit = item.unit.trim()
+        return if (item.ok) {
+            "✓ ${item.label}: $actual${if (unit.isNotEmpty()) " $unit" else ""} — записано и проверено"
+        } else {
+            "✗ ${item.label}\nТребовалось: $expected${if (unit.isNotEmpty()) " $unit" else ""}\nФактически: $actual${if (unit.isNotEmpty()) " $unit" else ""}"
+        }
     }
 
     private fun finalizeServiceWriteResults() {
@@ -3477,8 +3634,8 @@ class MainActivity : ComponentActivity() {
             listOf(
                 "Защита от повышенного напряжения элемента" to settingV(0x0131),
                 "Защита от пониженного напряжения элемента" to settingV(0x0135),
-                "Защита от повышенного общего напряжения" to settingV(0x0139, 10.0),
-                "Защита от пониженного общего напряжения" to settingV(0x013D, 10.0),
+                "Защита от повышенного общего напряжения" to settingPackVoltageOneDecimal(0x0139),
+                "Защита от пониженного общего напряжения" to settingPackVoltageOneDecimal(0x013D),
                 "Защита от перепада напряжения" to settingV(0x015B),
                 "Защита от перетока зарядки" to settingA(0x0163),
                 "Защита от перетока разрядки" to settingA(0x0164),
@@ -3658,6 +3815,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun settingV(addr: Int, scale: Double = 1000.0): String = regText(addr, scale, "V")
+
+    /** Отображение pack-напряжений (регистр / 10) в формате «10,0 В» без изменения raw. */
+    private fun settingPackVoltageOneDecimal(addr: Int): String {
+        val raw = configRegisters[addr] ?: return readOnlyUnavailable()
+        val volts = raw / 10.0
+        return String.format(java.util.Locale("ru", "RU"), "%.1f В", volts)
+    }
+
     private fun settingTemp(addr: Int): String {
         val raw = configRegisters[addr] ?: return readOnlyUnavailable()
         return "${raw - 40} °C"
@@ -4624,10 +4789,44 @@ class MainActivity : ComponentActivity() {
         val contactCard = card()
         contactCard.addView(sectionTitle("Контакты техподдержки", ""))
         contactCard.addView(TextView(this).apply {
-            text = "ЛИФЕРЫЧ\nТелефон: +7 (932) 078-10-11\nTelegram / MAX / VK\nГрафик: пн–пт 09:00–18:00"
-            textSize = 15f
-            setTextColor(Color.rgb(45,45,45))
-            setLineSpacing(4f, 1f)
+            text = "ЛИФЕРЫЧ"
+            textSize = 16f
+            typeface = interFont(760)
+            setTextColor(Color.rgb(16, 17, 20))
+        })
+        contactCard.addView(TextView(this).apply {
+            text = "+7 (932) 078-10-11"
+            textSize = 16f
+            typeface = interFont(720)
+            setTextColor(redDark)
+            setPadding(0, dp(8), 0, dp(4))
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Позвонить в поддержку"
+            setOnClickListener { dialPhone("+79320781011") }
+        })
+        listOf(
+            "Telegram" to "https://t.me/liferych",
+            "MAX" to "https://max.ru/u/f9LHodD0cOIwPdSddb5TLuiLTMRCIkIpTzgUzr_f2iEj89DXpt_Mh2zXvcc",
+            "ВКонтакте" to "https://vk.ru/liferych"
+        ).forEach { (title, url) ->
+            contactCard.addView(TextView(this).apply {
+                text = title
+                textSize = 15f
+                typeface = interFont(700)
+                setTextColor(Color.rgb(25, 118, 210))
+                setPadding(0, dp(6), 0, 0)
+                isClickable = true
+                isFocusable = true
+                contentDescription = "Открыть $title"
+                setOnClickListener { openExternalUrl(url) }
+            })
+        }
+        contactCard.addView(TextView(this).apply {
+            text = "График: пн–пт 09:00–18:00"
+            textSize = 13f
+            setTextColor(Color.rgb(90, 90, 90))
+            setPadding(0, dp(10), 0, 0)
         })
         content.addView(contactCard, marginLp(-1, -2, 0, 0, 0, 10))
 
@@ -4812,7 +5011,7 @@ class MainActivity : ComponentActivity() {
         }
         screenState = "profile"
         currentTab = "profile"
-        val prefs = getSharedPreferences("user_profile", MODE_PRIVATE)
+        val prefs = userProfilePrefs()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
@@ -4880,17 +5079,18 @@ class MainActivity : ComponentActivity() {
                 profileCard.addView(this, LinearLayout.LayoutParams(-1, dp(52)))
             }
         }
-        val name = field("ФИО", prefs.getString("name", "") ?: "", "Иванов Иван Иванович")
-        val phone = field("Номер телефона", prefs.getString("phone", "") ?: "", "+7 (___) ___-__-__")
+        val name = field("ФИО *", prefs.getString("name", "") ?: "", "Иванов Иван Иванович")
+        val savedPhone = prefs.getString("phone", "")?.trim().orEmpty()
+        val phone = field(
+            "Номер телефона *",
+            if (savedPhone.isBlank()) "+7" else formatRuPhoneMask(savedPhone),
+            "+7 (___) ___-__-__"
+        )
+        attachRuPhoneMask(phone)
         val email = field("Email", prefs.getString("email", "") ?: "", "name@example.ru")
         val birth = field("Дата рождения", prefs.getString("birth", "") ?: "", "ДД.ММ.ГГГГ")
-        val adminServerUrl = field(
-            "Адрес сервера",
-            adminServerBaseUrl(),
-            DEFAULT_ADMIN_SERVER_BASE_URL
-        )
         profileCard.addView(TextView(this).apply {
-            text = "Телеметрия BMS отправляется на сервер по адресу ${UPLOAD_PATH}. Обычно менять не нужно."
+            text = "Поля ФИО и телефон обязательны для добавления АКБ."
             textSize = 12f
             setTextColor(Color.rgb(111, 119, 129))
             setPadding(0, dp(8), 0, 0)
@@ -4904,12 +5104,24 @@ class MainActivity : ComponentActivity() {
             setTextColor(Color.rgb(16, 17, 20))
             background = round(red, dp(14), Color.TRANSPARENT, 0)
             setOnClickListener {
-                prefs.edit().putString("name", name.text.toString())
-                    .putString("phone", phone.text.toString())
-                    .putString("email", email.text.toString())
-                    .putString("birth", birth.text.toString()).apply()
-                saveAdminServerBaseUrl(adminServerUrl.text.toString())
-                toast("Профиль и адрес сервера сохранены")
+                val nameText = name.text.toString().trim()
+                val phoneText = formatRuPhoneMask(phone.text.toString())
+                if (nameText.isBlank()) {
+                    toast("Укажите ФИО")
+                    return@setOnClickListener
+                }
+                if (!isValidRuPhone(phoneText)) {
+                    toast("Укажите полный номер телефона")
+                    return@setOnClickListener
+                }
+                prefs.edit()
+                    .putString("name", nameText)
+                    .putString("phone", phoneText)
+                    .putString("email", email.text.toString().trim())
+                    .putString("birth", birth.text.toString().trim())
+                    .apply()
+                phone.setText(phoneText)
+                toast("Профиль сохранён")
             }
         }, marginLp(-1, dp(54), 0, 14, 0, 0))
         scroll.addView(content)
@@ -5118,7 +5330,15 @@ class MainActivity : ComponentActivity() {
             setTextColor(Color.rgb(35,35,35))
         })
         c.addView(TextView(this).apply {
-            text = "Статус: ${warrantyStatusRu(status)}\nДата: ${item.optString("created_at")}\nBMS: ${item.optString("bms_uid")}\nМодель: ${item.optString("model")}\nПроблема: ${item.optString("problem").take(120)}"
+            val comment = item.optString("admin_comment").trim()
+            text = buildString {
+                append("Статус: ${warrantyStatusRu(status)}\n")
+                append("Дата: ${item.optString("created_at")}\n")
+                append("BMS: ${item.optString("bms_uid")}\n")
+                append("Модель: ${item.optString("model")}\n")
+                append("Проблема: ${item.optString("problem").take(120)}")
+                if (comment.isNotBlank()) append("\nОтвет: ${comment.take(160)}")
+            }
             textSize = 13f
             setTextColor(Color.rgb(80,80,80))
             setPadding(0, dp(6), 0, dp(8))
@@ -5167,11 +5387,15 @@ class MainActivity : ComponentActivity() {
         })
 
         warrantyNameEdit = supportInput("ФИО клиента", "Иванов Иван")
-        warrantyNameEdit?.setText(existing?.optString("fio") ?: "")
+        val defaultFio = existing?.optString("fio")?.takeIf { it.isNotBlank() } ?: profileFullName()
+        warrantyNameEdit?.setText(defaultFio)
         formCard.addView(warrantyNameEdit)
 
-        warrantyPhoneEdit = supportInput("Телефон", "+7...")
-        warrantyPhoneEdit?.setText(existing?.optString("phone") ?: "")
+        warrantyPhoneEdit = supportInput("Телефон", "+7 (___) ___-__-__")
+        val defaultPhone = existing?.optString("phone")?.takeIf { it.isNotBlank() }
+            ?: formatRuPhoneMask(profilePhoneStored())
+        warrantyPhoneEdit?.setText(defaultPhone)
+        warrantyPhoneEdit?.let { attachRuPhoneMask(it) }
         formCard.addView(warrantyPhoneEdit, marginLp(-1, dp(52), 0, 8, 0, 0))
 
         warrantyModelEdit = supportInput("Модель АКБ", supportModelDefault())
@@ -5334,28 +5558,44 @@ class MainActivity : ComponentActivity() {
         thread {
             try {
                 val body = JSONObject().apply {
-                    put("api_key", WARRANTY_API_KEY)
+                    putBmsApiKey(this)
                     put("bms_uid", uid)
                     put("all_by_bms", true)
-                }.toString()
-
-                val conn = (URL(SERVER_WARRANTY_LIST_URL).openConnection() as HttpURLConnection).apply {
+                }
+                Log.i(
+                    BLE_LOG_TAG,
+                    "SUPPORT LIST REQUEST url=${adminServerUrl(WARRANTY_LIST_PATH)} " +
+                        "auth=${!BmsApiConfig.API_KEY.isNullOrBlank()} bms_uid=$uid"
+                )
+                val conn = (URL(adminServerUrl(WARRANTY_LIST_PATH)).openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     connectTimeout = 10000
                     readTimeout = 20000
                     doOutput = true
                     setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                    setRequestProperty("Accept", "application/json")
+                    applyBmsApiAuth(this)
                 }
-                conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-                val response = if (conn.responseCode in 200..299) {
-                    conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
-                } else {
-                    conn.errorStream?.bufferedReader(Charsets.UTF_8)?.readText() ?: ""
+                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCode
+                val response = try {
+                    val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                    stream?.bufferedReader(Charsets.UTF_8)?.readText().orEmpty()
+                } catch (_: Exception) {
+                    ""
                 }
                 conn.disconnect()
+                Log.i(
+                    BLE_LOG_TAG,
+                    "SUPPORT LIST RESPONSE http=$code body=${response.take(300)}"
+                )
 
-                val obj = JSONObject(response)
-                if (obj.optBoolean("ok")) {
+                val obj = try {
+                    JSONObject(response)
+                } catch (_: Exception) {
+                    null
+                }
+                if (code in 200..299 && obj?.optBoolean("ok") == true) {
                     val remoteList = obj.optJSONArray("requests") ?: JSONArray()
                     val local = warrantyRequestsArray()
 
@@ -5402,13 +5642,29 @@ class MainActivity : ComponentActivity() {
                         if (showToast) toast("Список обращений обновлён")
                     }
                 } else {
+                    val err = obj?.optString("error").orEmpty()
+                    Log.w(BLE_LOG_TAG, "SUPPORT LIST FAILED http=$code error=$err")
                     runOnUiThread {
-                        if (showToast) toast("Ошибка обновления: ${obj.optString("error", response.take(120))}")
+                        if (showToast) {
+                            toast(
+                                when {
+                                    code == 401 || err == "unauthorized" ->
+                                        "Не удалось обновить статусы: нет доступа к серверу"
+                                    code == 0 || response.isBlank() ->
+                                        "Не удалось связаться с сервером. Проверьте подключение к интернету."
+                                    else ->
+                                        "Не удалось обновить статусы обращений. Попробуйте ещё раз."
+                                }
+                            )
+                        }
                     }
                 }
             } catch (e: Exception) {
+                Log.w(BLE_LOG_TAG, "SUPPORT LIST EXCEPTION: ${e.message}")
                 runOnUiThread {
-                    if (showToast) toast("Ошибка статусов: ${e.message}")
+                    if (showToast) {
+                        toast("Не удалось связаться с сервером. Проверьте подключение к интернету.")
+                    }
                 }
             }
         }
@@ -5501,8 +5757,8 @@ class MainActivity : ComponentActivity() {
         val model = warrantyModelEdit?.text?.toString()?.trim().orEmpty().ifBlank { supportModelDefault() }
         val problem = warrantyProblemEdit?.text?.toString()?.trim().orEmpty()
 
-        if (fio.isBlank() || phone.isBlank() || problem.isBlank()) {
-            toast("Заполните ФИО, телефон и описание проблемы")
+        if (fio.isBlank() || !isValidRuPhone(phone) || problem.isBlank()) {
+            toast("Заполните ФИО, полный телефон и описание проблемы")
             return
         }
 
@@ -5510,7 +5766,7 @@ class MainActivity : ComponentActivity() {
         val existing = warrantyRequestByLocalId(localId)
 
         val payload = JSONObject()
-        payload.put("api_key", WARRANTY_API_KEY)
+        putBmsApiKey(payload)
         payload.put("client_fio", fio)
         payload.put("client_phone", phone)
         payload.put("battery_model", model)
@@ -5518,9 +5774,23 @@ class MainActivity : ComponentActivity() {
         payload.put("bms_uid", bmsUid())
         payload.put("bluetooth_name", dalyBluetoothDeviceId())
         payload.put("bluetooth_address", selectedAddress ?: "")
+        val sn = bmsSn()
+        if (sn.isNotBlank()) payload.put("bms_sn", sn)
         payload.put("app_version", APP_VERSION)
         payload.put("battery_snapshot", buildUploadJson())
         if (configRegisters.isNotEmpty()) payload.put("config_snapshot", buildConfigUploadJson())
+        if (warrantyMediaUris.isNotEmpty()) {
+            val media = JSONArray()
+            warrantyMediaUris.take(5).forEachIndexed { idx, uri ->
+                media.put(
+                    JSONObject().apply {
+                        put("filename", warrantyFileName(uri, idx))
+                        put("mime", contentResolver.getType(uri) ?: "application/octet-stream")
+                    }
+                )
+            }
+            payload.put("media", media)
+        }
 
         existing?.optString("server_id")?.takeIf { it.isNotBlank() }?.let {
             payload.put("request_id", it)
@@ -5553,7 +5823,7 @@ class MainActivity : ComponentActivity() {
                     updated.put("updated_at", nowText())
                     upsertWarrantyLocal(updated)
                     warrantyStatusText?.text = "Обращение отправлено. Статус: ${warrantyStatusRu(updated.optString("status"))}"
-                    toast(result)
+                    // Без toast «Успешно…» — статус виден на экране.
                     supportMode = "list"
                     editingWarrantyLocalId = null
                     showSupportScreen()
@@ -5581,59 +5851,62 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendWarrantyMultipart(payload: JSONObject, files: List<Uri>): String {
-        val boundary = "----LiferychWarranty${System.currentTimeMillis()}"
+        // Единый auth с телеметрией: x-api-key + api_key из BmsApiConfig.
+        // JSON вместо старого multipart — новый backend принимает application/json.
         return try {
-            val conn = (URL(SERVER_WARRANTY_URL).openConnection() as HttpURLConnection).apply {
+            putBmsApiKey(payload)
+            val url = adminServerUrl(WARRANTY_SUBMIT_PATH)
+            Log.i(
+                BLE_LOG_TAG,
+                "SUPPORT CREATE REQUEST url=$url method=POST " +
+                    "auth=${!BmsApiConfig.API_KEY.isNullOrBlank()} " +
+                    "fio_len=${payload.optString("client_fio").length} " +
+                    "phone_len=${payload.optString("client_phone").length} " +
+                    "media=${files.size}"
+            )
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 connectTimeout = 20000
                 readTimeout = 60000
                 doOutput = true
-                setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
                 setRequestProperty("Accept", "application/json")
+                applyBmsApiAuth(this)
             }
-
-            conn.outputStream.use { os ->
-                fun writeText(s: String) { os.write(s.toByteArray(Charsets.UTF_8)) }
-                writeText("--$boundary\r\n")
-                writeText("Content-Disposition: form-data; name=\"payload_json\"\r\n")
-                writeText("Content-Type: application/json; charset=utf-8\r\n\r\n")
-                writeText(payload.toString())
-                writeText("\r\n")
-
-                for ((idx, uri) in files.take(5).withIndex()) {
-                    val mime = contentResolver.getType(uri) ?: "application/octet-stream"
-                    val fileName = warrantyFileName(uri, idx)
-                    writeText("--$boundary\r\n")
-                    writeText("Content-Disposition: form-data; name=\"media[]\"; filename=\"$fileName\"\r\n")
-                    writeText("Content-Type: $mime\r\n\r\n")
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        val buffer = ByteArray(8192)
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read <= 0) break
-                            os.write(buffer, 0, read)
-                        }
-                    }
-                    writeText("\r\n")
-                }
-                writeText("--$boundary--\r\n")
-            }
+            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
 
             val code = conn.responseCode
             val response = try {
-                if (code in 200..299) conn.inputStream.bufferedReader(Charsets.UTF_8).readText()
-                else conn.errorStream?.bufferedReader(Charsets.UTF_8)?.readText() ?: ""
-            } catch (_: Exception) { "" }
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                stream?.bufferedReader(Charsets.UTF_8)?.readText().orEmpty()
+            } catch (_: Exception) {
+                ""
+            }
             conn.disconnect()
+            Log.i(BLE_LOG_TAG, "SUPPORT CREATE RESPONSE http=$code body=${response.take(300)}")
 
-            if (code in 200..299 && response.contains("\"ok\":true")) {
-                val id = Regex("\"id\"\\s*:\\s*(\\d+)").find(response)?.groupValues?.getOrNull(1)
-                "Обращение отправлено${id?.let { " №$it" } ?: ""}"
-            } else {
-                "Ошибка отправки HTTP $code: ${response.take(180)}"
+            val obj = try {
+                JSONObject(response)
+            } catch (_: Exception) {
+                null
+            }
+            val err = obj?.optString("error").orEmpty()
+            when {
+                code in 200..299 && obj?.optBoolean("ok") == true -> {
+                    val id = obj.opt("id")?.toString()?.takeIf { it.isNotBlank() && it != "null" }
+                        ?: Regex("\"id\"\\s*:\\s*(\\d+)").find(response)?.groupValues?.getOrNull(1)
+                    "Обращение отправлено${id?.let { " №$it" } ?: ""}"
+                }
+                code == 401 || err == "unauthorized" ->
+                    "Не удалось отправить обращение: нет доступа к серверу"
+                code == 0 || response.isBlank() ->
+                    "Не удалось связаться с сервером. Проверьте подключение к интернету."
+                else ->
+                    "Не удалось отправить обращение. Попробуйте ещё раз."
             }
         } catch (e: Exception) {
-            "Ошибка отправки: ${e.message ?: e.toString()}"
+            Log.w(BLE_LOG_TAG, "SUPPORT CREATE EXCEPTION: ${e.message}")
+            "Не удалось связаться с сервером. Проверьте подключение к интернету."
         }
     }
 
@@ -7506,7 +7779,13 @@ class MainActivity : ComponentActivity() {
             lastUploadStatus = result.message
             runOnUiThread {
                 refreshUploadStatusUi()
-                if (force || (isServiceApp() && !result.ok)) toast(lastUploadStatus)
+                // Успех — тихо (только Logcat); ошибку пользователю показываем.
+                if (!result.ok && (force || isServiceApp())) {
+                    toast(lastUploadStatus)
+                }
+                if (result.ok) {
+                    Log.i(BLE_LOG_TAG, "telemetry upload OK: $lastUploadStatus")
+                }
                 if (screenState == "journal") showJournalScreen()
             }
         }
@@ -7688,6 +7967,13 @@ class MainActivity : ComponentActivity() {
                     return@postDelayed
                 }
                 mainHandler.postDelayed({
+                    command.verifyAttempt = 0
+                    configRegisters.remove(command.register)
+                    Log.i(
+                        BLE_LOG_TAG,
+                        "WRITE ${command.key}: requested=${command.value}${command.unit} " +
+                            "raw=${command.rawValue} reg=0x%04X".format(command.register)
+                    )
                     remoteWriteAwaitingVerify = true
                     startConfigReadIfNeeded(force = true)
                     if (!configReadInProgress) {
@@ -7743,16 +8029,71 @@ class MainActivity : ComponentActivity() {
         fun afterFramesWritten() {
             if (command.key == "nominal_capacity" || command.key == "runtime_soc") {
                 probeRuntimeGauge {
+                    val expected = command.displayValue ?: command.value
+                    val actual = if (command.key == "runtime_soc") data.soc else data.remainingAh
+                    val ok = when (command.key) {
+                        "runtime_soc" -> runtimeSocIsFull()
+                        else -> {
+                            val target = serviceWriteCapacityAh ?: expected
+                            remainingMatchesTarget(target) ||
+                                (capacityMatchesTarget(target) && runtimeSocIsFull())
+                        }
+                    }
+                    Log.i(
+                        BLE_LOG_TAG,
+                        if (ok) {
+                            "VERIFY OK ${command.key}: expected=$expected actual=$actual"
+                        } else {
+                            "VERIFY FAILED ${command.key}: expected=$expected actual=$actual"
+                        }
+                    )
                     remoteWriteInProgress = false
                     pendingRemoteWrite = null
-                    val actual = if (command.key == "runtime_soc") data.soc else data.remainingAh
-                    completeServiceWriteStep(command, true, actual, null)
+                    completeServiceWriteStep(
+                        command,
+                        ok,
+                        actual,
+                        if (ok) null else "not_confirmed"
+                    )
                 }
                 return
             }
-            remoteWriteInProgress = false
-            pendingRemoteWrite = null
-            completeServiceWriteStep(command, true, command.displayValue ?: command.value, null)
+            if (command.key == "settings_password") {
+                command.verifyAttempt = 0
+                Log.i(BLE_LOG_TAG, "WRITE settings_password: requested=$SERVICE_SETTINGS_PASSWORD")
+                remoteWriteAwaitingVerify = true
+                mainHandler.postDelayed({
+                    startConfigReadIfNeeded(force = true)
+                    if (!configReadInProgress) {
+                        mainHandler.postDelayed({
+                            if (remoteWriteAwaitingVerify && !configReadInProgress) {
+                                failRemoteWrite("config_read_not_started")
+                            }
+                        }, 400)
+                    }
+                }, 700)
+                return
+            }
+
+            // READ → WRITE → READ BACK → COMPARE для шаблонных регистров
+            command.verifyAttempt = 0
+            configRegisters.remove(command.register)
+            Log.i(
+                BLE_LOG_TAG,
+                "WRITE ${command.key}: requested=${command.value}${command.unit} raw=${command.rawValue} reg=0x%04X"
+                    .format(command.register)
+            )
+            remoteWriteAwaitingVerify = true
+            mainHandler.postDelayed({
+                startConfigReadIfNeeded(force = true)
+                if (!configReadInProgress) {
+                    mainHandler.postDelayed({
+                        if (remoteWriteAwaitingVerify && !configReadInProgress) {
+                            failRemoteWrite("config_read_not_started")
+                        }
+                    }, 400)
+                }
+            }, 700)
         }
 
         fun writeFrameAt(index: Int) {
@@ -7761,13 +8102,16 @@ class MainActivity : ComponentActivity() {
                 mainHandler.postDelayed({ afterFramesWritten() }, 200L)
                 return
             }
+            val frame = writeFrames[index]
+            Log.d(BLE_LOG_TAG, "TX WRITE ${command.key}[$index]: ${bytesToHex(frame)}")
             writeBleFrame(timeFrame)
             mainHandler.postDelayed({
                 writeBleFrame(openFrame)
                 mainHandler.postDelayed({
-                    if (!writeBleFrame(writeFrames[index])) {
+                    if (!writeBleFrame(frame)) {
                         remoteWriteInProgress = false
                         pendingRemoteWrite = null
+                        remoteWriteAwaitingVerify = false
                         completeServiceWriteStep(command, false, null, "ble_write_failed")
                         return@postDelayed
                     }
@@ -7802,6 +8146,11 @@ class MainActivity : ComponentActivity() {
                 mainHandler.postDelayed({
                     val actual = data.cellCount?.toDouble()
                     val ok = data.cellCount == command.rawValue
+                    Log.i(
+                        BLE_LOG_TAG,
+                        if (ok) "VERIFY OK series_cell_count actual=$actual"
+                        else "VERIFY FAILED series_cell_count: expected=${command.rawValue} actual=$actual"
+                    )
                     remoteWriteInProgress = false
                     pendingRemoteWrite = null
                     completeServiceWriteStep(
@@ -7841,29 +8190,91 @@ class MainActivity : ComponentActivity() {
             pollOnce()
             return
         }
+
         val raw = configRegisters[command.register]
-        val actual = raw?.let { (it.toDouble() / command.scale) + command.offset }
-        val ok = if (command.localOnly) {
-            raw != null && (
-                raw == command.rawValue ||
-                    (actual != null && kotlin.math.abs(actual - command.value) < 0.005)
-                )
-        } else {
-            raw != null && (
-                raw == command.rawValue ||
-                    (actual != null && kotlin.math.abs(actual - command.value) <= 0.05)
-                )
+        val actualFromRegister = raw?.let { (it.toDouble() / command.scale) + command.offset }
+        val passwordActual = if (command.key == "settings_password") {
+            passwordFromBmsConfig()
+        } else null
+        val actual = when (command.key) {
+            "settings_password" -> passwordActual?.toDoubleOrNull()
+            else -> actualFromRegister
         }
+
+        // Сравниваем прежде всего нормализованный raw регистра (без float-шума).
+        val ok = when (command.key) {
+            "settings_password" -> passwordActual == SERVICE_SETTINGS_PASSWORD
+            else -> {
+                when {
+                    raw == null -> false
+                    raw == command.rawValue -> true
+                    else -> {
+                        // Допуск только по разрешению регистра (половина LSB в единицах value).
+                        val lsb = if (command.scale != 0.0) 1.0 / kotlin.math.abs(command.scale) else 1.0
+                        val tolerance = (lsb / 2.0).coerceAtMost(0.02)
+                        actualFromRegister != null &&
+                            kotlin.math.abs(actualFromRegister - command.value) <= tolerance
+                    }
+                }
+            }
+        }
+
+        Log.i(
+            BLE_LOG_TAG,
+            "READBACK ${command.key}: actual=${actual ?: "null"} raw=${raw ?: "null"} " +
+                "expected=${command.value} expected_raw=${command.rawValue}"
+        )
         configRaw["remote_write_verify"] = if (ok) {
             "OK raw=$raw actual=$actual"
         } else {
             "NOT_CONFIRMED raw=${raw ?: "null"} actual=${actual ?: "null"} expected_raw=${command.rawValue}"
         }
+
+        if (!ok && command.verifyAttempt < SERVICE_WRITE_VERIFY_MAX_ATTEMPTS) {
+            command.verifyAttempt++
+            Log.w(
+                BLE_LOG_TAG,
+                "VERIFY RETRY ${command.key} attempt=${command.verifyAttempt}: " +
+                    "expected=${command.value} actual=${actual ?: "null"}"
+            )
+            configRegisters.remove(command.register)
+            remoteWriteAwaitingVerify = true
+            mainHandler.postDelayed({
+                startConfigReadIfNeeded(force = true)
+                if (!configReadInProgress) {
+                    mainHandler.postDelayed({
+                        if (remoteWriteAwaitingVerify && !configReadInProgress) {
+                            failRemoteWrite("config_read_not_started")
+                        }
+                    }, 400)
+                }
+            }, SERVICE_WRITE_VERIFY_RETRY_DELAY_MS)
+            return
+        }
+
+        if (ok) {
+            Log.i(BLE_LOG_TAG, "VERIFY OK ${command.key}")
+        } else {
+            Log.w(
+                BLE_LOG_TAG,
+                "VERIFY FAILED ${command.key}: expected=${command.value}${command.unit} " +
+                    "actual=${actual ?: "null"}${command.unit} expected_raw=${command.rawValue} raw=${raw ?: "null"}"
+            )
+        }
+
         if (command.localOnly) {
             pendingRemoteWrite = null
             remoteWriteInProgress = false
             rememberCurrentBmsState()
             completeServiceWriteStep(command, ok, actual, if (ok) null else "not_confirmed")
+            if (ok) {
+                toast("✓ ${command.label}: ${formatTemplateNumber(actual)} ${command.unit}".trim())
+            } else {
+                toast(
+                    "✗ ${command.label}: требовалось ${formatTemplateNumber(command.value)} ${command.unit}, " +
+                        "фактически ${formatTemplateNumber(actual)} ${command.unit}".trim()
+                )
+            }
             mainHandler.postDelayed({ pollOnce() }, 400)
             return
         }

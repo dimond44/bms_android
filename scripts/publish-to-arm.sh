@@ -9,16 +9,23 @@ GRADLE_FILE="${ROOT}/app/build.gradle.kts"
 BUILD_TYPE="${BUILD_TYPE:-debug}"
 CHANGELOG_MSG=""
 CHANGELOG_FILE="${ROOT}/CHANGELOG_RELEASE.md"
+PUBLISH_USER=0
+PUBLISH_SERVICE=0
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/publish-to-arm.sh [-m "changelog"] [-f changelog.md] [--release]
+Usage: ./scripts/publish-to-arm.sh [-m "changelog"] [-f changelog.md] [--release] [--user] [--service]
 
   -m TEXT     Changelog items separated by ";" (default: "сборка от <date>")
   -f FILE     Read changelog lines from file (non-empty lines)
   --release   Use release APKs instead of debug
+  --user      Publish only ЛИФЕРЫЧ BMS (user)
+  --service   Publish only ЛИФЕРЫЧ Сервис (service)
   ARM_ROOT    Override ARM project path (default: /srv/projects/arm-liferych)
   BUILD_TYPE  Override build type (debug|release)
+
+  Если не указаны --user/--service — публикуются оба flavor.
+  Версия берётся из output-metadata.json конкретного flavor (версии независимы).
 EOF
 }
 
@@ -36,6 +43,14 @@ while [[ $# -gt 0 ]]; do
       BUILD_TYPE="release"
       shift
       ;;
+    --user)
+      PUBLISH_USER=1
+      shift
+      ;;
+    --service)
+      PUBLISH_SERVICE=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -48,6 +63,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$PUBLISH_USER" -eq 0 && "$PUBLISH_SERVICE" -eq 0 ]]; then
+  PUBLISH_USER=1
+  PUBLISH_SERVICE=1
+fi
+
 if [[ ! -f "$GRADLE_FILE" ]]; then
   echo "Не найден ${GRADLE_FILE}" >&2
   exit 1
@@ -55,14 +75,6 @@ fi
 
 if [[ ! -d "$ARM_ROOT" ]]; then
   echo "Не найден проект АРМ: ${ARM_ROOT}" >&2
-  exit 1
-fi
-
-VERSION_NAME="$(sed -n 's/.*versionName *= *"\([^"]*\)".*/\1/p' "$GRADLE_FILE" | head -n1)"
-VERSION_CODE="$(sed -n 's/.*versionCode *= *\([0-9][0-9]*\).*/\1/p' "$GRADLE_FILE" | head -n1)"
-
-if [[ -z "$VERSION_NAME" || -z "$VERSION_CODE" ]]; then
-  echo "Не удалось прочитать versionName/versionCode из ${GRADLE_FILE}" >&2
   exit 1
 fi
 
@@ -97,6 +109,27 @@ for i in "${!changelog_items[@]}"; do
 done
 changelog_json+="]"
 
+flavor_cap() {
+  local f="$1"
+  echo "$(tr '[:lower:]' '[:upper:]' <<< "${f:0:1}")${f:1}"
+}
+
+# Версия конкретного flavor из output-metadata.json (после сборки).
+read_flavor_version() {
+  local flavor="$1"
+  local meta="${ROOT}/app/build/outputs/apk/${flavor}/${BUILD_TYPE}/output-metadata.json"
+  if [[ ! -f "$meta" ]]; then
+    echo ""
+    return
+  fi
+  python3 - "$meta" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+el = (data.get("elements") or [None])[0] or {}
+print(f"{el.get('versionName','')}|{el.get('versionCode','')}")
+PY
+}
+
 publish_one() {
   local flavor="$1"
   local display_name="$2"
@@ -114,16 +147,30 @@ publish_one() {
     exit 1
   fi
 
-  local dest_name="liferych-bms-${flavor}-${VERSION_NAME}.apk"
+  local ver_pair version_name version_code
+  ver_pair="$(read_flavor_version "$flavor")"
+  version_name="${ver_pair%%|*}"
+  version_code="${ver_pair##*|}"
+  if [[ -z "$version_name" || -z "$version_code" ]]; then
+    echo "Не удалось прочитать versionName/versionCode для flavor=${flavor}" >&2
+    exit 1
+  fi
+
+  local dest_name="liferych-bms-${flavor}-${version_name}.apk"
   local dest="${RELEASES_DIR}/${dest_name}"
 
   # Remove previous APKs for this flavor (any version)
   find "$RELEASES_DIR" -maxdepth 1 -type f -name "liferych-bms-${flavor}-*.apk" -delete
 
   cp -f "$src" "$dest"
-  echo "Опубликован ${display_name}: ${dest_name} ← $(basename "$src")"
+  # Сервис АРМ читает APK от пользователя dimond44 / группы проекта
+  if command -v chown >/dev/null 2>&1; then
+    chown dimond44:proj-arm-liferych "$dest" 2>/dev/null || true
+  fi
+  chmod 664 "$dest" 2>/dev/null || true
+  echo "Опубликован ${display_name}: ${dest_name} (v${version_name} / ${version_code}) ← $(basename "$src")"
 
-  python3 - "$META_FILE" "$flavor" "$display_name" "$VERSION_NAME" "$VERSION_CODE" "$dest_name" "$changelog_json" <<'PY'
+  python3 - "$META_FILE" "$flavor" "$display_name" "$version_name" "$version_code" "$dest_name" "$changelog_json" <<'PY'
 import json, sys, datetime
 from pathlib import Path
 
@@ -165,17 +212,15 @@ meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", enco
 PY
 }
 
-# Bash capitalize helper for Gradle task names: user+debug -> UserDebug
-flavor_cap() {
-  local f="$1"
-  echo "$(tr '[:lower:]' '[:upper:]' <<< "${f:0:1}")${f:1}"
-}
-
-echo "Версия: ${VERSION_NAME} (${VERSION_CODE}), build=${BUILD_TYPE}"
+echo "build=${BUILD_TYPE}"
 echo "АРМ: ${ARM_ROOT}"
 
-publish_one "user" "ЛИФЕРЫЧ BMS"
-publish_one "service" "ЛИФЕРЫЧ Сервис"
+if [[ "$PUBLISH_USER" -eq 1 ]]; then
+  publish_one "user" "ЛИФЕРЫЧ BMS"
+fi
+if [[ "$PUBLISH_SERVICE" -eq 1 ]]; then
+  publish_one "service" "ЛИФЕРЫЧ Сервис"
+fi
 
 echo "Готово. Метаданные: ${META_FILE}"
 echo "Откройте в АРМ раздел ПО (/software)."
