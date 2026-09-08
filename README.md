@@ -49,6 +49,25 @@
 
 Скрипт читает версию из `app/build.gradle.kts`, кладёт APK в `/srv/projects/arm-liferych/public/releases/` и обновляет `software-releases.json`. В АРМ откройте раздел **ПО**.
 
+### Установка на телефон (Android 10, USB)
+
+Cursor работает на сервере `arm-liferych`, USB-кабель вставляется в ваш ПК. Один раз по USB на ПК:
+
+```bat
+adb devices
+adb tcpip 5555
+```
+
+Узнайте IP телефона в Wi‑Fi, затем на сервере:
+
+```bash
+~/.android-sdk/platform-tools/adb connect IP_ТЕЛЕФОНА:5555
+./scripts/install-on-device.sh service
+# или: ./scripts/install-on-device.sh user
+```
+
+На телефоне: режим разработчика, отладка по USB, подтвердить «Разрешить отладку».
+
 Проект использует JDK 17, Android Gradle Plugin 8.7.3, Kotlin 2.0.21, `compileSdk 35` и `minSdk 23`.
 
 ## Важное перед выпуском

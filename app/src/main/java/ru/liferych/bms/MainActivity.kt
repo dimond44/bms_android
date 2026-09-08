@@ -323,6 +323,148 @@ private class BatteryIconView(
     }
 }
 
+/** Простые outline-иконки для экрана «Главное» — одинаковый визуальный размер. */
+private enum class DashIconKind {
+    LIST, TAG, BARCODE, CHIP, BOLT, CURRENT, THERMO, CELLS, POWER, SHIELD, PULSE, CHART, CHECK
+}
+
+private class DashIconView(
+    context: Context,
+    private val kind: DashIconKind,
+    private val iconColor: Int
+) : View(context) {
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = iconColor
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = iconColor
+        style = Paint.Style.FILL
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val scale = minOf(width, height) / 24f
+        val offsetX = (width - 24f * scale) / 2f
+        val offsetY = (height - 24f * scale) / 2f
+        stroke.strokeWidth = 1.85f
+        canvas.save()
+        canvas.translate(offsetX, offsetY)
+        canvas.scale(scale, scale)
+        when (kind) {
+            DashIconKind.LIST -> {
+                canvas.drawLine(5f, 7f, 19f, 7f, stroke)
+                canvas.drawLine(5f, 12f, 19f, 12f, stroke)
+                canvas.drawLine(5f, 17f, 19f, 17f, stroke)
+                canvas.drawCircle(5f, 7f, 1.2f, fill)
+                canvas.drawCircle(5f, 12f, 1.2f, fill)
+                canvas.drawCircle(5f, 17f, 1.2f, fill)
+            }
+            DashIconKind.TAG -> {
+                canvas.drawRoundRect(4f, 8f, 16f, 16f, 2f, 2f, stroke)
+                canvas.drawLine(16f, 10f, 20f, 12f, stroke)
+                canvas.drawLine(20f, 12f, 16f, 14f, stroke)
+                canvas.drawCircle(8.5f, 12f, 1.2f, fill)
+            }
+            DashIconKind.BARCODE -> {
+                for (x in listOf(5f, 7.5f, 10f, 12f, 14.5f, 17f, 19f)) {
+                    val thick = if (x % 5f == 0f) 1.6f else 1.1f
+                    stroke.strokeWidth = thick
+                    canvas.drawLine(x, 6f, x, 18f, stroke)
+                }
+                stroke.strokeWidth = 1.85f
+            }
+            DashIconKind.CHIP -> {
+                canvas.drawRoundRect(7f, 7f, 17f, 17f, 2f, 2f, stroke)
+                canvas.drawRoundRect(9.5f, 9.5f, 14.5f, 14.5f, 1f, 1f, stroke)
+                canvas.drawLine(9f, 4.5f, 9f, 7f, stroke)
+                canvas.drawLine(12f, 4.5f, 12f, 7f, stroke)
+                canvas.drawLine(15f, 4.5f, 15f, 7f, stroke)
+                canvas.drawLine(9f, 17f, 9f, 19.5f, stroke)
+                canvas.drawLine(12f, 17f, 12f, 19.5f, stroke)
+                canvas.drawLine(15f, 17f, 15f, 19.5f, stroke)
+                canvas.drawLine(4.5f, 9f, 7f, 9f, stroke)
+                canvas.drawLine(4.5f, 12f, 7f, 12f, stroke)
+                canvas.drawLine(4.5f, 15f, 7f, 15f, stroke)
+                canvas.drawLine(17f, 9f, 19.5f, 9f, stroke)
+                canvas.drawLine(17f, 12f, 19.5f, 12f, stroke)
+                canvas.drawLine(17f, 15f, 19.5f, 15f, stroke)
+            }
+            DashIconKind.BOLT -> {
+                canvas.drawPath(Path().apply {
+                    moveTo(13f, 3f)
+                    lineTo(8f, 13f)
+                    lineTo(12f, 13f)
+                    lineTo(11f, 21f)
+                    lineTo(16f, 11f)
+                    lineTo(12f, 11f)
+                    close()
+                }, stroke)
+            }
+            DashIconKind.CURRENT -> {
+                canvas.drawLine(7f, 8f, 17f, 8f, stroke)
+                canvas.drawLine(14f, 5.5f, 17f, 8f, stroke)
+                canvas.drawLine(14f, 10.5f, 17f, 8f, stroke)
+                canvas.drawLine(17f, 16f, 7f, 16f, stroke)
+                canvas.drawLine(10f, 13.5f, 7f, 16f, stroke)
+                canvas.drawLine(10f, 18.5f, 7f, 16f, stroke)
+            }
+            DashIconKind.THERMO -> {
+                canvas.drawRoundRect(10.5f, 3.5f, 13.5f, 14f, 1.5f, 1.5f, stroke)
+                canvas.drawCircle(12f, 17.5f, 3.4f, stroke)
+                canvas.drawLine(12f, 7f, 12f, 14.5f, stroke)
+            }
+            DashIconKind.CELLS -> {
+                canvas.drawRoundRect(4f, 7f, 10f, 17f, 1.5f, 1.5f, stroke)
+                canvas.drawRoundRect(9.5f, 5.5f, 15.5f, 17f, 1.5f, 1.5f, stroke)
+                canvas.drawRoundRect(15f, 7f, 21f, 17f, 1.5f, 1.5f, stroke)
+            }
+            DashIconKind.POWER -> {
+                canvas.drawCircle(12f, 12.5f, 7.5f, stroke)
+                canvas.drawLine(12f, 5f, 12f, 12f, stroke)
+            }
+            DashIconKind.SHIELD -> {
+                canvas.drawPath(Path().apply {
+                    moveTo(12f, 3.5f)
+                    lineTo(19f, 6.5f)
+                    lineTo(19f, 12.5f)
+                    quadTo(19f, 18f, 12f, 21f)
+                    quadTo(5f, 18f, 5f, 12.5f)
+                    lineTo(5f, 6.5f)
+                    close()
+                }, stroke)
+            }
+            DashIconKind.PULSE -> {
+                canvas.drawPath(Path().apply {
+                    moveTo(3f, 12f)
+                    lineTo(7f, 12f)
+                    lineTo(9.5f, 6f)
+                    lineTo(12.5f, 18f)
+                    lineTo(15f, 12f)
+                    lineTo(21f, 12f)
+                }, stroke)
+            }
+            DashIconKind.CHART -> {
+                canvas.drawLine(5f, 18f, 19f, 18f, stroke)
+                canvas.drawLine(7f, 18f, 7f, 11f, stroke)
+                canvas.drawLine(12f, 18f, 12f, 7f, stroke)
+                canvas.drawLine(17f, 18f, 17f, 13f, stroke)
+            }
+            DashIconKind.CHECK -> {
+                canvas.drawCircle(12f, 12f, 8.5f, stroke)
+                canvas.drawPath(Path().apply {
+                    moveTo(7.5f, 12.2f)
+                    lineTo(10.5f, 15.2f)
+                    lineTo(16.5f, 8.8f)
+                }, stroke)
+            }
+        }
+        canvas.restore()
+    }
+}
+
 private class BluetoothIconView(
     context: Context,
     private val iconColor: Int
@@ -442,6 +584,9 @@ class MainActivity : ComponentActivity() {
     private var currentTab: String = "main"
     private var manageSection: String = "general"
     private var screenState: String = "splash"
+    /** История UI-экранов для стрелки «Назад» и системной кнопки Back (без Jetpack Navigation). */
+    private val uiBackStack = ArrayDeque<String>()
+    private var navigatingBack: Boolean = false
     private val templateChecksByBms: MutableMap<String, TemplateCheckResult> = mutableMapOf()
     private var latestTemplateCheck: TemplateCheckResult? = null
     private var testSocWriteDoneForConnection: Boolean = false
@@ -548,13 +693,27 @@ class MainActivity : ComponentActivity() {
     private lateinit var deviceListLayout: LinearLayout
 
     private lateinit var socGauge: SocGaugeView
-    private lateinit var socProgress: ProgressBar
+    private var socProgress: ProgressBar? = null
     private lateinit var voltageValue: TextView
     private lateinit var currentValue: TextView
+    private var currentSubValue: TextView? = null
     private lateinit var remainingValue: TextView
+    private var fullCapacityValue: TextView? = null
+    private var socStatusText: TextView? = null
+    private var cellCountValue: TextView? = null
+    private var cellDiffHeaderValue: TextView? = null
     private lateinit var chargeMosValue: TextView
     private lateinit var dischargeMosValue: TextView
+    private var chargeMosDot: View? = null
+    private var dischargeMosDot: View? = null
     private lateinit var balanceValue: TextView
+    private var balanceDot: View? = null
+    private var stateValue: TextView? = null
+    private var stateDot: View? = null
+    private var overallStatusTitle: TextView? = null
+    private var overallStatusSub: TextView? = null
+    private var overallStatusBanner: LinearLayout? = null
+    private var overallStatusIcon: TextView? = null
     private lateinit var heatValue: TextView
     private lateinit var batteryInfoText: TextView
     private lateinit var deviceNameValue: TextView
@@ -562,9 +721,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var t1Text: TextView
     private lateinit var t2Text: TextView
     private lateinit var cellsLayout: LinearLayout
-    private lateinit var headerTitle: TextView
-    private lateinit var headerSub: TextView
-    private lateinit var connectionText: TextView
     private lateinit var manageContentLayout: LinearLayout
     private lateinit var qtcContentLayout: LinearLayout
     private var qtcDbStatus: QtcDbStatus = QtcDbStatus.IDLE
@@ -851,7 +1007,7 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
         }
-        root.addView(header("Проверка QR-кода", "", ""))
+        root.addView(header("Проверка QR-кода", showBack = true))
 
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
@@ -944,7 +1100,7 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
         }
-        root.addView(header("Сканер QR-кода", "", ""))
+        root.addView(header("Сканер QR-кода", showBack = true))
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), 0, dp(16), dp(14))
@@ -1064,7 +1220,7 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
         }
-        root.addView(header("Результат QR-кода", "", ""))
+        root.addView(header("Результат QR-кода", showBack = true))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1145,7 +1301,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showLoadingScreen(label: String = "Поиск устройств...") {
-        screenState = "loading"
+        enterScreen("loading", track = false)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -1179,8 +1335,9 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
     }
 
-    private fun showBatteriesScreen() {
-        screenState = "batteries"
+    private fun showBatteriesScreen(asRootHome: Boolean = false) {
+        if (asRootHome) clearUiBackStack()
+        enterScreen("batteries", track = !asRootHome)
         currentTab = "main"
 
         val root = LinearLayout(this).apply {
@@ -1465,7 +1622,7 @@ class MainActivity : ComponentActivity() {
                     openTestBattery(battery, displayName)
                 } else if (connected) {
                     selectedDeviceName = displayName
-                    showDashboardScreen()
+                    showDashboardScreen(asRootHome = true)
                 } else {
                     connectSavedBattery(battery, displayName)
                 }
@@ -1495,7 +1652,7 @@ class MainActivity : ComponentActivity() {
                         if (it.address == battery.address) it.copy(customName = name) else it
                     })
                     if (selectedAddress == battery.address) selectedDeviceName = name
-                    showBatteriesScreen()
+                    showBatteriesScreen(asRootHome = true)
                 }
             }
             .setNegativeButton("Отмена", null)
@@ -1507,7 +1664,7 @@ class MainActivity : ComponentActivity() {
                     selectedAddress = null
                     selectedDeviceName = ""
                 }
-                showBatteriesScreen()
+                showBatteriesScreen(asRootHome = true)
             }
             .show()
     }
@@ -1532,6 +1689,7 @@ class MainActivity : ComponentActivity() {
         selectedAddress = battery.address
         selectedDeviceName = displayName
         returnToBatteriesAfterConnect = false
+        clearUiBackStack()
         showLoadingScreen("Подключение к $displayName...")
         connectSelectedDevice()
     }
@@ -1673,7 +1831,7 @@ class MainActivity : ComponentActivity() {
         data.temps[1] = 23
         data.temps[2] = 24
         data.errors.clear()
-        showDashboardScreen()
+        showDashboardScreen(asRootHome = true)
     }
 
     private fun loadSavedBatteries(): List<SavedBattery> {
@@ -1760,50 +1918,13 @@ class MainActivity : ComponentActivity() {
             beginAddBatteryFlow()
             return
         }
-        screenState = "search"
+        enterScreen("search")
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
         }
 
-        val top = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(9), dp(16), dp(9))
-            setBackgroundColor(Color.WHITE)
-        }
-        val brand = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(ImageView(this@MainActivity).apply {
-                setImageResource(R.drawable.liferych_logo)
-                scaleType = ImageView.ScaleType.FIT_CENTER
-            }, LinearLayout.LayoutParams(dp(56), dp(56)))
-            addView(TextView(this@MainActivity).apply {
-                text = "ЛИФЕРЫЧ"
-                textSize = 22f
-                setTextColor(Color.rgb(16, 17, 20))
-                typeface = interFont(800)
-            }, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(10) })
-        }
-        top.addView(brand, LinearLayout.LayoutParams(0, dp(56), 1f))
-        top.addView(TextView(this).apply {
-            text = "ᛒ"
-            textSize = 22f
-            setTextColor(redDark)
-            gravity = Gravity.CENTER
-            setOnClickListener { startScan() }
-            background = round(Color.rgb(246, 247, 249), dp(19), Color.rgb(223, 229, 235), 1)
-        }, LinearLayout.LayoutParams(dp(38), dp(38)).apply { rightMargin = dp(8) })
-        top.addView(TextView(this).apply {
-            text = "⋮"
-            textSize = 22f
-            setTextColor(Color.rgb(16, 17, 20))
-            gravity = Gravity.CENTER
-            background = round(Color.rgb(246, 247, 249), dp(19), Color.rgb(223, 229, 235), 1)
-            setOnClickListener { toast("Поиск BLE-устройств") }
-        }, LinearLayout.LayoutParams(dp(38), dp(38)))
-        root.addView(top, LinearLayout.LayoutParams(-1, dp(74)))
+        root.addView(header("Поиск устройств", showBack = true), LinearLayout.LayoutParams(-1, dp(74)))
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1821,6 +1942,16 @@ class MainActivity : ComponentActivity() {
             setTextColor(Color.rgb(16, 17, 20))
             typeface = interFont(760)
         }, marginLp(-1, -2, 0, 0, 0, 8))
+        content.addView(TextView(this).apply {
+            text = "Обновить список"
+            textSize = 14f
+            setTextColor(redDark)
+            typeface = interFont(700)
+            isClickable = true
+            isFocusable = true
+            setPadding(0, 0, 0, dp(8))
+            setOnClickListener { startScan() }
+        })
         val searchEdit = EditText(this).apply {
             setText(searchIdQuery)
             hint = "Поиск по ID, например 3A2F"
@@ -1868,171 +1999,428 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
     }
 
-    private fun showDashboardScreen() {
-        screenState = "dashboard"
+    private fun openBatteriesListFromDashboard() {
+        clearUiBackStack()
+        showBatteriesScreen(asRootHome = true)
+    }
+
+    private fun currentDirectionLabel(current: Double?): String {
+        if (current == null) return "Ожидание данных"
+        return when {
+            kotlin.math.abs(current) < 0.05 -> "Покой"
+            current < 0.0 -> "Заряд"
+            else -> "Разряд"
+        }
+    }
+
+    private fun socStatusLabel(soc: Double?): Pair<String, Int> {
+        val s = soc ?: return ("Нет данных" to Color.rgb(111, 119, 129))
+        return when {
+            s <= 20.0 -> "Низкий уровень заряда" to Color.rgb(210, 70, 70)
+            s < 70.0 -> "Средний уровень заряда" to Color.rgb(215, 160, 35)
+            else -> "Батарея заряжена" to Color.rgb(45, 176, 69)
+        }
+    }
+
+    // --- Дизайн-константы экрана «Главное» (Views) ---
+    private val dashScreenPad get() = dp(16)
+    private val dashSectionGap get() = dp(12)
+    private val dashCardGap get() = dp(10)
+    private val dashLargeRadius get() = dp(18)
+    private val dashMetricRadius get() = dp(16)
+    private val dashMetricHeight get() = dp(88)
+    private val dashInfoHeight get() = dp(96)
+    private val dashListRowHeight get() = dp(62)
+    private val dashIconBox get() = dp(40)
+    private val dashIconSize get() = dp(24)
+    private val dashPageBg = Color.rgb(240, 243, 247)
+    private val dashCardBg = Color.WHITE
+    private val dashBorder = Color.rgb(220, 227, 235)
+    private val dashMuted = Color.rgb(111, 119, 129)
+    private val dashInk = Color.rgb(16, 17, 20)
+    private val dashIconTone = Color.rgb(55, 65, 78)
+    private val dashCapPanelBg = Color.rgb(236, 245, 240)
+
+    private fun dashCardDrawable(radius: Int = dashMetricRadius): GradientDrawable {
+        return round(dashCardBg, radius, dashBorder, 1)
+    }
+
+    private fun dashIconBoxView(kind: DashIconKind): View {
+        val box = FrameLayout(this)
+        box.addView(
+            DashIconView(this, kind, dashIconTone),
+            FrameLayout.LayoutParams(dashIconSize, dashIconSize, Gravity.CENTER)
+        )
+        return box
+    }
+
+    private data class DashInfoRefs(val root: LinearLayout, val value: TextView)
+
+    private fun dashboardInfoTile(
+        kind: DashIconKind,
+        label: String,
+        initial: String
+    ): DashInfoRefs {
+        val value = TextView(this).apply {
+            text = initial
+            textSize = 14f
+            setTextColor(dashInk)
+            typeface = interFont(760)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            setLineSpacing(0f, 1.05f)
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = dashCardDrawable(dashMetricRadius)
+            elevation = dp(1).toFloat()
+            addView(dashIconBoxView(kind), LinearLayout.LayoutParams(dashIconBox, dashIconBox))
+            addView(TextView(this@MainActivity).apply {
+                text = label
+                textSize = 12f
+                setTextColor(dashMuted)
+                typeface = interFont(650)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+            addView(value, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        }
+        return DashInfoRefs(box, value)
+    }
+
+    private data class DashMetricRefs(
+        val root: LinearLayout,
+        val value: TextView,
+        val sub: TextView,
+        val dot: View
+    )
+
+    private fun dashboardMetricTile(
+        kind: DashIconKind,
+        label: String,
+        initial: String,
+        subInitial: String = "",
+        showDot: Boolean = false
+    ): DashMetricRefs {
+        val value = TextView(this).apply {
+            text = initial
+            textSize = 20f
+            setTextColor(dashInk)
+            typeface = interFont(760)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val sub = TextView(this).apply {
+            text = subInitial
+            textSize = 12f
+            setTextColor(dashMuted)
+            typeface = interFont(650)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            // INVISIBLE keeps fixed height for all metric tiles
+            visibility = if (subInitial.isBlank()) View.INVISIBLE else View.VISIBLE
+        }
+        val dot = View(this).apply {
+            background = round(Color.rgb(180, 186, 194), dp(5), Color.TRANSPARENT, 0)
+            visibility = if (showDot) View.VISIBLE else View.INVISIBLE
+        }
+        val textCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(TextView(this@MainActivity).apply {
+                text = label
+                textSize = 13f
+                setTextColor(dashMuted)
+                typeface = interFont(650)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            })
+            addView(value, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+            addView(sub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = dashCardDrawable(dashMetricRadius)
+            elevation = dp(1).toFloat()
+            isClickable = false
+            isFocusable = false
+            addView(dashIconBoxView(kind), LinearLayout.LayoutParams(dashIconBox, dashIconBox).apply {
+                rightMargin = dp(10)
+            })
+            addView(textCol, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(dot, LinearLayout.LayoutParams(dp(10), dp(10)).apply {
+                gravity = Gravity.BOTTOM
+                bottomMargin = dp(4)
+            })
+        }
+        return DashMetricRefs(row, value, sub, dot)
+    }
+
+    private fun showDashboardScreen(asRootHome: Boolean = false) {
+        if (asRootHome) clearUiBackStack()
+        enterScreen("dashboard", track = !asRootHome)
         currentTab = "main"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(dashPageBg)
         }
 
-        val connectionLabel = if (selectedAddress == TEST_BATTERY_ADDRESS) {
-            "Тестовый\nрежим"
-        } else {
-            "Bluetooth\nподключен"
-        }
-        val h = header(
-            appBrandTitle(),
-            selectedDeviceName.ifBlank { selectedAddress ?: "" },
-            connectionLabel
+        root.addView(
+            header(
+                "ЛИФЕРЫЧ",
+                selectedDeviceName.ifBlank { selectedAddress ?: "" },
+                showBack = true,
+                showBrand = true
+            )
         )
-        root.addView(h)
 
-        val scroll = ScrollView(this)
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+        }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(hPad(), 0, hPad(), dp(14))
+            setPadding(dashScreenPad, dp(10), dashScreenPad, dp(20))
         }
+        val halfGap = dashCardGap / 2
 
-        val hero = LinearLayout(this).apply {
+        val listRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+            setPadding(dp(16), 0, dp(14), 0)
+            background = round(Color.rgb(230, 236, 242), dashLargeRadius, Color.TRANSPARENT, 0)
+            elevation = dp(1).toFloat()
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { openBatteriesListFromDashboard() }
+            addView(dashIconBoxView(DashIconKind.LIST), LinearLayout.LayoutParams(dashIconBox, dashIconBox))
+            addView(TextView(this@MainActivity).apply {
+                text = "Список BMS / Добавить новую"
+                textSize = 15f
+                setTextColor(dashInk)
+                typeface = interFont(700)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(8) })
+            addView(TextView(this@MainActivity).apply {
+                text = "›"
+                textSize = 24f
+                setTextColor(dashMuted)
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(dp(24), -2))
+        }
+        content.addView(listRow, LinearLayout.LayoutParams(-1, dashListRowHeight).apply {
+            bottomMargin = dashSectionGap
+        })
+
+        val nameTile = dashboardInfoTile(
+            DashIconKind.TAG,
+            "Имя устройства",
+            selectedDeviceName.ifBlank { selectedAddress ?: "--" }
+        )
+        deviceNameValue = nameTile.value
+        val snTile = dashboardInfoTile(
+            DashIconKind.BARCODE,
+            "Заводской номер",
+            displayFactorySn().ifBlank { "--" }
+        )
+        bmsSnValue = snTile.value
+        val verTile = dashboardInfoTile(
+            DashIconKind.CHIP,
+            "Версия BMS",
+            displayBmsVersion().ifBlank { "--" }
+        )
+        bmsVersionValue = verTile.value
+
+        val infoRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        infoRow.addView(nameTile.root, LinearLayout.LayoutParams(0, dashInfoHeight, 1f).apply {
+            rightMargin = halfGap
+        })
+        infoRow.addView(snTile.root, LinearLayout.LayoutParams(0, dashInfoHeight, 1f).apply {
+            leftMargin = halfGap
+            rightMargin = halfGap
+        })
+        infoRow.addView(verTile.root, LinearLayout.LayoutParams(0, dashInfoHeight, 1f).apply {
+            leftMargin = halfGap
+        })
+        content.addView(infoRow, LinearLayout.LayoutParams(-1, -2).apply {
+            bottomMargin = dashSectionGap
+        })
+
+        val socCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = dashCardDrawable(dashLargeRadius)
             elevation = dp(2).toFloat()
         }
+        socCard.addView(TextView(this).apply {
+            text = "SOC"
+            textSize = 14f
+            setTextColor(dashInk)
+            typeface = interFont(760)
+        })
+        socCard.addView(TextView(this).apply {
+            text = "Уровень заряда"
+            textSize = 12f
+            setTextColor(dashMuted)
+            typeface = interFont(650)
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+
+        val socBody = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        val screenW = resources.displayMetrics.widthPixels
+        val gaugeSize = ((screenW - dashScreenPad * 2) * 0.42f).toInt()
+            .coerceIn(dp(160), dp(188))
+
+        val socLeft = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
         socGauge = SocGaugeView(this)
-        hero.addView(socGauge, LinearLayout.LayoutParams(dp(118), dp(118)))
-        val chargeBlock = LinearLayout(this).apply {
+        socLeft.addView(socGauge, LinearLayout.LayoutParams(gaugeSize, gaugeSize))
+        val (statusLabel, statusColor) = socStatusLabel(data.soc)
+        socStatusText = TextView(this).apply {
+            text = statusLabel
+            textSize = 13f
+            setTextColor(statusColor)
+            typeface = interFont(700)
+            gravity = Gravity.CENTER
+            maxLines = 2
+        }
+        socLeft.addView(socStatusText, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        socBody.addView(socLeft, LinearLayout.LayoutParams(0, -2, 1.15f))
+
+        val capacityPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), 0, 0, 0)
-            remainingValue = TextView(this@MainActivity).apply {
-                text = "-- А·ч"
-                textSize = 34f
-                setTextColor(Color.rgb(16, 17, 20))
-                typeface = interFont(770)
-            }
-            addView(remainingValue)
-            addView(TextView(this@MainActivity).apply {
-                text = "из полной ёмкости батареи"
-                textSize = 13f
-                setTextColor(Color.rgb(111, 119, 129))
-                typeface = interFont(650)
-            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
-            socProgress = ProgressBar(
-                this@MainActivity,
-                null,
-                android.R.attr.progressBarStyleHorizontal
-            ).apply {
-                max = 100
-                progress = data.soc?.toInt() ?: 0
-                progressTintList = android.content.res.ColorStateList.valueOf(red)
-                progressBackgroundTintList =
-                    android.content.res.ColorStateList.valueOf(Color.rgb(223, 229, 235))
-            }
-            addView(socProgress, LinearLayout.LayoutParams(-1, dp(8)).apply {
-                topMargin = dp(12)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = round(dashCapPanelBg, dashMetricRadius, Color.TRANSPARENT, 0)
+        }
+        capacityPanel.addView(
+            BatteryIconView(this, Color.rgb(45, 140, 75), 22f),
+            LinearLayout.LayoutParams(dp(28), dp(28)).apply { bottomMargin = dp(8) }
+        )
+        capacityPanel.addView(TextView(this).apply {
+            text = "Полная ёмкость"
+            textSize = 13f
+            setTextColor(dashMuted)
+            typeface = interFont(650)
+        })
+        fullCapacityValue = TextView(this).apply {
+            text = "-- Ач"
+            textSize = 28f
+            setTextColor(dashInk)
+            typeface = interFont(780)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        capacityPanel.addView(fullCapacityValue, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+        capacityPanel.addView(View(this).apply {
+            setBackgroundColor(Color.rgb(198, 218, 205))
+        }, LinearLayout.LayoutParams(-1, dp(1)).apply {
+            topMargin = dp(12)
+            bottomMargin = dp(12)
+        })
+        capacityPanel.addView(TextView(this).apply {
+            text = "Осталось"
+            textSize = 13f
+            setTextColor(dashMuted)
+            typeface = interFont(650)
+        })
+        remainingValue = TextView(this).apply {
+            text = "-- Ач"
+            textSize = 21f
+            setTextColor(dashInk)
+            typeface = interFont(760)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        capacityPanel.addView(remainingValue, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+        socBody.addView(capacityPanel, LinearLayout.LayoutParams(0, -1, 0.95f).apply {
+            leftMargin = dashCardGap
+        })
+        socCard.addView(socBody)
+        content.addView(socCard, LinearLayout.LayoutParams(-1, -2).apply {
+            bottomMargin = dashSectionGap
+        })
+
+        fun addMetricRow(left: View, right: View) {
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            row.addView(left, LinearLayout.LayoutParams(0, dashMetricHeight, 1f).apply {
+                rightMargin = halfGap
+            })
+            row.addView(right, LinearLayout.LayoutParams(0, dashMetricHeight, 1f).apply {
+                leftMargin = halfGap
+            })
+            content.addView(row, LinearLayout.LayoutParams(-1, -2).apply {
+                bottomMargin = dashCardGap
             })
         }
-        hero.addView(chargeBlock, LinearLayout.LayoutParams(0, -1, 1f))
-        content.addView(hero)
 
-        fun metricBox(
-            icon: String,
-            initial: String,
-            label: String,
-            sub: String,
-            valueSize: Float = 18f,
-            truncate: Boolean = false
-        ): Pair<LinearLayout, TextView> {
-            val value = TextView(this).apply {
-                text = initial
-                textSize = valueSize
-                setTextColor(Color.rgb(16, 17, 20))
-                typeface = interFont(760)
-                if (truncate) {
-                    maxLines = 2
-                    ellipsize = TextUtils.TruncateAt.END
-                }
-            }
-            val box = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(12), dp(12), dp(12), dp(12))
-                minimumHeight = dp(82)
-                background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
-                addView(TextView(this@MainActivity).apply {
-                    text = if (icon.isBlank()) label else "$icon  $label"
-                    textSize = 11f
-                    setTextColor(Color.rgb(111, 119, 129))
-                    typeface = interFont(650)
-                })
-                addView(value, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
-                addView(TextView(this@MainActivity).apply {
-                    text = sub
-                    textSize = 11f
-                    setTextColor(Color.rgb(111, 119, 129))
-                }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
-            }
-            return box to value
-        }
+        val voltageTile = dashboardMetricTile(DashIconKind.BOLT, "Напряжение", "-- В")
+        voltageValue = voltageTile.value
+        val currentTile = dashboardMetricTile(
+            DashIconKind.CURRENT,
+            "Ток",
+            "-- А",
+            currentDirectionLabel(data.current)
+        )
+        currentValue = currentTile.value
+        currentSubValue = currentTile.sub
+        addMetricRow(voltageTile.root, currentTile.root)
 
-        val metricRow1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val currentMetric = metricBox("↯", "-- А", "Ток", "Ожидание данных")
-        currentValue = currentMetric.second
-        metricRow1.addView(currentMetric.first, marginLp(0, -2, 0, 0, 4, 0).apply { weight = 1f })
-        val voltageMetric = metricBox("V", "-- В", "Напряжение", "Напряжение батареи")
-        voltageValue = voltageMetric.second
-        metricRow1.addView(voltageMetric.first, marginLp(0, -2, 4, 0, 0, 0).apply { weight = 1f })
-        content.addView(metricRow1, marginLp(-1, -2, 0, 8, 0, 0))
+        val tempTile = dashboardMetricTile(DashIconKind.THERMO, "Температура", "-- °C")
+        t1Text = tempTile.value
+        val cellsTile = dashboardMetricTile(
+            DashIconKind.CELLS,
+            "Количество ячеек",
+            data.cellCount?.toString() ?: "--",
+            "LiFePO4"
+        )
+        cellCountValue = cellsTile.value
+        addMetricRow(tempTile.root, cellsTile.root)
 
-        val metricRow2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val tempMetric = metricBox("°", "-- °C", "Температура", "Датчик BMS")
-        t1Text = tempMetric.second
-        metricRow2.addView(tempMetric.first, marginLp(0, -2, 0, 0, 4, 0).apply { weight = 1f })
-        val modeMetric = metricBox("◉", "Нормальный", "Режим", "Состояние BMS")
-        balanceValue = modeMetric.second
-        metricRow2.addView(modeMetric.first, marginLp(0, -2, 4, 0, 0, 0).apply { weight = 1f })
-        content.addView(metricRow2, marginLp(-1, -2, 0, 8, 0, 0))
+        val chargeMosTile = dashboardMetricTile(
+            DashIconKind.POWER,
+            "MOS зарядки",
+            "—",
+            showDot = true
+        )
+        chargeMosValue = chargeMosTile.value
+        chargeMosDot = chargeMosTile.dot
+        val dischargeMosTile = dashboardMetricTile(
+            DashIconKind.POWER,
+            "MOS разрядки",
+            "—",
+            showDot = true
+        )
+        dischargeMosValue = dischargeMosTile.value
+        dischargeMosDot = dischargeMosTile.dot
+        addMetricRow(chargeMosTile.root, dischargeMosTile.root)
 
-        val metricRow3 = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.FILL
-            isMeasureWithLargestChildEnabled = true
-        }
-        val nameMetric = metricBox("⌁", selectedDeviceName.ifBlank { "--" }, "Имя устройства", "Bluetooth", 14f, true)
-        deviceNameValue = nameMetric.second
-        metricRow3.addView(nameMetric.first, marginLp(0, -1, 0, 0, 4, 0).apply { weight = 1.4f })
-        val cyclesMetric = metricBox("#", "--", "Циклы", "Заряд / разряд", 14f)
-        cycleCountValue = cyclesMetric.second
-        metricRow3.addView(cyclesMetric.first, marginLp(0, -1, 4, 0, 0, 0).apply { weight = 1f })
-        content.addView(metricRow3, marginLp(-1, -2, 0, 8, 0, 0))
-        equalizeRowChildHeights(metricRow3)
-
-        if (isServiceApp()) {
-            val idMetric = metricBox("ID", bluetoothId().ifBlank { "--" }, "Bluetooth ID", "MAC-адрес", 12f, true)
-            bluetoothIdValue = idMetric.second.apply {
-                maxLines = 2
-                ellipsize = null
-            }
-            content.addView(idMetric.first, marginLp(-1, -2, 0, 8, 0, 0))
-        } else {
-            bluetoothIdValue = null
-        }
-
-        val snRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.FILL
-            isMeasureWithLargestChildEnabled = true
-        }
-        val snMetric = metricBox("", displayFactorySn().ifBlank { "--" }, "Заводской номер", "SN", 13f, true)
-        bmsSnValue = snMetric.second
-        snRow.addView(snMetric.first, marginLp(0, -1, 0, 0, 4, 0).apply { weight = 1.3f })
-        val versionMetric = metricBox("", displayBmsVersion().ifBlank { "--" }, "Версия BMS", "Аппаратная версия", 12f, true)
-        bmsVersionValue = versionMetric.second
-        snRow.addView(versionMetric.first, marginLp(0, -1, 4, 0, 0, 0).apply { weight = 1f })
-        content.addView(snRow, marginLp(-1, -2, 0, 8, 0, 0))
-        equalizeRowChildHeights(snRow)
+        val statusTile = dashboardMetricTile(
+            DashIconKind.SHIELD,
+            "Статус BMS",
+            "—",
+            showDot = true
+        )
+        balanceValue = statusTile.value
+        balanceDot = statusTile.dot
+        val stateTile = dashboardMetricTile(
+            DashIconKind.PULSE,
+            "Состояние",
+            "—",
+            showDot = true
+        )
+        stateValue = stateTile.value
+        stateDot = stateTile.dot
+        addMetricRow(statusTile.root, stateTile.root)
 
         if (isServiceApp()) {
             dashboardUploadStatusText = TextView(this).apply {
@@ -2040,55 +2428,131 @@ class MainActivity : ComponentActivity() {
                 textSize = 12f
                 setTextColor(Color.rgb(90, 90, 90))
             }
-            content.addView(dashboardUploadStatusText, marginLp(-1, -2, 0, 0, 0, 8))
+            content.addView(dashboardUploadStatusText, LinearLayout.LayoutParams(-1, -2).apply {
+                bottomMargin = dp(8)
+            })
             content.addView(TextView(this).apply {
                 text = "ОТПРАВИТЬ НА СЕРВЕР"
                 gravity = Gravity.CENTER
                 textSize = 14f
                 typeface = interFont(760)
-                setTextColor(Color.rgb(16, 17, 20))
+                setTextColor(dashInk)
                 background = round(red, dp(14), Color.TRANSPARENT, 0)
                 setOnClickListener { uploadCurrentData(force = true) }
-            }, marginLp(-1, dp(48), 0, 0, 0, 8))
+            }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dashCardGap })
         } else {
             dashboardUploadStatusText = null
         }
 
         batteryInfoText = TextView(this).apply { visibility = View.GONE }
-
-        chargeMosValue = TextView(this)
-        dischargeMosValue = TextView(this)
         heatValue = TextView(this)
         t2Text = TextView(this)
+        cycleCountValue = TextView(this)
+        socProgress = null
+        bluetoothIdValue = if (isServiceApp()) {
+            TextView(this).apply { visibility = View.GONE }
+        } else {
+            null
+        }
 
         val cellsCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = dashCardDrawable(dashLargeRadius)
+            elevation = dp(1).toFloat()
         }
-        cellsCard.addView(TextView(this).apply {
-            text = "Напряжение элементов"
-            textSize = 14f
-            setTextColor(Color.rgb(16, 17, 20))
+        val cellsHeader = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        cellsHeader.addView(dashIconBoxView(DashIconKind.CHART), LinearLayout.LayoutParams(dashIconBox, dashIconBox))
+        cellsHeader.addView(TextView(this).apply {
+            text = "Напряжение по ячейкам"
+            textSize = 15f
+            setTextColor(dashInk)
             typeface = interFont(760)
-        })
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
+        cellDiffHeaderValue = TextView(this).apply {
+            text = ""
+            textSize = 12f
+            setTextColor(dashMuted)
+            typeface = interFont(650)
+            maxLines = 1
+        }
+        cellsHeader.addView(cellDiffHeaderValue)
+        cellsHeader.addView(TextView(this).apply {
+            text = "›"
+            textSize = 22f
+            setTextColor(dashMuted)
+        }, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(4) })
+        cellsCard.addView(cellsHeader)
         cellsLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(10), 0, 0)
+            setPadding(0, dp(12), 0, 0)
         }
         cellsCard.addView(cellsLayout)
-        content.addView(cellsCard, marginLp(-1, -2, 0, 8, 0, 0))
+        content.addView(cellsCard, LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(2)
+            bottomMargin = dashSectionGap
+        })
+
+        overallStatusBanner = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = round(Color.rgb(232, 245, 236), dashLargeRadius, Color.TRANSPARENT, 0)
+        }
+        overallStatusIcon = TextView(this).apply {
+            text = "✓"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = round(Color.rgb(45, 176, 69), dp(14), Color.TRANSPARENT, 0)
+        }
+        overallStatusTitle = TextView(this).apply {
+            text = "Батарея в норме"
+            textSize = 15f
+            setTextColor(Color.rgb(28, 140, 60))
+            typeface = interFont(760)
+        }
+        overallStatusSub = TextView(this).apply {
+            text = "Все параметры в пределах нормы"
+            textSize = 12f
+            setTextColor(Color.rgb(70, 120, 85))
+        }
+        val overallCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(overallStatusTitle)
+            addView(overallStatusSub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+        }
+        overallStatusBanner?.addView(
+            overallStatusIcon,
+            LinearLayout.LayoutParams(dp(28), dp(28)).apply { rightMargin = dp(10) }
+        )
+        overallStatusBanner?.addView(overallCol, LinearLayout.LayoutParams(0, -2, 1f))
+        overallStatusBanner?.addView(TextView(this).apply {
+            text = "›"
+            textSize = 22f
+            setTextColor(Color.rgb(90, 150, 110))
+        })
+        content.addView(overallStatusBanner, LinearLayout.LayoutParams(-1, -2))
 
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-
         root.addView(fixedBottomNav("main"), LinearLayout.LayoutParams(-1, dp(70)))
-
         setContentView(root)
         updateDashboardUi()
     }
 
-    private fun header(title: String, sub: String, right: String): View {
+    private fun header(
+        title: String,
+        @Suppress("UNUSED_PARAMETER") sub: String = "",
+        @Suppress("UNUSED_PARAMETER") right: String = "",
+        showBack: Boolean = false,
+        showBrand: Boolean = !showBack
+    ): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -2096,68 +2560,181 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(Color.WHITE)
         }
 
-        val brand = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(ImageView(this@MainActivity).apply {
-                setImageResource(R.drawable.liferych_logo)
-                scaleType = ImageView.ScaleType.FIT_CENTER
-                contentDescription = "Логотип Лиферыч"
-            }, LinearLayout.LayoutParams(dp(56), dp(56)))
-            addView(TextView(this@MainActivity).apply {
-                text = "ЛИФЕРЫЧ"
-                textSize = 22f
+        if (showBack) {
+            root.addView(TextView(this).apply {
+                text = "←"
+                textSize = 26f
                 setTextColor(Color.rgb(16, 17, 20))
-                typeface = interFont(800)
-            }, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(10) })
-        }
-        root.addView(brand, LinearLayout.LayoutParams(0, dp(56), 1f))
-
-        headerTitle = TextView(this).apply {
-            text = title
-            textSize = 1f
-            setTextColor(Color.TRANSPARENT)
-            typeface = interFont(700)
-            visibility = View.GONE
-        }
-        headerSub = TextView(this).apply {
-            text = sub
-            textSize = 1f
-            visibility = View.GONE
+                gravity = Gravity.CENTER
+                contentDescription = "Назад"
+                isClickable = true
+                isFocusable = true
+                setPadding(dp(2), dp(4), dp(10), dp(4))
+                setOnClickListener { navigateBackUi() }
+            }, LinearLayout.LayoutParams(-2, dp(56)))
         }
 
-        connectionText = TextView(this).apply {
-            text = "ᛒ"
-            textSize = 22f
-            setTextColor(if (right.isNotBlank()) redDark else Color.rgb(111, 119, 129))
-            gravity = Gravity.CENTER
-            contentDescription = right.ifBlank { "Bluetooth" }
-            background = round(
-                Color.rgb(246, 247, 249),
-                dp(19),
-                Color.rgb(223, 229, 235),
-                1
-            )
+        if (showBrand) {
+            val brand = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(ImageView(this@MainActivity).apply {
+                    setImageResource(R.drawable.liferych_logo)
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                    contentDescription = "Логотип Лиферыч"
+                }, LinearLayout.LayoutParams(dp(56), dp(56)))
+                addView(TextView(this@MainActivity).apply {
+                    text = "ЛИФЕРЫЧ"
+                    textSize = if (showBack) 20f else 22f
+                    setTextColor(Color.rgb(16, 17, 20))
+                    typeface = interFont(800)
+                }, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(10) })
+            }
+            root.addView(brand, LinearLayout.LayoutParams(0, dp(56), 1f))
+        } else {
+            root.addView(TextView(this).apply {
+                text = title
+                textSize = 18f
+                setTextColor(Color.rgb(16, 17, 20))
+                typeface = interFont(750)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                gravity = Gravity.CENTER_VERTICAL
+            }, LinearLayout.LayoutParams(0, -2, 1f))
         }
-        root.addView(connectionText, LinearLayout.LayoutParams(dp(38), dp(38)).apply {
-            rightMargin = dp(8)
-        })
-        root.addView(TextView(this).apply {
-            text = "⋮"
-            textSize = 22f
-            setTextColor(Color.rgb(16, 17, 20))
-            gravity = Gravity.CENTER
-            contentDescription = "Меню"
-            background = round(
-                Color.rgb(246, 247, 249),
-                dp(19),
-                Color.rgb(223, 229, 235),
-                1
-            )
-            setOnClickListener { toast(title) }
-        }, LinearLayout.LayoutParams(dp(38), dp(38)))
 
         return root
+    }
+
+    private fun clearUiBackStack() {
+        uiBackStack.clear()
+    }
+
+    private fun isTrackableScreen(state: String): Boolean {
+        return state in setOf(
+            "batteries", "dashboard", "journal", "support", "profile",
+            "manage", "service", "qtc", "auth", "search"
+        )
+    }
+
+    private fun enterScreen(newState: String, track: Boolean = true) {
+        if (track && !navigatingBack) {
+            val prev = screenState
+            if (prev != newState && isTrackableScreen(prev)) {
+                if (uiBackStack.lastOrNull() != prev) {
+                    uiBackStack.addLast(prev)
+                }
+                while (uiBackStack.size > 32) uiBackStack.removeFirst()
+            }
+        }
+        screenState = newState
+    }
+
+    /** Текущая выбранная АКБ, если она ещё есть в сохранённом списке. */
+    private fun currentSavedBatteryOrNull(): SavedBattery? {
+        val addr = selectedAddress ?: return null
+        return loadSavedBatteries().firstOrNull { it.address.equals(addr, ignoreCase = true) }
+    }
+
+    private fun isRootHomeScreen(state: String = screenState): Boolean {
+        // Корневой экран выхода — список BMS. Dashboard с выбранной АКБ не корень:
+        // ← / Back ведут к списку, а не закрывают приложение.
+        return state == "batteries"
+    }
+
+    private fun goHomeFromMenu() {
+        clearUiBackStack()
+        val active = currentSavedBatteryOrNull()
+        if (active != null) {
+            selectedAddress = active.address
+            if (selectedDeviceName.isBlank()) {
+                selectedDeviceName = active.customName.ifBlank {
+                    active.bluetoothName.ifBlank { active.address }
+                }
+            }
+            showDashboardScreen(asRootHome = true)
+        } else {
+            if (selectedAddress != null &&
+                loadSavedBatteries().none { it.address.equals(selectedAddress, ignoreCase = true) }
+            ) {
+                selectedAddress = null
+            }
+            showBatteriesScreen(asRootHome = true)
+        }
+    }
+
+    private fun stopBleScanQuietly() {
+        try {
+            bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun restoreUiScreen(state: String) {
+        when (state) {
+            "batteries" -> showBatteriesScreen()
+            "dashboard" -> showDashboardScreen()
+            "journal" -> showJournalScreen()
+            "support" -> showSupportScreen()
+            "profile" -> showProfileScreen()
+            "manage" -> showManageScreen()
+            "service" -> showServiceScreen()
+            "qtc" -> showQtcScreen()
+            "auth" -> showAuthScreen()
+            "search" -> showSearchScreen()
+            else -> goHomeFromMenu()
+        }
+    }
+
+    /** Возврат по UI-стеку. true — обработано; false — на корне, можно выйти из приложения. */
+    private fun navigateBackUi(): Boolean {
+        when (screenState) {
+            "qr_scan" -> {
+                stopQrCamera()
+                showQrInputScreen()
+                return true
+            }
+            "qr_result" -> {
+                showQrInputScreen()
+                return true
+            }
+            "qr_input" -> {
+                showSplashScreen()
+                return true
+            }
+            "dashboard" -> {
+                openBatteriesListFromDashboard()
+                return true
+            }
+        }
+
+        if (screenState == "search" || screenState == "loading") {
+            stopBleScanQuietly()
+            disconnectGatt()
+        }
+
+        while (uiBackStack.isNotEmpty()) {
+            val prev = uiBackStack.removeLast()
+            if (prev == screenState) continue
+            navigatingBack = true
+            try {
+                restoreUiScreen(prev)
+            } finally {
+                navigatingBack = false
+            }
+            return true
+        }
+
+        if (!isRootHomeScreen()) {
+            navigatingBack = true
+            try {
+                goHomeFromMenu()
+            } finally {
+                navigatingBack = false
+            }
+            return true
+        }
+        return false
     }
 
     private fun card(): LinearLayout {
@@ -2256,24 +2833,39 @@ class MainActivity : ComponentActivity() {
             typeface = interFont(if (selected) 700 else 650)
             setOnClickListener {
                 if (text.contains("Главная")) {
-                    showBatteriesScreen()
+                    val onWorkingHome = screenState == "dashboard" && currentSavedBatteryOrNull() != null
+                    val onListHome = screenState == "batteries" && currentSavedBatteryOrNull() == null
+                    if (onWorkingHome || onListHome) return@setOnClickListener
+                    goHomeFromMenu()
                 } else if (text.contains("Сервис")) {
+                    if (screenState == "service") return@setOnClickListener
                     showServiceScreen()
                 } else if (text.contains("ОТК")) {
+                    if (screenState == "qtc") return@setOnClickListener
                     showQtcScreen()
                 } else if (text.contains("Управление") || text.contains("Настройки")) {
+                    if (screenState == "manage") return@setOnClickListener
                     showManageScreen()
                 } else if (text.contains("Журнал")) {
+                    if (screenState == "journal") return@setOnClickListener
                     showJournalScreen()
                 } else if (text.contains("Поддержка") || text.contains("Техподдержка")) {
+                    if (screenState == "support") return@setOnClickListener
                     showSupportScreen()
                 } else if (text.contains("Профиль")) {
                     if (isServiceApp()) {
+                        if (screenState == "profile") return@setOnClickListener
                         showProfileScreen()
                     } else {
                         val loggedIn = getSharedPreferences("user_profile", MODE_PRIVATE)
                             .getBoolean("logged_in", false)
-                        if (loggedIn) showProfileScreen() else showAuthScreen()
+                        if (loggedIn) {
+                            if (screenState == "profile") return@setOnClickListener
+                            showProfileScreen()
+                        } else {
+                            if (screenState == "auth") return@setOnClickListener
+                            showAuthScreen()
+                        }
                     }
                 }
             }
@@ -2306,7 +2898,7 @@ class MainActivity : ComponentActivity() {
             showBatteriesScreen()
             return
         }
-        screenState = "service"
+        enterScreen("service")
         currentTab = "service"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2316,7 +2908,7 @@ class MainActivity : ComponentActivity() {
             header(
                 "Сервис BMS",
                 selectedDeviceName.ifBlank { selectedAddress ?: "нет подключения" },
-                if (bluetoothGatt != null) "Bluetooth\nподключен" else "Нет BLE"
+                showBack = true
             )
         )
 
@@ -2478,7 +3070,7 @@ class MainActivity : ComponentActivity() {
         }
         if (configRegisters.isEmpty() && !configReadInProgress) loadCachedConfigForCurrentBms()
 
-        screenState = "qtc"
+        enterScreen("qtc")
         currentTab = "qtc"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2488,7 +3080,7 @@ class MainActivity : ComponentActivity() {
             header(
                 "ОТК",
                 selectedDeviceName.ifBlank { selectedAddress ?: "нет подключения" },
-                if (bluetoothGatt != null) "Bluetooth\nподключен" else "Нет BLE"
+                showBack = true
             )
         )
 
@@ -3429,14 +4021,20 @@ class MainActivity : ComponentActivity() {
     private fun showManageScreen() {
         if (configRegisters.isEmpty() && !configReadInProgress) loadCachedConfigForCurrentBms()
 
-        screenState = "manage"
+        enterScreen("manage")
         currentTab = "manage"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
         }
 
-        root.addView(header("Управление BMS", selectedDeviceName.ifBlank { selectedAddress ?: "" }, "Bluetooth\nподключен"))
+        root.addView(
+            header(
+                "Настройки",
+                selectedDeviceName.ifBlank { selectedAddress ?: "" },
+                showBack = true
+            )
+        )
 
         val fixedTabs = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -4756,14 +5354,20 @@ class MainActivity : ComponentActivity() {
 
 
     private fun showSupportScreen() {
-        screenState = "support"
+        enterScreen("support")
         currentTab = "support"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
         }
 
-        root.addView(header("Техническая поддержка", selectedDeviceName.ifBlank { selectedAddress ?: "" }, ""))
+        root.addView(
+            header(
+                "Поддержка",
+                selectedDeviceName.ifBlank { selectedAddress ?: "" },
+                showBack = true
+            )
+        )
 
         val top = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -4846,12 +5450,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showAuthScreen() {
-        screenState = "auth"
+        enterScreen("auth")
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
         }
-        root.addView(header("Вход", "", ""))
+        root.addView(header("Вход", showBack = true))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -5009,14 +5613,14 @@ class MainActivity : ComponentActivity() {
             showServiceProfileScreen()
             return
         }
-        screenState = "profile"
+        enterScreen("profile")
         currentTab = "profile"
         val prefs = userProfilePrefs()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
         }
-        root.addView(header("Профиль", "", ""))
+        root.addView(header("Профиль", showBack = true))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -5131,13 +5735,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showServiceProfileScreen() {
-        screenState = "profile"
+        enterScreen("profile")
         currentTab = "profile"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
         }
-        root.addView(header("Профиль сборщика", "", ""))
+        root.addView(header("Профиль сборщика", showBack = true))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -5924,14 +6528,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showJournalScreen() {
-        screenState = "journal"
+        enterScreen("journal")
         currentTab = "journal"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
         }
 
-        root.addView(header("Журнал BMS", selectedDeviceName.ifBlank { selectedAddress ?: "" }, ""))
+        root.addView(
+            header(
+                "Журнал",
+                selectedDeviceName.ifBlank { selectedAddress ?: "" },
+                showBack = true
+            )
+        )
 
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
@@ -6043,56 +6653,79 @@ class MainActivity : ComponentActivity() {
     private fun renderCells() {
         if (!::cellsLayout.isInitialized) return
         cellsLayout.removeAllViews()
-        val count = (data.cellCount ?: 4).coerceIn(1, 24)
-        val columns = if (count <= 8) 2 else 4
+        val count = when {
+            data.cellCount != null && data.cellCount!! > 0 -> data.cellCount!!
+            data.cells.isNotEmpty() -> data.cells.keys.maxOrNull() ?: data.cells.size
+            else -> 0
+        }.coerceIn(0, 24)
+        if (count == 0) {
+            cellsLayout.addView(TextView(this).apply {
+                text = "Нет данных по ячейкам"
+                textSize = 13f
+                setTextColor(dashMuted)
+            })
+            return
+        }
+        val columns = when {
+            count <= 4 -> count
+            count <= 8 -> 4
+            else -> 4
+        }.coerceAtLeast(1)
+        val cellH = if (count <= 8) dp(92) else dp(84)
+        val gap = dp(6)
         var row: LinearLayout? = null
         for (i in 1..count) {
             if ((i - 1) % columns == 0) {
                 row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                 }
-                cellsLayout.addView(row, LinearLayout.LayoutParams(-1, -2))
+                cellsLayout.addView(row, LinearLayout.LayoutParams(-1, -2).apply {
+                    if (i > 1) topMargin = gap
+                })
             }
             val v = data.cells[i]
-            val box = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(10), dp(10), dp(10), dp(12))
-                minimumHeight = if (count <= 8) dp(88) else dp(76)
-                background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
+            val inner = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                background = round(Color.rgb(248, 250, 252), dp(12), dashBorder, 1)
             }
-            box.addView(TextView(this).apply {
+            val bar = View(this).apply {
+                background = round(Color.rgb(45, 176, 69), dp(3), Color.TRANSPARENT, 0)
+            }
+            inner.addView(bar, LinearLayout.LayoutParams(dp(5), -1).apply { rightMargin = dp(8) })
+            val col = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            col.addView(TextView(this).apply {
                 text = "Ячейка $i"
                 textSize = if (count <= 8) 11f else 10f
                 typeface = interFont(600)
-                setTextColor(Color.rgb(122, 132, 144))
+                setTextColor(dashMuted)
+                maxLines = 1
             })
-            box.addView(TextView(this).apply {
+            col.addView(TextView(this).apply {
                 text = v?.let { "%.3f В".format(it) } ?: "--"
-                textSize = if (count <= 8) 16f else 13f
+                textSize = if (count <= 8) 15f else 13f
                 typeface = interFont(760)
-                setTextColor(Color.rgb(16, 17, 20))
-            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
-            box.addView(ProgressBar(
-                this,
-                null,
-                android.R.attr.progressBarStyleHorizontal
-            ).apply {
-                max = 3650
-                progress = ((v ?: 0.0) * 1000).toInt()
-                progressTintList =
-                    android.content.res.ColorStateList.valueOf(Color.rgb(31, 179, 90))
-                progressBackgroundTintList =
-                    android.content.res.ColorStateList.valueOf(Color.rgb(223, 229, 235))
-            }, LinearLayout.LayoutParams(-1, dp(7)).apply { topMargin = dp(12) })
+                setTextColor(dashInk)
+                maxLines = 1
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
+            inner.addView(col, LinearLayout.LayoutParams(0, -2, 1f))
             row?.addView(
-                box,
-                marginLp(0, -2, 3, 3, 3, 3).apply { weight = 1f }
+                inner,
+                LinearLayout.LayoutParams(0, cellH, 1f).apply {
+                    if ((i - 1) % columns != 0) leftMargin = gap
+                }
             )
         }
         val remainder = count % columns
         if (remainder != 0) {
             repeat(columns - remainder) {
-                row?.addView(Space(this), LinearLayout.LayoutParams(0, 1, 1f))
+                row?.addView(Space(this), LinearLayout.LayoutParams(0, 1, 1f).apply {
+                    leftMargin = gap
+                })
             }
         }
     }
@@ -6119,7 +6752,7 @@ class MainActivity : ComponentActivity() {
 
         val scanner = bluetoothAdapter.bluetoothLeScanner
         if (scanner == null) {
-            if (screenState == "loading") showBatteriesScreen()
+            if (screenState == "loading") showBatteriesScreen(asRootHome = true)
             if (::statusText.isInitialized) {
                 statusText.text = "BLE scanner недоступен. Проверь Bluetooth."
             }
@@ -6130,7 +6763,7 @@ class MainActivity : ComponentActivity() {
 
         mainHandler.postDelayed({
             try { scanner.stopScan(scanCallback) } catch (_: Exception) {}
-            if (screenState == "loading") showBatteriesScreen()
+            if (screenState == "loading") showBatteriesScreen(asRootHome = true)
             if (::statusText.isInitialized) {
                 statusText.text = "Поиск завершен. Найдено: ${devices.size}"
             }
@@ -6459,8 +7092,8 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     toast("Отключено от BMS")
-                    if (screenState != "search" && screenState != "loading") {
-                        showBatteriesScreen()
+                    if (screenState == "loading") {
+                        showBatteriesScreen(asRootHome = true)
                     }
                 }
             }
@@ -6479,7 +7112,7 @@ class MainActivity : ComponentActivity() {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 runOnUiThread {
                     toast("Не удалось прочитать BLE-сервисы: $status")
-                    showBatteriesScreen()
+                    showBatteriesScreen(asRootHome = true)
                 }
                 gatt.disconnect()
                 return
@@ -6508,9 +7141,9 @@ class MainActivity : ComponentActivity() {
                 saveCurrentBattery(force = true)
                 if (returnToBatteriesAfterConnect) {
                     returnToBatteriesAfterConnect = false
-                    showBatteriesScreen()
+                    showBatteriesScreen(asRootHome = true)
                 } else {
-                    showDashboardScreen()
+                    showDashboardScreen(asRootHome = true)
                 }
             }
             enableNotifications(gatt, notifyCharacteristic!!)
@@ -6969,15 +7602,59 @@ class MainActivity : ComponentActivity() {
         if (!::socGauge.isInitialized) return
 
         socGauge.setSoc(data.soc)
-        if (::socProgress.isInitialized) socProgress.progress = data.soc?.toInt() ?: 0
+        socProgress?.progress = data.soc?.toInt() ?: 0
         voltageValue.text = data.voltage?.let { "%.2f В".format(it) } ?: "-- В"
         currentValue.text = data.current?.let { "%.1f А".format(it) } ?: "-- А"
-        remainingValue.text = data.remainingAh?.let { "%.1f А·ч".format(it) } ?: "-- А·ч"
+        currentSubValue?.let { sub ->
+            val label = currentDirectionLabel(data.current)
+            sub.text = label
+            sub.visibility = View.VISIBLE
+        }
 
-        chargeMosValue.text = if (data.chargeMos == true) "ON" else "OFF"
-        chargeMosValue.setTextColor(if (data.chargeMos == true) green else orange)
-        dischargeMosValue.text = if (data.dischargeMos == true) "ON" else "OFF"
-        dischargeMosValue.setTextColor(if (data.dischargeMos == true) green else orange)
+        val fullAh = data.estimatedFullAh
+        fullCapacityValue?.text = fullAh?.let {
+            if (kotlin.math.abs(it - it.toLong()) < 0.05) "%.0f Ач".format(it) else "%.1f Ач".format(it)
+        } ?: "-- Ач"
+        remainingValue.text = data.remainingAh?.let {
+            if (kotlin.math.abs(it - it.toLong()) < 0.05) "%.0f Ач".format(it) else "%.1f Ач".format(it)
+        } ?: "-- Ач"
+
+        val (socLabel, socColor) = socStatusLabel(data.soc)
+        socStatusText?.let {
+            it.text = socLabel
+            it.setTextColor(socColor)
+        }
+
+        fun applyStatusDot(dot: View?, ok: Boolean?, warn: Boolean = false) {
+            when {
+                ok == true -> dot?.background = round(Color.rgb(45, 176, 69), dp(5), Color.TRANSPARENT, 0)
+                warn -> dot?.background = round(Color.rgb(215, 160, 35), dp(5), Color.TRANSPARENT, 0)
+                ok == false -> dot?.background = round(Color.rgb(210, 70, 70), dp(5), Color.TRANSPARENT, 0)
+                else -> dot?.background = round(Color.rgb(180, 186, 194), dp(5), Color.TRANSPARENT, 0)
+            }
+        }
+
+        fun applyMos(valueView: TextView, dot: View?, on: Boolean?) {
+            when (on) {
+                true -> {
+                    valueView.text = "ВКЛ"
+                    valueView.setTextColor(Color.rgb(28, 160, 55))
+                    applyStatusDot(dot, true)
+                }
+                false -> {
+                    valueView.text = "ВЫКЛ"
+                    valueView.setTextColor(Color.rgb(70, 76, 84))
+                    applyStatusDot(dot, null)
+                }
+                null -> {
+                    valueView.text = "—"
+                    valueView.setTextColor(Color.rgb(111, 119, 129))
+                    applyStatusDot(dot, null)
+                }
+            }
+        }
+        if (::chargeMosValue.isInitialized) applyMos(chargeMosValue, chargeMosDot, data.chargeMos)
+        if (::dischargeMosValue.isInitialized) applyMos(dischargeMosValue, dischargeMosDot, data.dischargeMos)
 
         if (hasTemperatureSensorError()) {
             t1Text.text = "Нет датчика"
@@ -6985,21 +7662,49 @@ class MainActivity : ComponentActivity() {
         } else {
             val t1 = data.temps[1] ?: data.minTemp
             val t2 = data.temps[2] ?: data.maxTemp
-            t1Text.text = "${t1?.toString() ?: "--"} °C"
+            val shown = t2 ?: t1
+            t1Text.text = shown?.let { "$it °C" } ?: "-- °C"
             t2Text.text = "${t2?.toString() ?: "--"} °C"
         }
-        balanceValue.text = when {
-            data.errors.isNotEmpty() -> "Внимание"
-            data.balancingCells.isNotEmpty() -> "Балансировка"
-            else -> "Нормальный"
-        }
-        balanceValue.setTextColor(
-            when {
-                data.errors.isNotEmpty() -> Color.rgb(239, 83, 80)
-                data.balancingCells.isNotEmpty() -> Color.rgb(255, 153, 0)
-                else -> Color.rgb(31, 179, 90)
+
+        cellCountValue?.text = (data.cellCount ?: data.cells.size.takeIf { it > 0 })?.toString() ?: "--"
+
+        if (::balanceValue.isInitialized) {
+            if (data.errors.isNotEmpty()) {
+                balanceValue.text = "Ошибка"
+                balanceValue.setTextColor(Color.rgb(210, 70, 70))
+                applyStatusDot(balanceDot, false)
+            } else {
+                balanceValue.text = "Норма"
+                balanceValue.setTextColor(Color.rgb(28, 160, 55))
+                applyStatusDot(balanceDot, true)
             }
-        )
+        }
+        stateValue?.let { state ->
+            when {
+                data.errors.isNotEmpty() -> {
+                    state.text = "Защита"
+                    state.setTextColor(Color.rgb(210, 70, 70))
+                    applyStatusDot(stateDot, false)
+                }
+                data.balancingCells.isNotEmpty() -> {
+                    state.text = "Балансировка"
+                    state.setTextColor(Color.rgb(215, 160, 35))
+                    applyStatusDot(stateDot, null, warn = true)
+                }
+                polling || bluetoothGatt != null -> {
+                    state.text = "Работает"
+                    state.setTextColor(Color.rgb(28, 160, 55))
+                    applyStatusDot(stateDot, true)
+                }
+                else -> {
+                    state.text = "Нет связи"
+                    state.setTextColor(Color.rgb(111, 119, 129))
+                    applyStatusDot(stateDot, null)
+                }
+            }
+        }
+
         val device = selectedDeviceName.ifBlank { selectedAddress ?: "не выбрано" }
         if (::deviceNameValue.isInitialized) deviceNameValue.text = device
         bluetoothIdValue?.text = bluetoothId().ifBlank { "--" }
@@ -7014,6 +7719,36 @@ class MainActivity : ComponentActivity() {
                 "✓  Нормальное состояние · Устройство: $device$cycles"
             } else {
                 "!  Требуется внимание · Устройство: $device$cycles"
+            }
+        }
+
+        cellDiffHeaderValue?.text = data.cellDiffV?.let { "Разбег: %.0f мВ".format(it * 1000.0) }.orEmpty()
+
+        overallStatusBanner?.let { banner ->
+            val title = overallStatusTitle
+            val sub = overallStatusSub
+            if (data.errors.isEmpty()) {
+                banner.background = round(Color.rgb(232, 245, 236), dp(18), Color.TRANSPARENT, 0)
+                title?.text = "Батарея в норме"
+                title?.setTextColor(Color.rgb(28, 140, 60))
+                sub?.text = "Все параметры в пределах нормы"
+                sub?.setTextColor(Color.rgb(70, 120, 85))
+                overallStatusIcon?.apply {
+                    text = "✓"
+                    setTextColor(Color.WHITE)
+                    background = round(Color.rgb(45, 176, 69), dp(14), Color.TRANSPARENT, 0)
+                }
+            } else {
+                banner.background = round(Color.rgb(255, 236, 236), dp(18), Color.TRANSPARENT, 0)
+                title?.text = "Требуется внимание"
+                title?.setTextColor(Color.rgb(190, 50, 50))
+                sub?.text = data.errors.joinToString(", ")
+                sub?.setTextColor(Color.rgb(140, 70, 70))
+                overallStatusIcon?.apply {
+                    text = "!"
+                    setTextColor(Color.WHITE)
+                    background = round(Color.rgb(210, 70, 70), dp(14), Color.TRANSPARENT, 0)
+                }
             }
         }
 
@@ -9325,28 +10060,28 @@ class MainActivity : ComponentActivity() {
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when (screenState) {
-            "dashboard", "journal", "support", "profile", "manage", "service", "qtc" -> {
-                disconnectGatt()
-                showBatteriesScreen()
-            }
-            "search", "loading" -> {
-                disconnectGatt()
-                showBatteriesScreen()
-            }
-            "batteries" -> {
-                disconnectGatt()
-                showSplashScreen()
-            }
             "qr_scan" -> {
                 stopQrCamera()
                 showQrInputScreen()
             }
             "qr_result" -> showQrInputScreen()
             "qr_input" -> showSplashScreen()
-            "auth" -> showBatteriesScreen()
-            else -> {
+            "splash" -> super.onBackPressed()
+            "search", "loading" -> {
+                stopBleScanQuietly()
                 disconnectGatt()
-                super.onBackPressed()
+                clearUiBackStack()
+                navigatingBack = true
+                try {
+                    showBatteriesScreen(asRootHome = true)
+                } finally {
+                    navigatingBack = false
+                }
+            }
+            else -> {
+                if (!navigateBackUi()) {
+                    super.onBackPressed()
+                }
             }
         }
     }
@@ -9364,25 +10099,26 @@ class SocGaugeView(context: Context) : View(context) {
     private var soc: Double? = null
 
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(225, 225, 225)
+        color = Color.rgb(228, 232, 236)
         style = Paint.Style.STROKE
-        strokeWidth = 20f
+        strokeWidth = 14f
         strokeCap = Paint.Cap.ROUND
     }
     private val valuePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(45, 176, 69)
         style = Paint.Style.STROKE
-        strokeWidth = 20f
+        strokeWidth = 14f
         strokeCap = Paint.Cap.ROUND
     }
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(35, 35, 35)
+        color = Color.rgb(16, 17, 20)
         textAlign = Paint.Align.CENTER
         typeface = Typeface.DEFAULT_BOLD
     }
     private val smallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(90, 90, 90)
+        color = Color.rgb(111, 119, 129)
         textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
     }
 
     fun setSoc(value: Double?) {
@@ -9394,28 +10130,39 @@ class SocGaugeView(context: Context) : View(context) {
         super.onDraw(canvas)
         val w = width.toFloat()
         val h = height.toFloat()
-        val pad = 20f
-        val rect = RectF(pad, pad, w - pad, h + 50f)
-        val start = 200f
-        val total = 140f
+        val size = min(w, h)
+        val stroke = (size * 0.075f).coerceIn(10f, 16f)
+        bgPaint.strokeWidth = stroke
+        valuePaint.strokeWidth = stroke
+        val pad = stroke / 2f + 3f
+        val left = (w - size) / 2f + pad
+        val top = (h - size) / 2f + pad
+        val right = left + size - 2f * pad
+        val bottom = top + size - 2f * pad
+        val rect = RectF(left, top, right, bottom)
 
-        canvas.drawArc(rect, start, total, false, bgPaint)
+        canvas.drawArc(rect, -90f, 360f, false, bgPaint)
 
         val s = max(0.0, min(100.0, soc ?: 0.0))
         valuePaint.color = when {
-            s >= 80 -> Color.rgb(45, 176, 69)
-            s >= 40 -> Color.rgb(215, 160, 35)
-            s >= 20 -> Color.rgb(230, 125, 35)
-            else -> Color.rgb(210, 70, 70)
+            s <= 20.0 -> Color.rgb(210, 70, 70)
+            s < 70.0 -> Color.rgb(215, 160, 35)
+            else -> Color.rgb(45, 176, 69)
         }
-        canvas.drawArc(rect, start, (total * (s / 100.0)).toFloat(), false, valuePaint)
+        if (soc != null && s > 0.0) {
+            canvas.drawArc(rect, -90f, (360.0 * (s / 100.0)).toFloat(), false, valuePaint)
+        }
 
-        smallPaint.textSize = 28f
-        canvas.drawText("SOC", w / 2f, h / 2f - 8f, smallPaint)
-        textPaint.textSize = 42f
-        canvas.drawText(if (soc == null) "--%" else "%.1f%%".format(s), w / 2f, h / 2f + 40f, textPaint)
-        smallPaint.textSize = 18f
-        canvas.drawText("0", pad + 6f, h - 4f, smallPaint)
-        canvas.drawText("100", w - pad - 8f, h - 4f, smallPaint)
+        val cx = w / 2f
+        val cy = h / 2f - size * 0.02f
+        textPaint.textSize = size * 0.20f
+        canvas.drawText(
+            if (soc == null) "--%" else "${s.toInt()}%",
+            cx,
+            cy,
+            textPaint
+        )
+        smallPaint.textSize = size * 0.09f
+        canvas.drawText("SOC", cx, cy + size * 0.13f, smallPaint)
     }
 }
