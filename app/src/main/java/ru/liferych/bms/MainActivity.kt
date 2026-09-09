@@ -25,6 +25,7 @@ import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.widget.*
+import android.util.TypedValue
 import androidx.activity.ComponentActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -199,7 +200,8 @@ data class BmsConfigTemplate(
     val version: Int,
     val chemistry: String,
     val supportedSeries: Set<Int>,
-    val parameters: List<BmsTemplateParameter>
+    val parameters: List<BmsTemplateParameter>,
+    val updatedAt: Long = 0L
 )
 
 data class BmsTemplateParameter(
@@ -214,7 +216,9 @@ data class BmsTemplateParameter(
     val expected: Double?,
     val expectedBySeries: Map<Int, Double>,
     val reason: String?,
-    val skipFor: Set<String> = emptySet()
+    val skipFor: Set<String> = emptySet(),
+    val enabled: Boolean = true,
+    val writable: Boolean = false
 )
 
 data class TemplateCheckItem(
@@ -224,7 +228,8 @@ data class TemplateCheckItem(
     val actual: Double?,
     val unit: String,
     val tolerance: Double,
-    val reason: String? = null
+    val reason: String? = null,
+    val status: String = "mismatch" // ok | mismatch | missing | skipped | disabled
 )
 
 data class TemplateCheckResult(
@@ -236,7 +241,9 @@ data class TemplateCheckResult(
     val mismatches: List<TemplateCheckItem> = emptyList(),
     val missing: List<TemplateCheckItem> = emptyList(),
     val unverified: List<TemplateCheckItem> = emptyList(),
-    val hardwareFamily: String = HARDWARE_FAMILY_STANDARD
+    val hardwareFamily: String = HARDWARE_FAMILY_STANDARD,
+    val items: List<TemplateCheckItem> = emptyList(),
+    val templateUpdatedAt: Long = 0L
 )
 
 private enum class QtcDbStatus {
@@ -589,6 +596,11 @@ class MainActivity : ComponentActivity() {
     private var navigatingBack: Boolean = false
     private val templateChecksByBms: MutableMap<String, TemplateCheckResult> = mutableMapOf()
     private var latestTemplateCheck: TemplateCheckResult? = null
+    /** Актуальный эталон с сервера. Без успешного fetch не используем локальный APK-template как истину. */
+    private var activeServerTemplate: BmsConfigTemplate? = null
+    private var serverTemplateFetchStatus: String = "idle" // idle | fetching | ok | error
+    private var serverTemplateFetchError: String? = null
+    private var serverTemplateFetchInFlight = false
     private var testSocWriteDoneForConnection: Boolean = false
     private val red = Color.rgb(255, 196, 0)
     private val redDark = Color.rgb(255, 183, 0)
@@ -636,6 +648,8 @@ class MainActivity : ComponentActivity() {
     private val serviceWriteResults: MutableList<ServiceWriteResult> = mutableListOf()
     private var serviceWriteActive: Boolean = false
     private var serviceWriteCapacityAh: Double? = null
+    /** Клиентское «Настроить BMS»: только отклонения шаблона, без service extras. */
+    private var clientTemplateApplyMode: Boolean = false
     private var serviceWriteTotal: Int = 0
     private var serviceWriteDone: Int = 0
     private var serviceWriteProgressBar: ProgressBar? = null
@@ -2018,154 +2032,196 @@ class MainActivity : ComponentActivity() {
         return when {
             s <= 20.0 -> "Низкий уровень заряда" to Color.rgb(210, 70, 70)
             s < 70.0 -> "Средний уровень заряда" to Color.rgb(215, 160, 35)
-            else -> "Батарея заряжена" to Color.rgb(45, 176, 69)
+            else -> "Батарея заряжена" to Color.rgb(31, 179, 90)
         }
     }
 
-    // --- Дизайн-константы экрана «Главное» (Views) ---
-    private val dashScreenPad get() = dp(16)
-    private val dashSectionGap get() = dp(12)
-    private val dashCardGap get() = dp(10)
-    private val dashLargeRadius get() = dp(18)
-    private val dashMetricRadius get() = dp(16)
-    private val dashMetricHeight get() = dp(88)
-    private val dashInfoHeight get() = dp(96)
-    private val dashListRowHeight get() = dp(62)
-    private val dashIconBox get() = dp(40)
-    private val dashIconSize get() = dp(24)
-    private val dashPageBg = Color.rgb(240, 243, 247)
-    private val dashCardBg = Color.WHITE
-    private val dashBorder = Color.rgb(220, 227, 235)
-    private val dashMuted = Color.rgb(111, 119, 129)
-    private val dashInk = Color.rgb(16, 17, 20)
-    private val dashIconTone = Color.rgb(55, 65, 78)
-    private val dashCapPanelBg = Color.rgb(236, 245, 240)
-
-    private fun dashCardDrawable(radius: Int = dashMetricRadius): GradientDrawable {
-        return round(dashCardBg, radius, dashBorder, 1)
+    /**
+     * Подгоняет размер шрифта под ширину TextView (1 строка, без «...»).
+     * Надёжнее TextViewCompat auto-size: Activity не AppCompat, обычный TextView.
+     */
+    private fun fitTextToWidth(tv: TextView, minSp: Float, maxSp: Float) {
+        val doFit = Runnable {
+            val available = tv.width - tv.paddingLeft - tv.paddingRight
+            val text = tv.text?.toString().orEmpty()
+            if (available <= 0 || text.isEmpty()) return@Runnable
+            var lo = minSp
+            var hi = maxSp
+            var best = minSp
+            val paint = Paint(tv.paint)
+            while (hi - lo > 0.2f) {
+                val mid = (lo + hi) / 2f
+                paint.textSize = TypedValue.applyDimension(
+                    TypedValue.COMPLEX_UNIT_SP,
+                    mid,
+                    resources.displayMetrics
+                )
+                if (paint.measureText(text) <= available) {
+                    best = mid
+                    lo = mid
+                } else {
+                    hi = mid
+                }
+            }
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, best)
+        }
+        tv.maxLines = 1
+        tv.isSingleLine = true
+        tv.ellipsize = null
+        tv.includeFontPadding = false
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, maxSp)
+        if (tv.width > 0) {
+            doFit.run()
+        } else {
+            tv.post(doFit)
+        }
     }
 
-    private fun dashIconBoxView(kind: DashIconKind): View {
-        val box = FrameLayout(this)
-        box.addView(
-            DashIconView(this, kind, dashIconTone),
-            FrameLayout.LayoutParams(dashIconSize, dashIconSize, Gravity.CENTER)
-        )
-        return box
+    private fun enableWidthFit(tv: TextView, minSp: Float, maxSp: Float) {
+        fitTextToWidth(tv, minSp, maxSp)
+        tv.addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
+            if (right - left != oldRight - oldLeft) {
+                fitTextToWidth(tv, minSp, maxSp)
+            }
+        }
     }
 
-    private data class DashInfoRefs(val root: LinearLayout, val value: TextView)
+    /** Компактная info-плитка: заголовок и значение в 1 строку, без иконки, без обрезки. */
+    private fun infoOneLineTile(label: String, initial: String): Pair<LinearLayout, TextView> {
+        val titleView = TextView(this).apply {
+            text = label
+            textSize = 11f
+            setTextColor(Color.rgb(111, 119, 129))
+            typeface = interFont(650)
+            gravity = Gravity.CENTER_VERTICAL
+            includeFontPadding = false
+            maxLines = 1
+            isSingleLine = true
+            ellipsize = null
+        }
+        val valueView = TextView(this).apply {
+            text = initial
+            textSize = 13f
+            setTextColor(Color.rgb(16, 17, 20))
+            typeface = interFont(720)
+            gravity = Gravity.CENTER_VERTICAL
+            includeFontPadding = false
+            maxLines = 1
+            isSingleLine = true
+            ellipsize = null
+            letterSpacing = -0.02f
+        }
+        enableWidthFit(titleView, 7f, 11f)
+        enableWidthFit(valueView, 6f, 13f)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), dp(10), dp(6), dp(10))
+            minimumHeight = dp(78)
+            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+            addView(titleView, LinearLayout.LayoutParams(-1, dp(16)))
+            addView(valueView, LinearLayout.LayoutParams(-1, dp(24)).apply { topMargin = dp(4) })
+        }
+        return box to valueView
+    }
 
-    private fun dashboardInfoTile(
-        kind: DashIconKind,
+    private fun capacityInnerTile(label: String, valueView: TextView): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            background = round(Color.rgb(248, 249, 251), dp(12), Color.rgb(223, 229, 235), 1)
+            addView(TextView(this@MainActivity).apply {
+                text = label
+                textSize = 12f
+                setTextColor(Color.rgb(111, 119, 129))
+                typeface = interFont(650)
+                maxLines = 1
+            })
+            addView(valueView, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        }
+    }
+
+    /** Единая типографика карточек главного экрана (без смены визуального языка). */
+    private fun classicMetricBox(
+        icon: String,
+        initial: String,
         label: String,
-        initial: String
-    ): DashInfoRefs {
+        sub: String = "",
+        valueSize: Float = 18f,
+        titleSize: Float = 12f,
+        truncate: Boolean = false,
+        fixedHeight: Boolean = true,
+        compact: Boolean = false,
+        fitOneLine: Boolean = false
+    ): Pair<LinearLayout, TextView> {
         val value = TextView(this).apply {
             text = initial
-            textSize = 14f
-            setTextColor(dashInk)
-            typeface = interFont(760)
-            maxLines = 2
+            textSize = valueSize
+            setTextColor(Color.rgb(16, 17, 20))
+            typeface = interFont(if (compact) 720 else 760)
+            maxLines = if (truncate) 2 else 1
+            if (fitOneLine) {
+                setSingleLine(true)
+                ellipsize = null
+            } else {
+                ellipsize = TextUtils.TruncateAt.END
+            }
+            setLineSpacing(0f, 1.05f)
+        }
+        val subView = TextView(this).apply {
+            text = sub.ifBlank { " " }
+            textSize = 12f
+            setTextColor(Color.rgb(111, 119, 129))
+            typeface = interFont(600)
+            maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
+            visibility = View.VISIBLE
+        }
+        val titleView = TextView(this).apply {
+            text = if (icon.isBlank()) label else "$icon  $label"
+            textSize = titleSize
+            setTextColor(Color.rgb(111, 119, 129))
+            typeface = interFont(650)
+            maxLines = 1
+            if (fitOneLine) {
+                setSingleLine(true)
+                ellipsize = null
+            } else {
+                ellipsize = TextUtils.TruncateAt.END
+            }
             setLineSpacing(0f, 1.05f)
         }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            background = dashCardDrawable(dashMetricRadius)
-            elevation = dp(1).toFloat()
-            addView(dashIconBoxView(kind), LinearLayout.LayoutParams(dashIconBox, dashIconBox))
-            addView(TextView(this@MainActivity).apply {
-                text = label
-                textSize = 12f
-                setTextColor(dashMuted)
-                typeface = interFont(650)
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-            addView(value, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+            setPadding(dp(if (compact) 10 else 12), dp(11), dp(if (compact) 10 else 12), dp(11))
+            if (fixedHeight) minimumHeight = dp(if (compact) 88 else 86)
+            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+            addView(titleView, LinearLayout.LayoutParams(-1, if (fitOneLine) dp(16) else -2))
+            addView(
+                value,
+                LinearLayout.LayoutParams(-1, if (fitOneLine) dp(22) else -2).apply {
+                    topMargin = dp(5)
+                }
+            )
+            addView(subView, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
         }
-        return DashInfoRefs(box, value)
+        if (fitOneLine) {
+            enableWidthFit(titleView, 7f, titleSize.coerceAtLeast(7f))
+            enableWidthFit(value, 6f, valueSize.coerceAtLeast(6f))
+        }
+        box.tag = subView
+        return box to value
     }
 
-    private data class DashMetricRefs(
-        val root: LinearLayout,
-        val value: TextView,
-        val sub: TextView,
-        val dot: View
-    )
-
-    private fun dashboardMetricTile(
-        kind: DashIconKind,
-        label: String,
-        initial: String,
-        subInitial: String = "",
-        showDot: Boolean = false
-    ): DashMetricRefs {
-        val value = TextView(this).apply {
-            text = initial
-            textSize = 20f
-            setTextColor(dashInk)
-            typeface = interFont(760)
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        }
-        val sub = TextView(this).apply {
-            text = subInitial
-            textSize = 12f
-            setTextColor(dashMuted)
-            typeface = interFont(650)
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            // INVISIBLE keeps fixed height for all metric tiles
-            visibility = if (subInitial.isBlank()) View.INVISIBLE else View.VISIBLE
-        }
-        val dot = View(this).apply {
-            background = round(Color.rgb(180, 186, 194), dp(5), Color.TRANSPARENT, 0)
-            visibility = if (showDot) View.VISIBLE else View.INVISIBLE
-        }
-        val textCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(TextView(this@MainActivity).apply {
-                text = label
-                textSize = 13f
-                setTextColor(dashMuted)
-                typeface = interFont(650)
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-            })
-            addView(value, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
-            addView(sub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
-        }
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            background = dashCardDrawable(dashMetricRadius)
-            elevation = dp(1).toFloat()
-            isClickable = false
-            isFocusable = false
-            addView(dashIconBoxView(kind), LinearLayout.LayoutParams(dashIconBox, dashIconBox).apply {
-                rightMargin = dp(10)
-            })
-            addView(textCol, LinearLayout.LayoutParams(0, -2, 1f))
-            addView(dot, LinearLayout.LayoutParams(dp(10), dp(10)).apply {
-                gravity = Gravity.BOTTOM
-                bottomMargin = dp(4)
-            })
-        }
-        return DashMetricRefs(row, value, sub, dot)
-    }
+    private fun classicMetricSub(box: LinearLayout): TextView? = box.tag as? TextView
 
     private fun showDashboardScreen(asRootHome: Boolean = false) {
         if (asRootHome) clearUiBackStack()
         enterScreen("dashboard", track = !asRootHome)
         currentTab = "main"
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(dashPageBg)
+            setBackgroundColor(Color.WHITE)
         }
 
         root.addView(
@@ -2177,250 +2233,203 @@ class MainActivity : ComponentActivity() {
             )
         )
 
-        val scroll = ScrollView(this).apply {
-            isFillViewport = true
-            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-        }
+        val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dashScreenPad, dp(10), dashScreenPad, dp(20))
+            setPadding(hPad(), 0, hPad(), dp(22))
         }
-        val halfGap = dashCardGap / 2
 
+        // Список BMS — в стиле старых карточек
         val listRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), 0, dp(14), 0)
-            background = round(Color.rgb(230, 236, 242), dashLargeRadius, Color.TRANSPARENT, 0)
-            elevation = dp(1).toFloat()
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
             isClickable = true
             isFocusable = true
             setOnClickListener { openBatteriesListFromDashboard() }
-            addView(dashIconBoxView(DashIconKind.LIST), LinearLayout.LayoutParams(dashIconBox, dashIconBox))
+            addView(TextView(this@MainActivity).apply {
+                text = "≡"
+                textSize = 18f
+                setTextColor(Color.rgb(16, 17, 20))
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(dp(28), -2))
             addView(TextView(this@MainActivity).apply {
                 text = "Список BMS / Добавить новую"
-                textSize = 15f
-                setTextColor(dashInk)
+                textSize = 14f
+                setTextColor(Color.rgb(16, 17, 20))
                 typeface = interFont(700)
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
-            }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(8) })
+            }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
             addView(TextView(this@MainActivity).apply {
                 text = "›"
-                textSize = 24f
-                setTextColor(dashMuted)
-                gravity = Gravity.CENTER
-            }, LinearLayout.LayoutParams(dp(24), -2))
+                textSize = 22f
+                setTextColor(Color.rgb(111, 119, 129))
+            })
         }
-        content.addView(listRow, LinearLayout.LayoutParams(-1, dashListRowHeight).apply {
-            bottomMargin = dashSectionGap
-        })
+        content.addView(listRow, marginLp(-1, -2, 0, 8, 0, 8))
 
-        val nameTile = dashboardInfoTile(
-            DashIconKind.TAG,
+        // Имя | Серийный номер | Версия — 1 строка, полный текст (без иконок, auto-size)
+        val nameMetric = infoOneLineTile(
             "Имя устройства",
             selectedDeviceName.ifBlank { selectedAddress ?: "--" }
         )
-        deviceNameValue = nameTile.value
-        val snTile = dashboardInfoTile(
-            DashIconKind.BARCODE,
-            "Заводской номер",
+        deviceNameValue = nameMetric.second
+        val snMetric = infoOneLineTile(
+            "Серийный номер",
             displayFactorySn().ifBlank { "--" }
         )
-        bmsSnValue = snTile.value
-        val verTile = dashboardInfoTile(
-            DashIconKind.CHIP,
+        bmsSnValue = snMetric.second
+        val verMetric = infoOneLineTile(
             "Версия BMS",
             displayBmsVersion().ifBlank { "--" }
         )
-        bmsVersionValue = verTile.value
-
-        val infoRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        infoRow.addView(nameTile.root, LinearLayout.LayoutParams(0, dashInfoHeight, 1f).apply {
-            rightMargin = halfGap
-        })
-        infoRow.addView(snTile.root, LinearLayout.LayoutParams(0, dashInfoHeight, 1f).apply {
-            leftMargin = halfGap
-            rightMargin = halfGap
-        })
-        infoRow.addView(verTile.root, LinearLayout.LayoutParams(0, dashInfoHeight, 1f).apply {
-            leftMargin = halfGap
-        })
-        content.addView(infoRow, LinearLayout.LayoutParams(-1, -2).apply {
-            bottomMargin = dashSectionGap
-        })
-
-        val socCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
-            background = dashCardDrawable(dashLargeRadius)
-            elevation = dp(2).toFloat()
+        bmsVersionValue = verMetric.second
+        val infoRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.FILL
+            isMeasureWithLargestChildEnabled = true
         }
-        socCard.addView(TextView(this).apply {
-            text = "SOC"
-            textSize = 14f
-            setTextColor(dashInk)
-            typeface = interFont(760)
-        })
-        socCard.addView(TextView(this).apply {
-            text = "Уровень заряда"
-            textSize = 12f
-            setTextColor(dashMuted)
-            typeface = interFont(650)
-        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
+        infoRow.addView(nameMetric.first, marginLp(0, -1, 0, 0, 4, 0).apply { weight = 1f })
+        infoRow.addView(snMetric.first, marginLp(0, -1, 4, 0, 4, 0).apply { weight = 1f })
+        infoRow.addView(verMetric.first, marginLp(0, -1, 4, 0, 0, 0).apply { weight = 1f })
+        content.addView(infoRow, marginLp(-1, -2, 0, 0, 0, 8))
+        equalizeRowChildHeights(infoRow)
 
-        val socBody = LinearLayout(this).apply {
+        // SOC (крупнее) + ёмкость правее (две внутренние плашки)
+        val hero = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(10), 0, 0)
+            setPadding(dp(12), dp(16), dp(16), dp(16))
+            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+            elevation = dp(2).toFloat()
         }
-        val screenW = resources.displayMetrics.widthPixels
-        val gaugeSize = ((screenW - dashScreenPad * 2) * 0.42f).toInt()
-            .coerceIn(dp(160), dp(188))
-
-        val socLeft = LinearLayout(this).apply {
+        val socCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
         }
         socGauge = SocGaugeView(this)
-        socLeft.addView(socGauge, LinearLayout.LayoutParams(gaugeSize, gaugeSize))
-        val (statusLabel, statusColor) = socStatusLabel(data.soc)
+        val gaugeSize = dp(156)
+        socCol.addView(socGauge, LinearLayout.LayoutParams(gaugeSize, gaugeSize))
+        val (stLabel, stColor) = socStatusLabel(data.soc)
         socStatusText = TextView(this).apply {
-            text = statusLabel
-            textSize = 13f
-            setTextColor(statusColor)
+            text = stLabel
+            textSize = 12f
+            setTextColor(stColor)
             typeface = interFont(700)
             gravity = Gravity.CENTER
             maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
         }
-        socLeft.addView(socStatusText, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
-        socBody.addView(socLeft, LinearLayout.LayoutParams(0, -2, 1.15f))
+        socCol.addView(socStatusText, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+        hero.addView(socCol, LinearLayout.LayoutParams(0, -2, 0.95f))
 
-        val capacityPanel = LinearLayout(this).apply {
+        val capacityCol = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            background = round(dashCapPanelBg, dashMetricRadius, Color.TRANSPARENT, 0)
+            setPadding(dp(12), dp(2), dp(2), dp(2))
         }
-        capacityPanel.addView(
-            BatteryIconView(this, Color.rgb(45, 140, 75), 22f),
-            LinearLayout.LayoutParams(dp(28), dp(28)).apply { bottomMargin = dp(8) }
-        )
-        capacityPanel.addView(TextView(this).apply {
-            text = "Полная ёмкость"
-            textSize = 13f
-            setTextColor(dashMuted)
-            typeface = interFont(650)
-        })
         fullCapacityValue = TextView(this).apply {
-            text = "-- Ач"
-            textSize = 28f
-            setTextColor(dashInk)
-            typeface = interFont(780)
+            text = "-- А·ч"
+            textSize = 20f
+            setTextColor(Color.rgb(16, 17, 20))
+            typeface = interFont(770)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
-        capacityPanel.addView(fullCapacityValue, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
-        capacityPanel.addView(View(this).apply {
-            setBackgroundColor(Color.rgb(198, 218, 205))
-        }, LinearLayout.LayoutParams(-1, dp(1)).apply {
-            topMargin = dp(12)
-            bottomMargin = dp(12)
-        })
-        capacityPanel.addView(TextView(this).apply {
-            text = "Осталось"
-            textSize = 13f
-            setTextColor(dashMuted)
-            typeface = interFont(650)
-        })
         remainingValue = TextView(this).apply {
-            text = "-- Ач"
-            textSize = 21f
-            setTextColor(dashInk)
-            typeface = interFont(760)
+            text = "-- А·ч"
+            textSize = 20f
+            setTextColor(Color.rgb(16, 17, 20))
+            typeface = interFont(770)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
-        capacityPanel.addView(remainingValue, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
-        socBody.addView(capacityPanel, LinearLayout.LayoutParams(0, -1, 0.95f).apply {
-            leftMargin = dashCardGap
-        })
-        socCard.addView(socBody)
-        content.addView(socCard, LinearLayout.LayoutParams(-1, -2).apply {
-            bottomMargin = dashSectionGap
-        })
+        capacityCol.addView(
+            capacityInnerTile("Полная ёмкость", fullCapacityValue!!),
+            LinearLayout.LayoutParams(-1, -2)
+        )
+        capacityCol.addView(
+            capacityInnerTile("Осталось", remainingValue),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
+        )
+        socProgress = null
+        hero.addView(capacityCol, LinearLayout.LayoutParams(0, -1, 1.05f))
+        content.addView(hero, marginLp(-1, -2, 0, 0, 0, 8))
 
-        fun addMetricRow(left: View, right: View) {
-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            row.addView(left, LinearLayout.LayoutParams(0, dashMetricHeight, 1f).apply {
-                rightMargin = halfGap
-            })
-            row.addView(right, LinearLayout.LayoutParams(0, dashMetricHeight, 1f).apply {
-                leftMargin = halfGap
-            })
-            content.addView(row, LinearLayout.LayoutParams(-1, -2).apply {
-                bottomMargin = dashCardGap
-            })
+        fun addPair(left: View, right: View) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.FILL
+                isMeasureWithLargestChildEnabled = true
+            }
+            row.addView(left, marginLp(0, -1, 0, 0, 4, 0).apply { weight = 1f })
+            row.addView(right, marginLp(0, -1, 4, 0, 0, 0).apply { weight = 1f })
+            content.addView(row, marginLp(-1, -2, 0, 0, 0, 8))
+            equalizeRowChildHeights(row)
         }
 
-        val voltageTile = dashboardMetricTile(DashIconKind.BOLT, "Напряжение", "-- В")
-        voltageValue = voltageTile.value
-        val currentTile = dashboardMetricTile(
-            DashIconKind.CURRENT,
-            "Ток",
+        val voltageMetric = classicMetricBox(
+            "⚡", "-- В", "Напряжение", "Напряжение батареи",
+            valueSize = 18f, titleSize = 12f
+        )
+        voltageValue = voltageMetric.second
+        val currentMetric = classicMetricBox(
+            "↯",
             "-- А",
-            currentDirectionLabel(data.current)
+            "Ток",
+            currentDirectionLabel(data.current),
+            valueSize = 18f,
+            titleSize = 12f
         )
-        currentValue = currentTile.value
-        currentSubValue = currentTile.sub
-        addMetricRow(voltageTile.root, currentTile.root)
+        currentValue = currentMetric.second
+        currentSubValue = classicMetricSub(currentMetric.first)
+        addPair(voltageMetric.first, currentMetric.first)
 
-        val tempTile = dashboardMetricTile(DashIconKind.THERMO, "Температура", "-- °C")
-        t1Text = tempTile.value
-        val cellsTile = dashboardMetricTile(
-            DashIconKind.CELLS,
-            "Количество ячеек",
+        val tempMetric = classicMetricBox(
+            "°", "-- °C", "Температура", "Датчик BMS",
+            valueSize = 18f, titleSize = 12f
+        )
+        t1Text = tempMetric.second
+        val cellsMetric = classicMetricBox(
+            "▤",
             data.cellCount?.toString() ?: "--",
-            "LiFePO4"
+            "Количество ячеек",
+            "LiFePO4",
+            valueSize = 18f,
+            titleSize = 12f
         )
-        cellCountValue = cellsTile.value
-        addMetricRow(tempTile.root, cellsTile.root)
+        cellCountValue = cellsMetric.second
+        addPair(tempMetric.first, cellsMetric.first)
 
-        val chargeMosTile = dashboardMetricTile(
-            DashIconKind.POWER,
-            "MOS зарядки",
-            "—",
-            showDot = true
+        val chargeMetric = classicMetricBox(
+            "⏻", "—", "MOS зарядки", " ",
+            valueSize = 18f, titleSize = 12f
         )
-        chargeMosValue = chargeMosTile.value
-        chargeMosDot = chargeMosTile.dot
-        val dischargeMosTile = dashboardMetricTile(
-            DashIconKind.POWER,
-            "MOS разрядки",
-            "—",
-            showDot = true
+        chargeMosValue = chargeMetric.second
+        chargeMosDot = null
+        val dischargeMetric = classicMetricBox(
+            "⏻", "—", "MOS разрядки", " ",
+            valueSize = 18f, titleSize = 12f
         )
-        dischargeMosValue = dischargeMosTile.value
-        dischargeMosDot = dischargeMosTile.dot
-        addMetricRow(chargeMosTile.root, dischargeMosTile.root)
+        dischargeMosValue = dischargeMetric.second
+        dischargeMosDot = null
+        addPair(chargeMetric.first, dischargeMetric.first)
 
-        val statusTile = dashboardMetricTile(
-            DashIconKind.SHIELD,
-            "Статус BMS",
-            "—",
-            showDot = true
+        val statusMetric = classicMetricBox(
+            "◉", "—", "Статус BMS", " ",
+            valueSize = 18f, titleSize = 12f
         )
-        balanceValue = statusTile.value
-        balanceDot = statusTile.dot
-        val stateTile = dashboardMetricTile(
-            DashIconKind.PULSE,
-            "Состояние",
-            "—",
-            showDot = true
+        balanceValue = statusMetric.second
+        balanceDot = null
+        val stateMetric = classicMetricBox(
+            "≈", "—", "Состояние", " ",
+            valueSize = 18f, titleSize = 12f
         )
-        stateValue = stateTile.value
-        stateDot = stateTile.dot
-        addMetricRow(statusTile.root, stateTile.root)
+        stateValue = stateMetric.second
+        stateDot = null
+        addPair(statusMetric.first, stateMetric.first)
 
         if (isServiceApp()) {
             dashboardUploadStatusText = TextView(this).apply {
@@ -2428,18 +2437,16 @@ class MainActivity : ComponentActivity() {
                 textSize = 12f
                 setTextColor(Color.rgb(90, 90, 90))
             }
-            content.addView(dashboardUploadStatusText, LinearLayout.LayoutParams(-1, -2).apply {
-                bottomMargin = dp(8)
-            })
+            content.addView(dashboardUploadStatusText, marginLp(-1, -2, 0, 0, 0, 8))
             content.addView(TextView(this).apply {
                 text = "ОТПРАВИТЬ НА СЕРВЕР"
                 gravity = Gravity.CENTER
                 textSize = 14f
                 typeface = interFont(760)
-                setTextColor(dashInk)
+                setTextColor(Color.rgb(16, 17, 20))
                 background = round(red, dp(14), Color.TRANSPARENT, 0)
                 setOnClickListener { uploadCurrentData(force = true) }
-            }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dashCardGap })
+            }, marginLp(-1, dp(48), 0, 0, 0, 8))
         } else {
             dashboardUploadStatusText = null
         }
@@ -2448,96 +2455,66 @@ class MainActivity : ComponentActivity() {
         heatValue = TextView(this)
         t2Text = TextView(this)
         cycleCountValue = TextView(this)
-        socProgress = null
         bluetoothIdValue = if (isServiceApp()) {
             TextView(this).apply { visibility = View.GONE }
-        } else {
-            null
-        }
+        } else null
 
         val cellsCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            background = dashCardDrawable(dashLargeRadius)
-            elevation = dp(1).toFloat()
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
         }
         val cellsHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        cellsHeader.addView(dashIconBoxView(DashIconKind.CHART), LinearLayout.LayoutParams(dashIconBox, dashIconBox))
         cellsHeader.addView(TextView(this).apply {
             text = "Напряжение по ячейкам"
-            textSize = 15f
-            setTextColor(dashInk)
+            textSize = 14f
+            setTextColor(Color.rgb(16, 17, 20))
             typeface = interFont(760)
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
+        }, LinearLayout.LayoutParams(0, -2, 1f))
         cellDiffHeaderValue = TextView(this).apply {
             text = ""
             textSize = 12f
-            setTextColor(dashMuted)
+            setTextColor(Color.rgb(111, 119, 129))
             typeface = interFont(650)
-            maxLines = 1
         }
         cellsHeader.addView(cellDiffHeaderValue)
-        cellsHeader.addView(TextView(this).apply {
-            text = "›"
-            textSize = 22f
-            setTextColor(dashMuted)
-        }, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(4) })
         cellsCard.addView(cellsHeader)
         cellsLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(12), 0, 0)
+            setPadding(0, dp(10), 0, 0)
         }
         cellsCard.addView(cellsLayout)
-        content.addView(cellsCard, LinearLayout.LayoutParams(-1, -2).apply {
-            topMargin = dp(2)
-            bottomMargin = dashSectionGap
-        })
+        content.addView(cellsCard, marginLp(-1, -2, 0, 8, 0, 8))
 
         overallStatusBanner = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-            background = round(Color.rgb(232, 245, 236), dashLargeRadius, Color.TRANSPARENT, 0)
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
         }
-        overallStatusIcon = TextView(this).apply {
-            text = "✓"
-            textSize = 16f
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            background = round(Color.rgb(45, 176, 69), dp(14), Color.TRANSPARENT, 0)
-        }
+        overallStatusIcon = null
         overallStatusTitle = TextView(this).apply {
-            text = "Батарея в норме"
-            textSize = 15f
-            setTextColor(Color.rgb(28, 140, 60))
+            text = "✓  Батарея в норме"
+            textSize = 14f
+            setTextColor(Color.rgb(31, 179, 90))
             typeface = interFont(760)
         }
         overallStatusSub = TextView(this).apply {
             text = "Все параметры в пределах нормы"
             textSize = 12f
-            setTextColor(Color.rgb(70, 120, 85))
+            setTextColor(Color.rgb(111, 119, 129))
         }
-        val overallCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(overallStatusTitle)
-            addView(overallStatusSub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(2) })
-        }
+        overallStatusBanner?.addView(overallStatusTitle)
         overallStatusBanner?.addView(
-            overallStatusIcon,
-            LinearLayout.LayoutParams(dp(28), dp(28)).apply { rightMargin = dp(10) }
+            overallStatusSub,
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) }
         )
-        overallStatusBanner?.addView(overallCol, LinearLayout.LayoutParams(0, -2, 1f))
-        overallStatusBanner?.addView(TextView(this).apply {
-            text = "›"
-            textSize = 22f
-            setTextColor(Color.rgb(90, 150, 110))
-        })
-        content.addView(overallStatusBanner, LinearLayout.LayoutParams(-1, -2))
+        overallStatusBanner?.isClickable = true
+        overallStatusBanner?.isFocusable = true
+        overallStatusBanner?.setOnClickListener { showConfigCheckScreen() }
+        content.addView(overallStatusBanner, marginLp(-1, -2, 0, 0, 0, 4))
 
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -2678,6 +2655,7 @@ class MainActivity : ComponentActivity() {
             "support" -> showSupportScreen()
             "profile" -> showProfileScreen()
             "manage" -> showManageScreen()
+            "config_check" -> showConfigCheckScreen()
             "service" -> showServiceScreen()
             "qtc" -> showQtcScreen()
             "auth" -> showAuthScreen()
@@ -3069,6 +3047,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (configRegisters.isEmpty() && !configReadInProgress) loadCachedConfigForCurrentBms()
+        fetchServerConfigTemplate(force = false)
 
         enterScreen("qtc")
         currentTab = "qtc"
@@ -3171,12 +3150,14 @@ class MainActivity : ComponentActivity() {
             "ok" -> "Конфигурация соответствует шаблону"
             "mismatch" -> "Конфигурация не соответствует шаблону"
             "incomplete" -> "Проверка конфигурации неполная"
+            "unavailable" -> "Проверка конфигурации недоступна"
             else -> "Конфигурация ещё не проверена"
         }
         val detail = when (status) {
             "ok" -> "Серия $series. Все параметры шаблона совпадают."
             "mismatch" -> "Серия $series. Ниже указаны расхождения."
             "incomplete" -> "Серия $series. Не все параметры удалось сравнить."
+            "unavailable" -> "Не удалось получить актуальный шаблон с сервера."
             "checking" -> "Чтение настроек BMS ещё не закончено."
             else -> "Подключите BMS и дождитесь чтения конфигурации."
         }
@@ -3201,15 +3182,12 @@ class MainActivity : ComponentActivity() {
 
     private fun qtcTemplateParameterRows(): List<Pair<String, String>> {
         val series = resolvedSeriesCount()
-        val template = try {
-            loadBmsConfigTemplate()
-        } catch (_: Exception) {
-            return listOf("Шаблон" to "не загружен")
-        }
+        val template = activeCheckTemplate()
+            ?: return listOf("Шаблон" to "не получен с сервера")
         val family = currentHardwareFamily()
         val rows = mutableListOf<Pair<String, String>>()
         for (parameter in template.parameters) {
-            if (parameter.enforcement == "informational") continue
+            if (!parameter.enabled || parameter.enforcement == "informational") continue
             if (shouldSkipTemplateParameter(parameter, family)) continue
             val expected = parameter.expected ?: series?.let { parameter.expectedBySeries[it] }
             val actual = templateParameterActual(parameter)
@@ -3437,6 +3415,120 @@ class MainActivity : ComponentActivity() {
         return "Успешно $ok из ${serviceWriteResults.size}"
     }
 
+    private fun writeTargetSeries(): Int {
+        // Сервисный полный шаблон: серия из выбора 12В/24В.
+        if (serviceWriteCapacityAh != null) {
+            return if (serviceTemplateKey == "24v") 8 else 4
+        }
+        return resolvedSeriesCount() ?: if (serviceTemplateKey == "24v") 8 else 4
+    }
+
+    /** Клиент: записать только writable-параметры шаблона, которые не совпадают. */
+    private fun startClientTemplateApply() {
+        if (serviceWriteActive) {
+            toast("Запись уже выполняется")
+            return
+        }
+        if (bluetoothGatt == null || writeCharacteristic == null) {
+            toast("Подключите BMS по Bluetooth")
+            return
+        }
+        toast("Получаем актуальный шаблон с сервера…")
+        fetchServerConfigTemplate(force = true) {
+            val template = activeServerTemplate
+            if (template == null) {
+                toast(
+                    serverTemplateFetchError
+                        ?: "Не удалось получить актуальный шаблон. Настройка недоступна."
+                )
+                return@fetchServerConfigTemplate
+            }
+            val series = resolvedSeriesCount()
+            if (series == null || series !in template.supportedSeries) {
+                toast("Нет подходящего шаблона конфигурации для этой BMS")
+                return@fetchServerConfigTemplate
+            }
+            enqueueClientTemplateWrites(series, template)
+        }
+    }
+
+    private fun enqueueClientTemplateWrites(series: Int, template: BmsConfigTemplate) {
+        val family = currentHardwareFamily()
+        val queue = java.util.ArrayDeque<RemoteWriteCommand>()
+        var id = 1
+        serviceWriteResults.clear()
+        serviceWriteCapacityAh = null
+        serviceWriteRetryRound = 0
+        clientTemplateApplyMode = true
+        Log.i(
+            BLE_LOG_TAG,
+            "CONFIG TEMPLATE client apply id=${template.id} version=${template.version} series=$series family=$family"
+        )
+        for (parameter in orderedTemplateParameters(template.parameters)) {
+            if (!parameter.writable) continue
+            if (shouldSkipTemplateParameter(parameter, family)) continue
+            val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
+            if (parameter.key == "series_cell_count") {
+                if (data.cellCount == expected.toInt()) {
+                    upsertServiceWriteResult(
+                        ServiceWriteResult(
+                            key = parameter.key,
+                            label = parameter.label,
+                            expected = expected,
+                            actual = data.cellCount?.toDouble(),
+                            unit = parameter.unit,
+                            ok = true
+                        )
+                    )
+                } else {
+                    id = enqueueSeriesCountWrite(queue, expected.toInt(), id)
+                }
+                continue
+            }
+            if (templateParameterMatches(parameter, expected)) {
+                upsertServiceWriteResult(
+                    ServiceWriteResult(
+                        key = parameter.key,
+                        label = parameter.label,
+                        expected = expected,
+                        actual = templateParameterActual(parameter),
+                        unit = parameter.unit,
+                        ok = true
+                    )
+                )
+                continue
+            }
+            val command = templateParameterWriteCommand(id, parameter, expected) ?: continue
+            Log.i(
+                BLE_LOG_TAG,
+                "PARAM ${parameter.key} expected=$expected ${parameter.unit} client enqueue write"
+            )
+            queue.add(command)
+            id++
+        }
+        if (queue.isEmpty()) {
+            clientTemplateApplyMode = false
+            serviceWriteActive = false
+            if (configRegisters.isNotEmpty()) {
+                setTemplateCheckResult(evaluateTemplateCheck())
+            }
+            toast(
+                if (serviceWriteResults.isEmpty()) "Нет параметров для записи"
+                else "Все параметры уже совпадают, запись не нужна"
+            )
+            showConfigCheckScreen()
+            return
+        }
+        serviceWriteQueue = queue
+        serviceWriteTotal = queue.size
+        serviceWriteDone = 0
+        serviceWriteActive = true
+        toast("Запись ${queue.size} параметр(ов) по шаблону…")
+        showConfigCheckScreen()
+        val first = serviceWriteQueue.poll()
+        if (first != null) startRemoteWrite(first)
+    }
+
     private fun startServiceTemplateWrite() {
         if (!isServiceApp() || serviceWriteActive) return
         if (assemblerName().isBlank()) {
@@ -3453,7 +3545,22 @@ class MainActivity : ComponentActivity() {
             return
         }
         val series = if (serviceTemplateKey == "24v") 8 else 4
-        enqueueServiceTemplateWrites(capacity, series)
+        toast("Получаем актуальный шаблон с сервера…")
+        fetchServerConfigTemplate(force = true) {
+            val template = activeServerTemplate
+            if (template == null) {
+                toast(
+                    serverTemplateFetchError
+                        ?: "Не удалось получить актуальный шаблон конфигурации. Настройка недоступна."
+                )
+                return@fetchServerConfigTemplate
+            }
+            if (series !in template.supportedSeries) {
+                toast("Нет подходящего шаблона конфигурации для этой BMS (${series}S)")
+                return@fetchServerConfigTemplate
+            }
+            enqueueServiceTemplateWrites(capacity, series, template)
+        }
     }
 
     private fun serviceWriteProgressPercent(): Int {
@@ -3471,12 +3578,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun enqueueServiceTemplateWrites(capacityAh: Double, series: Int) {
-        val fileName = if (serviceTemplateKey == "24v") "service_template_24v.json" else "service_template_12v.json"
-        val template = try {
-            loadBmsConfigTemplate(fileName)
-        } catch (e: Exception) {
-            toast("Не удалось загрузить шаблон: ${e.message ?: e.javaClass.simpleName}")
+    /** Эталон для записи — только серверный template (не assets). */
+    private fun activeWriteTemplate(): BmsConfigTemplate? = activeServerTemplate
+
+    private fun enqueueServiceTemplateWrites(
+        capacityAh: Double,
+        series: Int,
+        template: BmsConfigTemplate
+    ) {
+        if (series !in template.supportedSeries) {
+            toast("Нет подходящего шаблона конфигурации для этой BMS (${series}S)")
             return
         }
         val family = currentHardwareFamily()
@@ -3485,12 +3596,35 @@ class MainActivity : ComponentActivity() {
         serviceWriteResults.clear()
         serviceWriteCapacityAh = capacityAh
         serviceWriteRetryRound = 0
+        Log.i(
+            BLE_LOG_TAG,
+            "CONFIG TEMPLATE write start id=${template.id} version=${template.version} series=$series family=$family"
+        )
         id = enqueueSeriesCountWrite(queue, series, id)
         for (parameter in orderedTemplateParameters(template.parameters)) {
             if (parameter.key == "series_cell_count") continue
+            if (!parameter.writable) continue
             if (shouldSkipTemplateParameter(parameter, family)) continue
             val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
+            if (templateParameterMatches(parameter, expected)) {
+                upsertServiceWriteResult(
+                    ServiceWriteResult(
+                        key = parameter.key,
+                        label = parameter.label,
+                        expected = expected,
+                        actual = templateParameterActual(parameter),
+                        unit = parameter.unit,
+                        ok = true,
+                        error = null
+                    )
+                )
+                continue
+            }
             val command = templateParameterWriteCommand(id, parameter, expected) ?: continue
+            Log.i(
+                BLE_LOG_TAG,
+                "PARAM ${parameter.key} expected=$expected ${parameter.unit} enqueue write register=0x${parameter.register.toString(16)}"
+            )
             queue.add(command)
             id++
         }
@@ -3507,6 +3641,9 @@ class MainActivity : ComponentActivity() {
                 if (serviceWriteResults.isEmpty()) "В шаблоне нет параметров для записи"
                 else "Все параметры уже совпадают, запись не нужна"
             )
+            if (configRegisters.isNotEmpty()) {
+                setTemplateCheckResult(evaluateTemplateCheck())
+            }
             return
         }
         serviceWriteQueue = queue
@@ -3714,18 +3851,14 @@ class MainActivity : ComponentActivity() {
     private fun enqueueServiceTemplateRetryIfNeeded(): Boolean {
         if (serviceWriteRetryRound >= SERVICE_WRITE_MAX_RETRY_ROUNDS) return false
         refreshServiceTemplateParamResults()
-        val series = if (serviceTemplateKey == "24v") 8 else 4
+        val series = writeTargetSeries()
         val family = currentHardwareFamily()
-        val template = try {
-            val fileName = if (serviceTemplateKey == "24v") "service_template_24v.json" else "service_template_12v.json"
-            loadBmsConfigTemplate(fileName)
-        } catch (_: Exception) {
-            return false
-        }
+        val template = activeWriteTemplate() ?: return false
         val queue = java.util.ArrayDeque<RemoteWriteCommand>()
         var id = 1000 + serviceWriteRetryRound * 100
         for (parameter in orderedTemplateParameters(template.parameters)) {
             if (parameter.key == "series_cell_count") continue
+            if (!parameter.writable) continue
             if (shouldSkipTemplateParameter(parameter, family)) continue
             val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
             if (templateParameterMatches(parameter, expected)) continue
@@ -3851,8 +3984,25 @@ class MainActivity : ComponentActivity() {
         serviceWriteTotal = 0
         serviceWriteDone = 0
         finalizeServiceWriteResults()
-        uploadServiceReport()
+        if (configRegisters.isNotEmpty() && activeServerTemplate != null) {
+            setTemplateCheckResult(evaluateTemplateCheck())
+        }
+        val clientMode = clientTemplateApplyMode
+        clientTemplateApplyMode = false
         val failed = serviceWriteResults.count { !it.ok }
+        if (clientMode) {
+            if (serviceWriteResults.isNotEmpty() && failed == 0) {
+                toast("Настройка BMS завершена. Все параметры записаны и проверены.")
+            } else if (failed > 0) {
+                toast("Настройка BMS не завершена. Не подтверждено: $failed")
+            } else {
+                toast("Запись завершена")
+            }
+            if (screenState == "dashboard") updateDashboardUi()
+            showConfigCheckScreen()
+            return
+        }
+        uploadServiceReport()
         if (serviceWriteResults.isNotEmpty() && failed == 0) {
             removeCurrentSessionBattery()
             toast("Настройка BMS успешно завершена. Все параметры записаны и проверены.")
@@ -3936,16 +4086,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshServiceTemplateParamResults() {
-        val series = if (serviceTemplateKey == "24v") 8 else 4
+        val series = writeTargetSeries()
         val family = currentHardwareFamily()
-        val template = try {
-            val fileName = if (serviceTemplateKey == "24v") "service_template_24v.json" else "service_template_12v.json"
-            loadBmsConfigTemplate(fileName)
-        } catch (_: Exception) {
-            return
-        }
+        val template = activeWriteTemplate() ?: return
         for (parameter in template.parameters) {
             if (parameter.key == "series_cell_count") continue
+            if (!parameter.writable) continue
             if (shouldSkipTemplateParameter(parameter, family)) continue
             val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
             val actual = templateParameterActual(parameter)
@@ -4061,7 +4207,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun switchManageSection(direction: Int) {
-        val sections = listOf("general", "voltage_current", "temperature", "balancing")
+        val sections = listOf("general", "voltage_current", "temperature", "balancing", "cell")
         val currentIndex = sections.indexOf(manageSection).coerceAtLeast(0)
         val nextIndex = (currentIndex + direction).coerceIn(sections.indices)
         if (nextIndex == currentIndex) return
@@ -4073,19 +4219,12 @@ class MainActivity : ComponentActivity() {
         if (!::manageContentLayout.isInitialized) return
         manageContentLayout.removeAllViews()
 
-        if (manageSection == "general") {
-            manageContentLayout.addView(
-                templateCheckCard(),
-                marginLp(-1, -2, 0, 0, 0, 10)
-            )
-        }
-
         manageContentLayout.addView(TextView(this).apply {
             text = when (manageSection) {
                 "general" -> "Основные параметры"
                 "voltage_current" -> "Напряжение / ток"
                 "temperature" -> "Температура"
-                "balancing" -> "Защиты и балансировка"
+                "balancing" -> "Настройка балансировки"
                 "cell" -> "Параметры элемента"
                 else -> "Основные параметры"
             }
@@ -4099,10 +4238,7 @@ class MainActivity : ComponentActivity() {
             "general" -> renderManageGeneral()
             "voltage_current" -> renderManageVoltageCurrent()
             "temperature" -> renderManageTemperature()
-            "balancing" -> {
-                renderManageBalancing()
-                renderManageCellParameters()
-            }
+            "balancing" -> renderManageBalancing()
             "cell" -> renderManageCellParameters()
             else -> renderManageGeneral()
         }
@@ -4120,7 +4256,8 @@ class MainActivity : ComponentActivity() {
             "general" to "Основные",
             "voltage_current" to "Напряжение",
             "temperature" to "Температура",
-            "balancing" to "Защиты"
+            "cell" to "Параметры элемента",
+            "balancing" to "Балансировка"
         )
         for ((key, title) in tabs) {
             row.addView(manageTabButton(key, title), marginLp(-2, dp(42), 0, 0, 8, 0))
@@ -4159,14 +4296,10 @@ class MainActivity : ComponentActivity() {
             listOf(
                 "Тип батареи" to batteryTypeText(),
                 "Номинальная емкость" to nominalCapacityText(),
-                "Время ожидания сна" to regText(0x0115, 0.1, "S"),
+                "Время ожидания сна" to regText(0x0115, 0.1, "s"),
                 "Настройка SOC" to fmtPct(data.soc),
                 "Калибр. SOC 0" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_0_REG, 1000.0, "V")),
-                "Калибр. SOC 100" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V")),
-                "Переключатель зарядки" to mosText(data.chargeMos),
-                "Переключатель разрядки" to mosText(data.dischargeMos),
-                "Изменить пароль настроек" to "только чтение",
-                "Отправить данные в облако" to "OFF"
+                "Калибр. SOC 100" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V"))
             )
         ), marginLp(-1, -2, 0, 0, 0, 12))
 
@@ -4317,8 +4450,7 @@ class MainActivity : ComponentActivity() {
                 "Напряжение включения балансировки" to dlUnsupportedOr(regVoltageOneDecimal(0x011A)),
                 "Напряжение отключения балансировки" to dlUnsupportedOr(regText(0x01FB, 1000.0, "V")),
                 "Перепад напряжения при открытии балансировки" to dlUnsupportedOr(regText(0x011B, null, "mV")),
-                "Ток включения балансировки" to dlUnsupportedOr(regCurrentOneDecimal(0x0151)),
-                "Переключатель активной балансировки" to dlUnsupportedOr(balanceSwitchText(0x0220))
+                "Ток включения балансировки" to dlUnsupportedOr(regCurrentOneDecimal(0x0151))
             )
         ), marginLp(-1, -2, 0, 0, 0, 12))
 
@@ -4341,14 +4473,10 @@ class MainActivity : ComponentActivity() {
             listOf(
                 "Тип батареи" to batteryTypeText(),
                 "Номинальная емкость" to nominalCapacityText(),
-                "Время ожидания сна" to regText(0x0115, 0.1, "S"),
+                "Время ожидания сна" to regText(0x0115, 0.1, "s"),
                 "Настройка SOC" to fmtPct(data.soc),
                 "Калибр. SOC 0" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_0_REG, 1000.0, "V")),
-                "Калибр. SOC 100" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V")),
-                "Адрес подчиненной платы" to regText(0x020F, null, ""),
-                "Тип инвертора" to "не проверяется",
-                "Способ связи" to "не проверяется",
-                "Протокол одной шины" to "не проверяется"
+                "Калибр. SOC 100" to dlUnsupportedOr(regText(DALY_SOC_CALIBRATION_100_REG, 1000.0, "V"))
             )
         ), marginLp(-1, -2, 0, 0, 0, 12))
 
@@ -4392,13 +4520,13 @@ class MainActivity : ComponentActivity() {
         val raw = configRegisters[addr] ?: return readOnlyUnavailable()
         val valueText = if (scale != null) {
             val v = raw / scale
-            if (unit == "V") {
-                "%.3f".format(v).trimTrailingZeros()
-            } else if (unit == "A") {
-                "%.2f".format(v).trimTrailingZeros()
-            } else {
-                "%.2f".format(v).trimTrailingZeros()
-            }
+            val formatted = when (unit.lowercase(java.util.Locale.ROOT)) {
+                "v" -> java.lang.String.format(java.util.Locale.US, "%.3f", v)
+                "a" -> java.lang.String.format(java.util.Locale.US, "%.2f", v)
+                "s" -> java.lang.String.format(java.util.Locale.US, "%.2f", v)
+                else -> java.lang.String.format(java.util.Locale.US, "%.2f", v)
+            }.trimTrailingZeros()
+            formatted
         } else {
             raw.toString()
         }
@@ -4468,13 +4596,25 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadBmsConfigTemplate(fileName: String = "bms_config_template.json"): BmsConfigTemplate {
+        // Сервисные write-шаблоны (12V/24V) остаются в assets.
+        // Эталон для проверки берётся только с сервера — см. activeCheckTemplate().
+        if (fileName == "bms_config_template.json") {
+            activeServerTemplate?.let { return it }
+            throw IllegalStateException("server_template_unavailable")
+        }
         val root = assets.open(fileName)
             .bufferedReader(Charsets.UTF_8)
             .use { JSONObject(it.readText()) }
+        return parseBmsConfigTemplateJson(root)
+    }
+
+    private fun activeCheckTemplate(): BmsConfigTemplate? = activeServerTemplate
+
+    private fun parseBmsConfigTemplateJson(root: JSONObject): BmsConfigTemplate {
         val templateId = root.getString("id")
         val templateVersion = root.getInt("version")
-        val chemistry = root.getString("chemistry")
-        require(templateId.isNotBlank() && templateVersion > 0 && chemistry.isNotBlank())
+        val chemistry = root.optString("chemistry", "")
+        require(templateId.isNotBlank() && templateVersion > 0)
         val parametersJson = root.getJSONArray("parameters")
         require(parametersJson.length() > 0)
         val parameters = mutableListOf<BmsTemplateParameter>()
@@ -4490,11 +4630,11 @@ class MainActivity : ComponentActivity() {
                     expectedBySeries[key.toInt()] = values.getDouble(key)
                 }
             }
-            val enforcement = item.getString("enforcement")
+            val enforcement = item.optString("enforcement", "required")
             require(enforcement == "required" || enforcement == "informational")
             val scale = item.getDouble("scale")
             require(scale != 0.0)
-            val tolerance = item.getDouble("tolerance")
+            val tolerance = item.optDouble("tolerance", 0.0)
             require(tolerance >= 0.0)
             val expected = if (item.has("expected") && !item.isNull("expected")) {
                 item.getDouble("expected")
@@ -4509,8 +4649,21 @@ class MainActivity : ComponentActivity() {
                     if (family.isNotBlank()) add(family)
                 }
             }
+            val enabled = when {
+                item.has("enabled") && !item.isNull("enabled") -> item.getBoolean("enabled")
+                item.has("check_enabled") && !item.isNull("check_enabled") -> item.getBoolean("check_enabled")
+                enforcement == "informational" -> false
+                else -> true
+            }
+            val key = item.getString("key")
+            val writable = when {
+                item.has("writable") && !item.isNull("writable") -> item.getBoolean("writable")
+                item.has("write_enabled") && !item.isNull("write_enabled") -> item.getBoolean("write_enabled")
+                // Совместимость со старыми шаблонами без поля writable.
+                else -> key == "series_cell_count" || key in SERVICE_TEMPLATE_WRITE_ORDER
+            }
             parameters += BmsTemplateParameter(
-                key = item.getString("key"),
+                key = key,
                 label = item.getString("label"),
                 register = register,
                 scale = scale,
@@ -4521,18 +4674,70 @@ class MainActivity : ComponentActivity() {
                 expected = expected,
                 expectedBySeries = expectedBySeries,
                 reason = item.optString("reason").takeIf { it.isNotBlank() },
-                skipFor = skipFor
+                skipFor = skipFor,
+                enabled = enabled,
+                writable = writable
             )
         }
-        val supported = root.getJSONArray("supported_series")
-        require(supported.length() > 0)
+        val supported = root.optJSONArray("supported_series")
+        val supportedSeries = if (supported != null && supported.length() > 0) {
+            (0 until supported.length()).map { supported.getInt(it) }.toSet()
+        } else {
+            setOf(4, 8)
+        }
         return BmsConfigTemplate(
             id = templateId,
             version = templateVersion,
-            chemistry = chemistry,
-            supportedSeries = (0 until supported.length()).map { supported.getInt(it) }.toSet(),
-            parameters = parameters
+            chemistry = chemistry.ifBlank { "LiFePO4" },
+            supportedSeries = supportedSeries,
+            parameters = parameters,
+            updatedAt = root.optLong("updated_at", 0L)
         )
+    }
+
+    private fun fetchServerConfigTemplate(force: Boolean = false, onDone: (() -> Unit)? = null) {
+        if (serverTemplateFetchInFlight && !force) {
+            onDone?.invoke()
+            return
+        }
+        serverTemplateFetchInFlight = true
+        serverTemplateFetchStatus = "fetching"
+        thread {
+            val json = adminJsonRequest("GET", "/api/v1/config-template", null)
+            mainHandler.post {
+                serverTemplateFetchInFlight = false
+                try {
+                    if (json?.optBoolean("ok") == true && json.has("template")) {
+                        val parsed = parseBmsConfigTemplateJson(json.getJSONObject("template"))
+                        activeServerTemplate = parsed
+                        serverTemplateFetchStatus = "ok"
+                        serverTemplateFetchError = null
+                        // Неавторитетный кэш только для диагностики (не для статуса «ok»).
+                        getSharedPreferences(CONFIG_PREFS_NAME, MODE_PRIVATE)
+                            .edit()
+                            .putString("server_template_cache", json.getJSONObject("template").toString())
+                            .putLong("server_template_cached_at", System.currentTimeMillis())
+                            .apply()
+                    } else {
+                        activeServerTemplate = null
+                        serverTemplateFetchStatus = "error"
+                        serverTemplateFetchError = json?.optString("error")
+                            ?.takeIf { it.isNotBlank() }
+                            ?: "Не удалось получить актуальный шаблон конфигурации"
+                    }
+                } catch (e: Exception) {
+                    activeServerTemplate = null
+                    serverTemplateFetchStatus = "error"
+                    serverTemplateFetchError = (e.message ?: e.javaClass.simpleName).take(160)
+                }
+                if (configRegisters.isNotEmpty()) {
+                    setTemplateCheckResult(evaluateTemplateCheck())
+                }
+                if (screenState == "dashboard") updateDashboardUi()
+                if (screenState == "config_check") showConfigCheckScreen()
+                onDone?.invoke()
+            }
+        }
     }
 
     private fun resolvedSeriesCount(): Int? {
@@ -4551,65 +4756,130 @@ class MainActivity : ComponentActivity() {
         val checkedAt = System.currentTimeMillis()
         val series = resolvedSeriesCount()
         val hardwareFamily = currentHardwareFamily()
+        val template = activeCheckTemplate()
+        if (template == null) {
+            return TemplateCheckResult(
+                templateId = "",
+                templateVersion = 0,
+                status = "unavailable",
+                checkedAt = checkedAt,
+                seriesCount = series,
+                missing = listOf(
+                    TemplateCheckItem(
+                        key = "server_template",
+                        label = "Шаблон конфигурации",
+                        expected = null,
+                        actual = null,
+                        unit = "",
+                        tolerance = 0.0,
+                        reason = serverTemplateFetchError ?: "server_template_unavailable",
+                        status = "missing"
+                    )
+                ),
+                items = emptyList(),
+                hardwareFamily = hardwareFamily
+            )
+        }
         return try {
-            val template = loadBmsConfigTemplate()
             val mismatches = mutableListOf<TemplateCheckItem>()
             val missing = mutableListOf<TemplateCheckItem>()
             val unverified = mutableListOf<TemplateCheckItem>()
+            val items = mutableListOf<TemplateCheckItem>()
 
             for (parameter in template.parameters) {
                 val expected = parameter.expected ?: series?.let { parameter.expectedBySeries[it] }
                 val actual = templateParameterActual(parameter)
                 val hasActual = templateParameterHasActual(parameter)
 
-                if (parameter.enforcement == "informational") {
+                if (!parameter.enabled || parameter.enforcement == "informational") {
+                    items += TemplateCheckItem(
+                        parameter.key,
+                        parameter.label,
+                        expected,
+                        if (hasActual) actual else null,
+                        parameter.unit,
+                        parameter.tolerance,
+                        "disabled",
+                        status = "disabled"
+                    )
                     continue
                 }
 
                 if (shouldSkipTemplateParameter(parameter, hardwareFamily)) {
+                    items += TemplateCheckItem(
+                        parameter.key,
+                        parameter.label,
+                        expected,
+                        if (hasActual) actual else null,
+                        parameter.unit,
+                        parameter.tolerance,
+                        "skipped_for_hardware",
+                        status = "skipped"
+                    )
                     continue
                 }
 
-                if (parameter.expectedBySeries.isNotEmpty() && series == null) {
-                    missing += TemplateCheckItem(
-                        parameter.key,
-                        parameter.label,
-                        null,
-                        null,
-                        parameter.unit,
-                        parameter.tolerance,
-                        "unsupported_series"
-                    )
-                } else if (!hasActual) {
-                    missing += TemplateCheckItem(
-                        parameter.key,
-                        parameter.label,
-                        expected,
-                        null,
-                        parameter.unit,
-                        parameter.tolerance,
-                        "register_missing"
-                    )
-                } else if (expected == null) {
-                    missing += TemplateCheckItem(
-                        parameter.key,
-                        parameter.label,
-                        null,
-                        null,
-                        parameter.unit,
-                        parameter.tolerance,
-                        "expected_value_missing"
-                    )
-                } else if (kotlin.math.abs(actual!! - expected) > parameter.tolerance) {
-                    mismatches += TemplateCheckItem(
-                        parameter.key,
-                        parameter.label,
-                        expected,
-                        actual,
-                        parameter.unit,
-                        parameter.tolerance
-                    )
+                val item = when {
+                    parameter.expectedBySeries.isNotEmpty() && series == null -> {
+                        TemplateCheckItem(
+                            parameter.key,
+                            parameter.label,
+                            null,
+                            null,
+                            parameter.unit,
+                            parameter.tolerance,
+                            "unsupported_series",
+                            status = "missing"
+                        ).also { missing += it }
+                    }
+                    !hasActual -> {
+                        TemplateCheckItem(
+                            parameter.key,
+                            parameter.label,
+                            expected,
+                            null,
+                            parameter.unit,
+                            parameter.tolerance,
+                            "register_missing",
+                            status = "missing"
+                        ).also { missing += it }
+                    }
+                    expected == null -> {
+                        TemplateCheckItem(
+                            parameter.key,
+                            parameter.label,
+                            null,
+                            null,
+                            parameter.unit,
+                            parameter.tolerance,
+                            "expected_value_missing",
+                            status = "missing"
+                        ).also { missing += it }
+                    }
+                    kotlin.math.abs(actual!! - expected) > parameter.tolerance -> {
+                        TemplateCheckItem(
+                            parameter.key,
+                            parameter.label,
+                            expected,
+                            actual,
+                            parameter.unit,
+                            parameter.tolerance,
+                            status = "mismatch"
+                        ).also { mismatches += it }
+                    }
+                    else -> {
+                        TemplateCheckItem(
+                            parameter.key,
+                            parameter.label,
+                            expected,
+                            actual,
+                            parameter.unit,
+                            parameter.tolerance,
+                            status = "ok"
+                        )
+                    }
                 }
+                items += item
             }
 
             val status = when {
@@ -4626,12 +4896,14 @@ class MainActivity : ComponentActivity() {
                 mismatches,
                 missing,
                 unverified,
-                hardwareFamily
+                hardwareFamily,
+                items,
+                template.updatedAt
             )
         } catch (e: Exception) {
             TemplateCheckResult(
-                templateId = "liferych-lfp-default",
-                templateVersion = 1,
+                templateId = template.id,
+                templateVersion = template.version,
                 status = "incomplete",
                 checkedAt = checkedAt,
                 seriesCount = series,
@@ -4643,10 +4915,12 @@ class MainActivity : ComponentActivity() {
                         actual = null,
                         unit = "",
                         tolerance = 0.0,
-                        reason = "template_load_error: ${(e.message ?: e.javaClass.simpleName).take(160)}"
+                        reason = "template_load_error: ${(e.message ?: e.javaClass.simpleName).take(160)}",
+                        status = "missing"
                     )
                 ),
-                hardwareFamily = hardwareFamily
+                hardwareFamily = hardwareFamily,
+                templateUpdatedAt = template.updatedAt
             )
         }
     }
@@ -4657,14 +4931,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setTemplateCheckChecking() {
+        val tpl = activeServerTemplate
         setTemplateCheckResult(
             TemplateCheckResult(
-                templateId = "liferych-lfp-default",
-                templateVersion = 1,
+                templateId = tpl?.id ?: "",
+                templateVersion = tpl?.version ?: 0,
                 status = "checking",
                 checkedAt = 0L,
                 seriesCount = data.cellCount,
-                hardwareFamily = currentHardwareFamily()
+                hardwareFamily = currentHardwareFamily(),
+                templateUpdatedAt = tpl?.updatedAt ?: 0L
             )
         )
     }
@@ -5047,7 +5323,7 @@ class MainActivity : ComponentActivity() {
         val color = when (status) {
             "ok" -> Color.rgb(28, 160, 55)
             "mismatch" -> Color.rgb(211, 47, 47)
-            "incomplete" -> Color.rgb(224, 150, 0)
+            "incomplete", "unavailable" -> Color.rgb(224, 150, 0)
             else -> Color.rgb(110, 118, 128)
         }
         val title = when (status) {
@@ -5055,6 +5331,7 @@ class MainActivity : ComponentActivity() {
             "ok" -> "Конфигурация соответствует шаблону"
             "mismatch" -> "Есть отклонения конфигурации"
             "incomplete" -> "Проверка конфигурации неполная"
+            "unavailable" -> "Проверка конфигурации недоступна"
             else -> "Конфигурация ещё не проверена"
         }
         val checked = result?.checkedAt?.takeIf { it > 0L }?.let {
@@ -5084,18 +5361,205 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun showConfigCheckScreen() {
+        enterScreen("config_check")
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+        root.addView(
+            header(
+                "Конфигурация BMS",
+                selectedDeviceName.ifBlank { selectedAddress ?: "" },
+                showBack = true
+            )
+        )
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(20))
+        }
+        val result = currentTemplateCheck()
+        val template = activeServerTemplate
+        val meta = buildString {
+            append("Версия шаблона: ")
+            append(template?.version?.toString() ?: result?.templateVersion?.takeIf { it > 0 }?.toString() ?: "—")
+            append("\nОбновлён: ")
+            val updated = (template?.updatedAt ?: result?.templateUpdatedAt ?: 0L).takeIf { it > 0 }
+            append(
+                updated?.let {
+                    java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", java.util.Locale.getDefault())
+                        .format(java.util.Date(it))
+                } ?: "—"
+            )
+            append("\nПроверено: ")
+            append(
+                result?.checkedAt?.takeIf { it > 0 }?.let {
+                    java.text.SimpleDateFormat("dd.MM.yyyy HH:mm:ss", java.util.Locale.getDefault())
+                        .format(java.util.Date(it))
+                } ?: "—"
+            )
+        }
+        content.addView(TextView(this).apply {
+            text = meta
+            textSize = 13f
+            setTextColor(Color.rgb(111, 119, 129))
+            typeface = interFont(600)
+            setPadding(dp(4), 0, dp(4), dp(12))
+        })
+
+        val writableKeys = activeServerTemplate?.parameters
+            ?.filter { it.writable && it.enabled }
+            ?.map { it.key }
+            ?.toSet()
+            .orEmpty()
+        val writableMismatches = (result?.items
+            ?.filter { it.status == "mismatch" || it.status == "missing" }
+            .orEmpty()
+            .ifEmpty { result?.mismatches.orEmpty() + result?.missing.orEmpty() })
+            .filter { writableKeys.isEmpty() || it.key in writableKeys }
+        val canApply = !isServiceApp() &&
+            activeServerTemplate != null &&
+            result?.status in setOf("mismatch", "incomplete") &&
+            writableMismatches.isNotEmpty() &&
+            bluetoothGatt != null &&
+            !serviceWriteActive
+
+        if (serviceWriteActive && clientTemplateApplyMode) {
+            content.addView(TextView(this).apply {
+                text = "Идёт запись параметров: $serviceWriteDone / $serviceWriteTotal"
+                textSize = 14f
+                typeface = interFont(700)
+                setTextColor(Color.rgb(16, 17, 20))
+                setPadding(dp(4), 0, dp(4), dp(10))
+            })
+        } else if (canApply) {
+            content.addView(TextView(this).apply {
+                text = "Настроить BMS"
+                textSize = 16f
+                typeface = interFont(760)
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(14), dp(12), dp(14))
+                background = round(red, dp(14), Color.TRANSPARENT, 0)
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { startClientTemplateApply() }
+            }, marginLp(-1, -2, 0, 0, 0, 12))
+            content.addView(TextView(this).apply {
+                text = "Будут записаны только отличающиеся параметры шаблона. После каждой записи выполняется повторное чтение."
+                textSize = 12f
+                setTextColor(Color.rgb(111, 119, 129))
+                setPadding(dp(4), 0, dp(4), dp(12))
+            })
+        }
+
+        when {
+            result?.status == "unavailable" ||
+                (serverTemplateFetchStatus == "error" && template == null) -> {
+                content.addView(
+                    manageSectionCard(
+                        "Статус",
+                        listOf(
+                            "Состояние" to (serverTemplateFetchError
+                                ?: "Не удалось получить актуальный шаблон конфигурации")
+                        )
+                    ),
+                    marginLp(-1, -2, 0, 0, 0, 12)
+                )
+            }
+            result == null || result.status == "checking" -> {
+                content.addView(
+                    manageSectionCard(
+                        "Статус",
+                        listOf("Состояние" to "Проверка выполняется…")
+                    ),
+                    marginLp(-1, -2, 0, 0, 0, 12)
+                )
+            }
+            else -> {
+                val rows = if (result.items.isNotEmpty()) {
+                    result.items
+                } else {
+                    result.mismatches.map { it.copy(status = "mismatch") } +
+                        result.missing.map { it.copy(status = "missing") }
+                }
+                for (item in rows) {
+                    content.addView(
+                        configCheckDetailCard(item),
+                        marginLp(-1, -2, 0, 0, 0, 10)
+                    )
+                }
+                if (rows.isEmpty()) {
+                    content.addView(
+                        manageSectionCard(
+                            "Статус",
+                            listOf("Состояние" to "Нет параметров для отображения")
+                        ),
+                        marginLp(-1, -2, 0, 0, 0, 12)
+                    )
+                }
+            }
+        }
+
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(fixedBottomNav("main"), LinearLayout.LayoutParams(-1, dp(70)))
+        setContentView(root)
+    }
+
+    private fun configCheckDetailCard(item: TemplateCheckItem): LinearLayout {
+        val (mark, color, statusText) = when (item.status) {
+            "ok" -> Triple("✓", Color.rgb(31, 179, 90), "соответствует")
+            "mismatch" -> Triple("✗", Color.rgb(211, 47, 47), "не соответствует")
+            "missing" -> Triple("?", Color.rgb(224, 150, 0), "не удалось прочитать")
+            "skipped" -> Triple("—", Color.rgb(111, 119, 129), "не применяется")
+            "disabled" -> Triple("—", Color.rgb(111, 119, 129), "проверка отключена")
+            else -> Triple("•", Color.rgb(111, 119, 129), item.status)
+        }
+        val unit = item.unit.trim()
+        fun fmt(v: Double?): String {
+            if (v == null) return "—"
+            val num = formatTemplateNumber(v)
+            return if (unit.isBlank()) num else "$num $unit"
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+            addView(TextView(this@MainActivity).apply {
+                text = "$mark  ${item.label}"
+                textSize = 15f
+                typeface = interFont(720)
+                setTextColor(Color.rgb(16, 17, 20))
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = statusText
+                textSize = 12f
+                typeface = interFont(650)
+                setTextColor(color)
+                setPadding(0, dp(2), 0, dp(6))
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = "Ожидалось: ${fmt(item.expected)}\nФактически: ${fmt(item.actual)}"
+                textSize = 13f
+                setTextColor(Color.rgb(75, 79, 84))
+            })
+        }
+    }
+
     private fun String.trimTrailingZeros(): String {
-        return this.replace(Regex("0+$"), "").replace(Regex("\\.$"), "")
+        return this.replace(Regex("0+$"), "").replace(Regex("[.,]$"), "")
     }
 
     private fun batteryTypeText(): String {
         val raw = configRegisters[0x0100] ?: configRegisters[0x0113]
         return when (raw) {
-            null -> "Фосфат лития"
-            0, 1 -> "Фосфат лития"
-            2 -> "Литий-ион"
-            3 -> "Титанат лития"
-            else -> "Фосфат лития"
+            null -> "LiFePO4"
+            0, 1 -> "LiFePO4"
+            2 -> "Li-ion"
+            3 -> "LTO"
+            else -> "LiFePO4"
         }
     }
 
@@ -6662,70 +7126,64 @@ class MainActivity : ComponentActivity() {
             cellsLayout.addView(TextView(this).apply {
                 text = "Нет данных по ячейкам"
                 textSize = 13f
-                setTextColor(dashMuted)
+                setTextColor(Color.rgb(111, 119, 129))
             })
             return
         }
+        // 4S — в одну строку; больше — как в старом UI (2 или 4 колонки)
         val columns = when {
             count <= 4 -> count
-            count <= 8 -> 4
+            count <= 8 -> 2
             else -> 4
         }.coerceAtLeast(1)
-        val cellH = if (count <= 8) dp(92) else dp(84)
-        val gap = dp(6)
         var row: LinearLayout? = null
         for (i in 1..count) {
             if ((i - 1) % columns == 0) {
                 row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                 }
-                cellsLayout.addView(row, LinearLayout.LayoutParams(-1, -2).apply {
-                    if (i > 1) topMargin = gap
-                })
+                cellsLayout.addView(row, LinearLayout.LayoutParams(-1, -2))
             }
             val v = data.cells[i]
-            val inner = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(10), dp(10), dp(10), dp(10))
-                background = round(Color.rgb(248, 250, 252), dp(12), dashBorder, 1)
-            }
-            val bar = View(this).apply {
-                background = round(Color.rgb(45, 176, 69), dp(3), Color.TRANSPARENT, 0)
-            }
-            inner.addView(bar, LinearLayout.LayoutParams(dp(5), -1).apply { rightMargin = dp(8) })
-            val col = LinearLayout(this).apply {
+            val box = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(10), dp(10), dp(10), dp(12))
+                minimumHeight = if (count <= 8) dp(88) else dp(76)
+                background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
             }
-            col.addView(TextView(this).apply {
+            box.addView(TextView(this).apply {
                 text = "Ячейка $i"
                 textSize = if (count <= 8) 11f else 10f
                 typeface = interFont(600)
-                setTextColor(dashMuted)
-                maxLines = 1
+                setTextColor(Color.rgb(122, 132, 144))
             })
-            col.addView(TextView(this).apply {
+            box.addView(TextView(this).apply {
                 text = v?.let { "%.3f В".format(it) } ?: "--"
-                textSize = if (count <= 8) 15f else 13f
+                textSize = if (count <= 8) 16f else 13f
                 typeface = interFont(760)
-                setTextColor(dashInk)
-                maxLines = 1
-            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
-            inner.addView(col, LinearLayout.LayoutParams(0, -2, 1f))
+                setTextColor(Color.rgb(16, 17, 20))
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+            box.addView(ProgressBar(
+                this,
+                null,
+                android.R.attr.progressBarStyleHorizontal
+            ).apply {
+                max = 3650
+                progress = ((v ?: 0.0) * 1000).toInt().coerceIn(0, 3650)
+                progressTintList =
+                    android.content.res.ColorStateList.valueOf(Color.rgb(31, 179, 90))
+                progressBackgroundTintList =
+                    android.content.res.ColorStateList.valueOf(Color.rgb(223, 229, 235))
+            }, LinearLayout.LayoutParams(-1, dp(7)).apply { topMargin = dp(12) })
             row?.addView(
-                inner,
-                LinearLayout.LayoutParams(0, cellH, 1f).apply {
-                    if ((i - 1) % columns != 0) leftMargin = gap
-                }
+                box,
+                marginLp(0, -2, 3, 3, 3, 3).apply { weight = 1f }
             )
         }
         val remainder = count % columns
         if (remainder != 0) {
             repeat(columns - remainder) {
-                row?.addView(Space(this), LinearLayout.LayoutParams(0, 1, 1f).apply {
-                    leftMargin = gap
-                })
+                row?.addView(Space(this), LinearLayout.LayoutParams(0, 1, 1f))
             }
         }
     }
@@ -7613,11 +8071,11 @@ class MainActivity : ComponentActivity() {
 
         val fullAh = data.estimatedFullAh
         fullCapacityValue?.text = fullAh?.let {
-            if (kotlin.math.abs(it - it.toLong()) < 0.05) "%.0f Ач".format(it) else "%.1f Ач".format(it)
-        } ?: "-- Ач"
+            if (kotlin.math.abs(it - it.toLong()) < 0.05) "%.0f А·ч".format(it) else "%.1f А·ч".format(it)
+        } ?: "-- А·ч"
         remainingValue.text = data.remainingAh?.let {
-            if (kotlin.math.abs(it - it.toLong()) < 0.05) "%.0f Ач".format(it) else "%.1f Ач".format(it)
-        } ?: "-- Ач"
+            if (kotlin.math.abs(it - it.toLong()) < 0.05) "%.0f А·ч".format(it) else "%.1f А·ч".format(it)
+        } ?: "-- А·ч"
 
         val (socLabel, socColor) = socStatusLabel(data.soc)
         socStatusText?.let {
@@ -7638,12 +8096,12 @@ class MainActivity : ComponentActivity() {
             when (on) {
                 true -> {
                     valueView.text = "ВКЛ"
-                    valueView.setTextColor(Color.rgb(28, 160, 55))
+                    valueView.setTextColor(Color.rgb(31, 179, 90))
                     applyStatusDot(dot, true)
                 }
                 false -> {
                     valueView.text = "ВЫКЛ"
-                    valueView.setTextColor(Color.rgb(70, 76, 84))
+                    valueView.setTextColor(Color.rgb(111, 119, 129))
                     applyStatusDot(dot, null)
                 }
                 null -> {
@@ -7672,11 +8130,11 @@ class MainActivity : ComponentActivity() {
         if (::balanceValue.isInitialized) {
             if (data.errors.isNotEmpty()) {
                 balanceValue.text = "Ошибка"
-                balanceValue.setTextColor(Color.rgb(210, 70, 70))
+                balanceValue.setTextColor(Color.rgb(239, 83, 80))
                 applyStatusDot(balanceDot, false)
             } else {
                 balanceValue.text = "Норма"
-                balanceValue.setTextColor(Color.rgb(28, 160, 55))
+                balanceValue.setTextColor(Color.rgb(31, 179, 90))
                 applyStatusDot(balanceDot, true)
             }
         }
@@ -7684,17 +8142,17 @@ class MainActivity : ComponentActivity() {
             when {
                 data.errors.isNotEmpty() -> {
                     state.text = "Защита"
-                    state.setTextColor(Color.rgb(210, 70, 70))
+                    state.setTextColor(Color.rgb(239, 83, 80))
                     applyStatusDot(stateDot, false)
                 }
                 data.balancingCells.isNotEmpty() -> {
                     state.text = "Балансировка"
-                    state.setTextColor(Color.rgb(215, 160, 35))
+                    state.setTextColor(Color.rgb(255, 153, 0))
                     applyStatusDot(stateDot, null, warn = true)
                 }
                 polling || bluetoothGatt != null -> {
                     state.text = "Работает"
-                    state.setTextColor(Color.rgb(28, 160, 55))
+                    state.setTextColor(Color.rgb(31, 179, 90))
                     applyStatusDot(stateDot, true)
                 }
                 else -> {
@@ -7706,10 +8164,19 @@ class MainActivity : ComponentActivity() {
         }
 
         val device = selectedDeviceName.ifBlank { selectedAddress ?: "не выбрано" }
-        if (::deviceNameValue.isInitialized) deviceNameValue.text = device
+        if (::deviceNameValue.isInitialized) {
+            deviceNameValue.text = device
+            fitTextToWidth(deviceNameValue, 6f, 13f)
+        }
         bluetoothIdValue?.text = bluetoothId().ifBlank { "--" }
-        bmsSnValue?.text = displayFactorySn().ifBlank { "--" }
-        bmsVersionValue?.text = displayBmsVersion().ifBlank { "--" }
+        bmsSnValue?.let { sn ->
+            sn.text = displayFactorySn().ifBlank { "--" }
+            fitTextToWidth(sn, 6f, 13f)
+        }
+        bmsVersionValue?.let { ver ->
+            ver.text = displayBmsVersion().ifBlank { "--" }
+            fitTextToWidth(ver, 6f, 13f)
+        }
         if (::cycleCountValue.isInitialized) {
             cycleCountValue.text = data.cycles?.toString() ?: "--"
         }
@@ -7727,27 +8194,63 @@ class MainActivity : ComponentActivity() {
         overallStatusBanner?.let { banner ->
             val title = overallStatusTitle
             val sub = overallStatusSub
-            if (data.errors.isEmpty()) {
-                banner.background = round(Color.rgb(232, 245, 236), dp(18), Color.TRANSPARENT, 0)
-                title?.text = "Батарея в норме"
-                title?.setTextColor(Color.rgb(28, 140, 60))
-                sub?.text = "Все параметры в пределах нормы"
-                sub?.setTextColor(Color.rgb(70, 120, 85))
-                overallStatusIcon?.apply {
-                    text = "✓"
-                    setTextColor(Color.WHITE)
-                    background = round(Color.rgb(45, 176, 69), dp(14), Color.TRANSPARENT, 0)
+            val check = currentTemplateCheck()
+            when {
+                data.errors.isNotEmpty() -> {
+                    banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+                    title?.text = "!  Требуется внимание"
+                    title?.setTextColor(Color.rgb(239, 83, 80))
+                    sub?.text = data.errors.joinToString(", ")
+                    sub?.setTextColor(Color.rgb(111, 119, 129))
                 }
-            } else {
-                banner.background = round(Color.rgb(255, 236, 236), dp(18), Color.TRANSPARENT, 0)
-                title?.text = "Требуется внимание"
-                title?.setTextColor(Color.rgb(190, 50, 50))
-                sub?.text = data.errors.joinToString(", ")
-                sub?.setTextColor(Color.rgb(140, 70, 70))
-                overallStatusIcon?.apply {
-                    text = "!"
-                    setTextColor(Color.WHITE)
-                    background = round(Color.rgb(210, 70, 70), dp(14), Color.TRANSPARENT, 0)
+                check?.status == "unavailable" ||
+                    (serverTemplateFetchStatus == "error" && activeServerTemplate == null) -> {
+                    banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+                    title?.text = "⚠  Проверка конфигурации недоступна"
+                    title?.setTextColor(Color.rgb(224, 150, 0))
+                    sub?.text = serverTemplateFetchError
+                        ?: "Не удалось получить актуальный шаблон с сервера"
+                    sub?.setTextColor(Color.rgb(111, 119, 129))
+                }
+                check?.status == "checking" || serverTemplateFetchStatus == "fetching" -> {
+                    banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+                    title?.text = "…  Проверка конфигурации"
+                    title?.setTextColor(Color.rgb(111, 119, 129))
+                    sub?.text = "Сверяем параметры BMS с серверным шаблоном"
+                    sub?.setTextColor(Color.rgb(111, 119, 129))
+                }
+                check?.status == "mismatch" -> {
+                    banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+                    title?.text = "⚠  Есть отклонения конфигурации"
+                    title?.setTextColor(Color.rgb(224, 150, 0))
+                    val count = check.mismatches.size
+                    sub?.text = if (count == 1) {
+                        "1 параметр требует проверки"
+                    } else {
+                        "$count параметра требуют проверки"
+                    }
+                    sub?.setTextColor(Color.rgb(111, 119, 129))
+                }
+                check?.status == "incomplete" -> {
+                    banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+                    title?.text = "⚠  Проверка конфигурации неполная"
+                    title?.setTextColor(Color.rgb(224, 150, 0))
+                    sub?.text = "Не все параметры удалось прочитать или сравнить"
+                    sub?.setTextColor(Color.rgb(111, 119, 129))
+                }
+                check?.status == "ok" -> {
+                    banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+                    title?.text = "✓  Батарея в норме"
+                    title?.setTextColor(Color.rgb(31, 179, 90))
+                    sub?.text = "Все параметры соответствуют"
+                    sub?.setTextColor(Color.rgb(111, 119, 129))
+                }
+                else -> {
+                    banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+                    title?.text = "✓  Батарея в норме"
+                    title?.setTextColor(Color.rgb(31, 179, 90))
+                    sub?.text = "Ожидается проверка конфигурации"
+                    sub?.setTextColor(Color.rgb(111, 119, 129))
                 }
             }
         }
@@ -8642,7 +9145,7 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun startRemoteWrite(command: RemoteWriteCommand) {
-        if (command.localOnly && isServiceApp()) {
+        if (command.localOnly) {
             startServiceLocalWrite(command)
             return
         }
@@ -9110,6 +9613,7 @@ class MainActivity : ComponentActivity() {
 
         configReadInProgress = true
         setTemplateCheckChecking()
+        fetchServerConfigTemplate(force = true)
         pollLoopToken++
         pendingRuntimeCommand = null
         activeConfigRead = null
@@ -10099,26 +10603,26 @@ class SocGaugeView(context: Context) : View(context) {
     private var soc: Double? = null
 
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(228, 232, 236)
+        color = Color.rgb(225, 225, 225)
         style = Paint.Style.STROKE
-        strokeWidth = 14f
+        strokeWidth = 22f
         strokeCap = Paint.Cap.ROUND
     }
     private val valuePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(45, 176, 69)
         style = Paint.Style.STROKE
-        strokeWidth = 14f
+        strokeWidth = 22f
         strokeCap = Paint.Cap.ROUND
     }
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(16, 17, 20)
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.DEFAULT_BOLD
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        isFakeBoldText = true
     }
     private val smallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.rgb(111, 119, 129)
         textAlign = Paint.Align.CENTER
-        typeface = Typeface.DEFAULT_BOLD
     }
 
     fun setSoc(value: Double?) {
@@ -10131,38 +10635,35 @@ class SocGaugeView(context: Context) : View(context) {
         val w = width.toFloat()
         val h = height.toFloat()
         val size = min(w, h)
-        val stroke = (size * 0.075f).coerceIn(10f, 16f)
+        val stroke = (size * 0.095f).coerceIn(18f, 26f)
         bgPaint.strokeWidth = stroke
         valuePaint.strokeWidth = stroke
-        val pad = stroke / 2f + 3f
+        val pad = stroke / 2f + 4f
         val left = (w - size) / 2f + pad
         val top = (h - size) / 2f + pad
-        val right = left + size - 2f * pad
-        val bottom = top + size - 2f * pad
-        val rect = RectF(left, top, right, bottom)
+        val rect = RectF(left, top, left + size - 2f * pad, top + size - 2f * pad)
 
         canvas.drawArc(rect, -90f, 360f, false, bgPaint)
 
         val s = max(0.0, min(100.0, soc ?: 0.0))
-        valuePaint.color = when {
+        val accent = when {
             s <= 20.0 -> Color.rgb(210, 70, 70)
             s < 70.0 -> Color.rgb(215, 160, 35)
             else -> Color.rgb(45, 176, 69)
         }
+        valuePaint.color = accent
         if (soc != null && s > 0.0) {
             canvas.drawArc(rect, -90f, (360.0 * (s / 100.0)).toFloat(), false, valuePaint)
         }
 
         val cx = w / 2f
-        val cy = h / 2f - size * 0.02f
-        textPaint.textSize = size * 0.20f
-        canvas.drawText(
-            if (soc == null) "--%" else "${s.toInt()}%",
-            cx,
-            cy,
-            textPaint
-        )
-        smallPaint.textSize = size * 0.09f
-        canvas.drawText("SOC", cx, cy + size * 0.13f, smallPaint)
+        val cy = h / 2f
+        // Главный акцент — процент (крупнее и жирнее), SOC вторично снизу
+        textPaint.color = Color.rgb(16, 17, 20)
+        textPaint.textSize = size * 0.28f
+        val percentText = if (soc == null) "--%" else "%.0f%%".format(s)
+        canvas.drawText(percentText, cx, cy + size * 0.02f, textPaint)
+        smallPaint.textSize = size * 0.10f
+        canvas.drawText("SOC", cx, cy + size * 0.18f, smallPaint)
     }
 }
