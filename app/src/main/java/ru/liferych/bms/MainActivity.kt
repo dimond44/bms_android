@@ -1671,12 +1671,24 @@ class MainActivity : ComponentActivity() {
             }
             .setNegativeButton("Отмена", null)
             .setNeutralButton("Удалить") { _, _ ->
+                val wasSelected = selectedAddress == battery.address
                 saveBatteries(loadSavedBatteries().filterNot {
                     it.address == battery.address
                 })
-                if (selectedAddress == battery.address) {
+                if (wasSelected) {
+                    disconnectGatt()
                     selectedAddress = null
                     selectedDeviceName = ""
+                    // Локальное удаление не трогает серверную историю.
+                    // Очищаем только volatile-состояние текущей сессии, чтобы SN/конфиг
+                    // не ушли на сервер под uid=unknown_bms.
+                    configRegisters.clear()
+                    configRaw.clear()
+                    data.cells.clear()
+                    data.voltage = null
+                    data.soc = null
+                    pendingFirstTelemetryUpload = false
+                    resetRemoteWriteState()
                 }
                 showBatteriesScreen(asRootHome = true)
             }
@@ -4611,80 +4623,146 @@ class MainActivity : ComponentActivity() {
     private fun activeCheckTemplate(): BmsConfigTemplate? = activeServerTemplate
 
     private fun parseBmsConfigTemplateJson(root: JSONObject): BmsConfigTemplate {
-        val templateId = root.getString("id")
-        val templateVersion = root.getInt("version")
+        val templateId = root.optString("id").trim()
+        val templateVersion = root.optInt("version", 0)
         val chemistry = root.optString("chemistry", "")
-        require(templateId.isNotBlank() && templateVersion > 0)
-        val parametersJson = root.getJSONArray("parameters")
-        require(parametersJson.length() > 0)
+        if (templateId.isBlank() || templateVersion <= 0) {
+            throw IllegalArgumentException("invalid_template_header")
+        }
+        val parametersJson = root.optJSONArray("parameters")
+            ?: throw IllegalArgumentException("template_parameters_missing")
+        if (parametersJson.length() <= 0) {
+            throw IllegalArgumentException("template_parameters_empty")
+        }
         val parameters = mutableListOf<BmsTemplateParameter>()
         for (i in 0 until parametersJson.length()) {
-            val item = parametersJson.getJSONObject(i)
-            val registerText = item.getString("register")
-            val register = registerText.removePrefix("0x").removePrefix("0X").toInt(16)
-            val expectedBySeries = mutableMapOf<Int, Double>()
-            item.optJSONObject("expected_by_series")?.let { values ->
-                val keys = values.keys()
-                while (keys.hasNext()) {
-                    val key = keys.next()
-                    expectedBySeries[key.toInt()] = values.getDouble(key)
+            val item = parametersJson.optJSONObject(i) ?: continue
+            try {
+                val key = item.optString("key").trim()
+                if (key.isBlank()) {
+                    Log.w(BLE_LOG_TAG, "CONFIG TEMPLATE skip: empty key at index=$i")
+                    continue
                 }
-            }
-            val enforcement = item.optString("enforcement", "required")
-            require(enforcement == "required" || enforcement == "informational")
-            val scale = item.getDouble("scale")
-            require(scale != 0.0)
-            val tolerance = item.optDouble("tolerance", 0.0)
-            require(tolerance >= 0.0)
-            val expected = if (item.has("expected") && !item.isNull("expected")) {
-                item.getDouble("expected")
-            } else {
-                null
-            }
-            require(expected != null || expectedBySeries.isNotEmpty())
-            val skipFor = buildSet {
-                val skipJson = item.optJSONArray("skip_for") ?: return@buildSet
-                for (j in 0 until skipJson.length()) {
-                    val family = skipJson.optString(j)
-                    if (family.isNotBlank()) add(family)
+                val registerText = item.optString("register").trim()
+                if (registerText.isBlank()) {
+                    Log.w(BLE_LOG_TAG, "CONFIG TEMPLATE skip unsupported key=$key reason=missing_register")
+                    continue
                 }
+                val register = try {
+                    registerText.removePrefix("0x").removePrefix("0X").toInt(16)
+                } catch (_: Exception) {
+                    Log.w(BLE_LOG_TAG, "CONFIG TEMPLATE skip unsupported key=$key reason=bad_register:$registerText")
+                    continue
+                }
+                val expectedBySeries = mutableMapOf<Int, Double>()
+                item.optJSONObject("expected_by_series")?.let { values ->
+                    val keys = values.keys()
+                    while (keys.hasNext()) {
+                        val seriesKey = keys.next()
+                        val series = seriesKey.toIntOrNull() ?: continue
+                        if (!values.isNull(seriesKey)) {
+                            expectedBySeries[series] = values.getDouble(seriesKey)
+                        }
+                    }
+                }
+                val enforcement = item.optString("enforcement", "required")
+                if (enforcement != "required" && enforcement != "informational") {
+                    Log.w(BLE_LOG_TAG, "CONFIG TEMPLATE skip unsupported key=$key reason=bad_enforcement:$enforcement")
+                    continue
+                }
+                if (!item.has("scale") || item.isNull("scale")) {
+                    Log.w(BLE_LOG_TAG, "CONFIG TEMPLATE skip unsupported key=$key reason=missing_scale")
+                    continue
+                }
+                val scale = item.getDouble("scale")
+                if (scale == 0.0) {
+                    Log.w(BLE_LOG_TAG, "CONFIG TEMPLATE skip unsupported key=$key reason=zero_scale")
+                    continue
+                }
+                val tolerance = item.optDouble("tolerance", 0.0)
+                if (tolerance < 0.0) {
+                    Log.w(BLE_LOG_TAG, "CONFIG TEMPLATE skip unsupported key=$key reason=negative_tolerance")
+                    continue
+                }
+                val expected = if (item.has("expected") && !item.isNull("expected")) {
+                    item.getDouble("expected")
+                } else {
+                    null
+                }
+                val enabled = when {
+                    item.has("enabled") && !item.isNull("enabled") -> item.getBoolean("enabled")
+                    item.has("check_enabled") && !item.isNull("check_enabled") -> item.getBoolean("check_enabled")
+                    enforcement == "informational" -> false
+                    else -> true
+                }
+                val writable = when {
+                    item.has("writable") && !item.isNull("writable") -> item.getBoolean("writable")
+                    item.has("write_enabled") && !item.isNull("write_enabled") -> item.getBoolean("write_enabled")
+                    // Совместимость со старыми шаблонами без поля writable.
+                    else -> key == "series_cell_count" || key in SERVICE_TEMPLATE_WRITE_ORDER
+                }
+                // Write-only параметры (например runtime_soc) могут не иметь expected —
+                // они не участвуют в config check, но нужны для remote write.
+                if (expected == null && expectedBySeries.isEmpty()) {
+                    if (!(writable && !enabled)) {
+                        Log.w(
+                            BLE_LOG_TAG,
+                            "CONFIG TEMPLATE skip key=$key reason=missing_expected writable=$writable enabled=$enabled"
+                        )
+                        continue
+                    }
+                    Log.i(BLE_LOG_TAG, "CONFIG TEMPLATE accept write-only key=$key (no expected)")
+                }
+                val skipFor = buildSet {
+                    val skipJson = item.optJSONArray("skip_for") ?: return@buildSet
+                    for (j in 0 until skipJson.length()) {
+                        val family = skipJson.optString(j)
+                        if (family.isNotBlank()) add(family)
+                    }
+                }
+                parameters += BmsTemplateParameter(
+                    key = key,
+                    label = item.optString("label").ifBlank { key },
+                    register = register,
+                    scale = scale,
+                    offset = item.optDouble("offset", 0.0),
+                    unit = item.optString("unit", ""),
+                    tolerance = tolerance,
+                    enforcement = enforcement,
+                    expected = expected,
+                    expectedBySeries = expectedBySeries,
+                    reason = item.optString("reason").takeIf { it.isNotBlank() },
+                    skipFor = skipFor,
+                    enabled = enabled,
+                    writable = writable
+                )
+            } catch (e: Exception) {
+                Log.w(
+                    BLE_LOG_TAG,
+                    "CONFIG TEMPLATE skip index=$i reason=${e.message ?: e.javaClass.simpleName}"
+                )
             }
-            val enabled = when {
-                item.has("enabled") && !item.isNull("enabled") -> item.getBoolean("enabled")
-                item.has("check_enabled") && !item.isNull("check_enabled") -> item.getBoolean("check_enabled")
-                enforcement == "informational" -> false
-                else -> true
-            }
-            val key = item.getString("key")
-            val writable = when {
-                item.has("writable") && !item.isNull("writable") -> item.getBoolean("writable")
-                item.has("write_enabled") && !item.isNull("write_enabled") -> item.getBoolean("write_enabled")
-                // Совместимость со старыми шаблонами без поля writable.
-                else -> key == "series_cell_count" || key in SERVICE_TEMPLATE_WRITE_ORDER
-            }
-            parameters += BmsTemplateParameter(
-                key = key,
-                label = item.getString("label"),
-                register = register,
-                scale = scale,
-                offset = item.optDouble("offset", 0.0),
-                unit = item.optString("unit", ""),
-                tolerance = tolerance,
-                enforcement = enforcement,
-                expected = expected,
-                expectedBySeries = expectedBySeries,
-                reason = item.optString("reason").takeIf { it.isNotBlank() },
-                skipFor = skipFor,
-                enabled = enabled,
-                writable = writable
-            )
+        }
+        if (parameters.isEmpty()) {
+            throw IllegalArgumentException("template_parameters_unusable")
         }
         val supported = root.optJSONArray("supported_series")
         val supportedSeries = if (supported != null && supported.length() > 0) {
-            (0 until supported.length()).map { supported.getInt(it) }.toSet()
+            (0 until supported.length()).mapNotNull {
+                try {
+                    supported.getInt(it)
+                } catch (_: Exception) {
+                    null
+                }
+            }.toSet()
         } else {
             setOf(4, 8)
         }
+        Log.i(
+            BLE_LOG_TAG,
+            "CONFIG TEMPLATE parsed id=$templateId version=$templateVersion params=${parameters.size} " +
+                "keys=${parameters.joinToString(",") { it.key }}"
+        )
         return BmsConfigTemplate(
             id = templateId,
             version = templateVersion,
@@ -4695,6 +4773,26 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun humanizeTemplateFetchError(raw: String?): String {
+        val text = raw?.trim().orEmpty()
+        return when {
+            text.isBlank() -> "Не удалось получить актуальный шаблон конфигурации"
+            text.equals("Failed requirement.", ignoreCase = true) ->
+                "Серверный шаблон содержит параметр без эталонного значения"
+            text == "invalid_template_header" -> "Сервер вернул некорректный шаблон"
+            text == "template_parameters_missing" || text == "template_parameters_empty" ->
+                "Сервер вернул пустой шаблон конфигурации"
+            text == "template_parameters_unusable" ->
+                "В шаблоне нет параметров, пригодных для проверки"
+            text == "unauthorized" -> "Нет доступа к шаблону на сервере"
+            text == "template_not_found" -> "Для этой BMS не найден шаблон конфигурации"
+            text == "server_unreachable" -> "Не удалось получить шаблон с сервера"
+            text.startsWith("HTTP ") || text.contains("timeout", ignoreCase = true) ->
+                "Не удалось получить шаблон с сервера"
+            else -> text.take(160)
+        }
+    }
+
     private fun fetchServerConfigTemplate(force: Boolean = false, onDone: (() -> Unit)? = null) {
         if (serverTemplateFetchInFlight && !force) {
             onDone?.invoke()
@@ -4703,32 +4801,42 @@ class MainActivity : ComponentActivity() {
         serverTemplateFetchInFlight = true
         serverTemplateFetchStatus = "fetching"
         thread {
+            Log.i(BLE_LOG_TAG, "CONFIG TEMPLATE REQUEST path=/api/v1/config-template")
             val json = adminJsonRequest("GET", "/api/v1/config-template", null)
             mainHandler.post {
                 serverTemplateFetchInFlight = false
                 try {
                     if (json?.optBoolean("ok") == true && json.has("template")) {
-                        val parsed = parseBmsConfigTemplateJson(json.getJSONObject("template"))
+                        val templateObj = json.getJSONObject("template")
+                        Log.i(
+                            BLE_LOG_TAG,
+                            "CONFIG TEMPLATE RESPONSE ok=true version=${templateObj.optInt("version")} " +
+                                "params=${templateObj.optJSONArray("parameters")?.length() ?: 0}"
+                        )
+                        val parsed = parseBmsConfigTemplateJson(templateObj)
                         activeServerTemplate = parsed
                         serverTemplateFetchStatus = "ok"
                         serverTemplateFetchError = null
                         // Неавторитетный кэш только для диагностики (не для статуса «ok»).
                         getSharedPreferences(CONFIG_PREFS_NAME, MODE_PRIVATE)
                             .edit()
-                            .putString("server_template_cache", json.getJSONObject("template").toString())
+                            .putString("server_template_cache", templateObj.toString())
                             .putLong("server_template_cached_at", System.currentTimeMillis())
                             .apply()
                     } else {
                         activeServerTemplate = null
                         serverTemplateFetchStatus = "error"
-                        serverTemplateFetchError = json?.optString("error")
-                            ?.takeIf { it.isNotBlank() }
-                            ?: "Не удалось получить актуальный шаблон конфигурации"
+                        val raw = json?.optString("error")?.takeIf { it.isNotBlank() }
+                            ?: json?.optString("message")?.takeIf { it.isNotBlank() }
+                            ?: if (json == null) "server_unreachable" else "template_response_invalid"
+                        serverTemplateFetchError = humanizeTemplateFetchError(raw)
+                        Log.w(BLE_LOG_TAG, "CONFIG TEMPLATE RESPONSE ok=false error=$raw")
                     }
                 } catch (e: Exception) {
                     activeServerTemplate = null
                     serverTemplateFetchStatus = "error"
-                    serverTemplateFetchError = (e.message ?: e.javaClass.simpleName).take(160)
+                    serverTemplateFetchError = humanizeTemplateFetchError(e.message ?: e.javaClass.simpleName)
+                    Log.e(BLE_LOG_TAG, "CONFIG TEMPLATE PARSE failed: ${e.message}", e)
                 }
                 if (configRegisters.isNotEmpty()) {
                     setTemplateCheckResult(evaluateTemplateCheck())
@@ -4792,16 +4900,7 @@ class MainActivity : ComponentActivity() {
                 val hasActual = templateParameterHasActual(parameter)
 
                 if (!parameter.enabled || parameter.enforcement == "informational") {
-                    items += TemplateCheckItem(
-                        parameter.key,
-                        parameter.label,
-                        expected,
-                        if (hasActual) actual else null,
-                        parameter.unit,
-                        parameter.tolerance,
-                        "disabled",
-                        status = "disabled"
-                    )
+                    // В админке «Не проверять» — не показываем в конфигурации шаблона.
                     continue
                 }
 
@@ -5478,12 +5577,12 @@ class MainActivity : ComponentActivity() {
                 )
             }
             else -> {
-                val rows = if (result.items.isNotEmpty()) {
+                val rows = (if (result.items.isNotEmpty()) {
                     result.items
                 } else {
                     result.mismatches.map { it.copy(status = "mismatch") } +
                         result.missing.map { it.copy(status = "missing") }
-                }
+                }).filter { it.status != "disabled" }
                 for (item in rows) {
                     content.addView(
                         configCheckDetailCard(item),
@@ -8674,9 +8773,17 @@ class MainActivity : ComponentActivity() {
             val target = command.displayValue ?: serviceWriteCapacityAh ?: return false
             return packGaugeAlreadyProgrammed(target) && capacityAlreadyMatches(target)
         }
-        if (command.key == "runtime_soc") {
-            val target = serviceWriteCapacityAh ?: return false
-            return packGaugeAlreadyProgrammed(target)
+    if (command.key == "runtime_soc") {
+            if (command.localOnly) {
+                val target = serviceWriteCapacityAh ?: return false
+                return packGaugeAlreadyProgrammed(target)
+            }
+            val live = data.soc
+            if (live != null && kotlin.math.abs(live - command.value) <= 1.0) return true
+            val raw = configRegisters[command.register] ?: return false
+            if (raw == command.rawValue) return true
+            val actual = (raw.toDouble() / command.scale) + command.offset
+            return kotlin.math.abs(actual - command.value) <= 1.0
         }
         val raw = configRegisters[command.register] ?: return false
         if (raw == command.rawValue) return true
@@ -9002,6 +9109,14 @@ class MainActivity : ComponentActivity() {
 
     private fun uploadCurrentData(force: Boolean) {
         if (uploading) return
+        if (!hasStableBmsIdentityForUpload()) {
+            Log.w(BLE_LOG_TAG, "telemetry upload skipped: unstable bms identity uid=${bmsUid()}")
+            if (force) {
+                lastUploadStatus = "Нет стабильного ID BMS"
+                refreshUploadStatusUi()
+            }
+            return
+        }
         if (data.voltage == null && data.soc == null && !force) return
 
         val now = System.currentTimeMillis()
@@ -9027,6 +9142,12 @@ class MainActivity : ComponentActivity() {
                 if (screenState == "journal") showJournalScreen()
             }
         }
+    }
+
+    private fun hasStableBmsIdentityForUpload(): Boolean {
+        val uid = bmsUid().trim()
+        if (isDalyBluetoothDeviceId(uid)) return true
+        return !selectedAddress.isNullOrBlank() && uid.isNotBlank() && uid != "unknown_bms"
     }
 
     private data class TelemetryPostResult(val ok: Boolean, val message: String)
@@ -9160,10 +9281,11 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (remoteWriteAlreadyMatches(command)) {
-            val actual = if (command.key == "nominal_capacity") {
-                currentNominalCapacityAh()
-            } else {
-                scaledRegisterValue(command.register, command.scale, command.offset)
+            val actual = when (command.key) {
+                "nominal_capacity" -> currentNominalCapacityAh()
+                "runtime_soc" -> data.soc
+                    ?: scaledRegisterValue(command.register, command.scale, command.offset)
+                else -> scaledRegisterValue(command.register, command.scale, command.offset)
             }
             if (!command.localOnly) {
                 toast("${command.label}: уже совпадает")
@@ -9436,12 +9558,23 @@ class MainActivity : ComponentActivity() {
         } else null
         val actual = when (command.key) {
             "settings_password" -> passwordActual?.toDoubleOrNull()
+            "runtime_soc" -> data.soc ?: actualFromRegister
             else -> actualFromRegister
         }
 
         // Сравниваем прежде всего нормализованный raw регистра (без float-шума).
         val ok = when (command.key) {
             "settings_password" -> passwordActual == SERVICE_SETTINGS_PASSWORD
+            "runtime_soc" -> {
+                when {
+                    raw != null && raw == command.rawValue -> true
+                    actualFromRegister != null &&
+                        kotlin.math.abs(actualFromRegister - command.value) <= 1.0 -> true
+                    data.soc != null &&
+                        kotlin.math.abs(data.soc!! - command.value) <= 1.0 -> true
+                    else -> false
+                }
+            }
             else -> {
                 when {
                     raw == null -> false
@@ -10279,7 +10412,7 @@ class MainActivity : ComponentActivity() {
 
         val note = JSONObject()
         note.put("source", "v47: audited runtime/config payload; capacity from runtime, raw Daly capacity regs diagnostic only")
-        note.put("write_commands_enabled", false)
+        note.put("write_commands_enabled", !isServiceApp())
         note.put("register_count", configRegisters.size)
         config.put("read_note", note)
 

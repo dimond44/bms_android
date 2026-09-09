@@ -1,6 +1,6 @@
 {
   "id": "liferych-lfp-default",
-  "version": 7,
+  "version": 8,
   "chemistry": "LiFePO4",
   "supported_series": [
     4,
@@ -35,6 +35,21 @@
       "expected": 3600,
       "enabled": true,
       "writable": true
+    },
+    {
+      "key": "runtime_soc",
+      "label": "SOC (ёмкость), %",
+      "register": "0x0116",
+      "scale": 10,
+      "offset": 0,
+      "unit": "%",
+      "tolerance": 1,
+      "enforcement": "required",
+      "expected": null,
+      "enabled": false,
+      "check_enabled": false,
+      "writable": true,
+      "write_enabled": true
     },
     {
       "key": "soc_calibration_0",
