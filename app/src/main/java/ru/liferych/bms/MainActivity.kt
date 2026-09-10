@@ -2668,6 +2668,7 @@ class MainActivity : ComponentActivity() {
             "profile" -> showProfileScreen()
             "manage" -> showManageScreen()
             "config_check" -> showConfigCheckScreen()
+            "support_diagnostics" -> showSupportDiagnostics()
             "service" -> showServiceScreen()
             "qtc" -> showQtcScreen()
             "auth" -> showAuthScreen()
@@ -4843,6 +4844,7 @@ class MainActivity : ComponentActivity() {
                 }
                 if (screenState == "dashboard") updateDashboardUi()
                 if (screenState == "config_check") showConfigCheckScreen()
+                if (screenState == "support_diagnostics") showSupportDiagnostics()
                 onDone?.invoke()
             }
         }
@@ -5027,6 +5029,22 @@ class MainActivity : ComponentActivity() {
     private fun setTemplateCheckResult(result: TemplateCheckResult) {
         latestTemplateCheck = result
         templateChecksByBms[bmsUid()] = result
+        refreshConfigCheckScreensIfVisible()
+    }
+
+    private fun refreshConfigCheckScreensIfVisible() {
+        val refresh = {
+            when (screenState) {
+                "config_check" -> showConfigCheckScreen()
+                "support_diagnostics" -> showSupportDiagnostics()
+                "dashboard" -> updateDashboardUi()
+            }
+        }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            refresh()
+        } else {
+            runOnUiThread { refresh() }
+        }
     }
 
     private fun setTemplateCheckChecking() {
@@ -5478,103 +5496,97 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(20))
         }
+        appendConfigCheckContent(content, showWriteActions = true)
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(fixedBottomNav("main"), LinearLayout.LayoutParams(-1, dp(70)))
+        setContentView(root)
+    }
+
+    /** Общий блок конфигурации для Главной (подробно) и Поддержка → Диагностика. */
+    private fun appendConfigCheckContent(content: LinearLayout, showWriteActions: Boolean) {
         val result = currentTemplateCheck()
         val template = activeServerTemplate
         val meta = buildString {
-            append("Версия шаблона: ")
+            append("Шаблон конфигурации: v")
             append(template?.version?.toString() ?: result?.templateVersion?.takeIf { it > 0 }?.toString() ?: "—")
-            append("\nОбновлён: ")
-            val updated = (template?.updatedAt ?: result?.templateUpdatedAt ?: 0L).takeIf { it > 0 }
-            append(
-                updated?.let {
-                    java.text.SimpleDateFormat("dd.MM.yyyy HH:mm", java.util.Locale.getDefault())
-                        .format(java.util.Date(it))
-                } ?: "—"
-            )
-            append("\nПроверено: ")
-            append(
-                result?.checkedAt?.takeIf { it > 0 }?.let {
-                    java.text.SimpleDateFormat("dd.MM.yyyy HH:mm:ss", java.util.Locale.getDefault())
-                        .format(java.util.Date(it))
-                } ?: "—"
-            )
+            val checked = result?.checkedAt?.takeIf { it > 0 }?.let {
+                java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+                    .format(java.util.Date(it))
+            }
+            if (checked != null) {
+                append("  ·  Проверка: ")
+                append(checked)
+            }
         }
         content.addView(TextView(this).apply {
             text = meta
-            textSize = 13f
+            textSize = 12f
             setTextColor(Color.rgb(111, 119, 129))
             typeface = interFont(600)
-            setPadding(dp(4), 0, dp(4), dp(12))
+            setPadding(dp(2), 0, dp(2), dp(8))
         })
 
-        val writableKeys = activeServerTemplate?.parameters
-            ?.filter { it.writable && it.enabled }
-            ?.map { it.key }
-            ?.toSet()
-            .orEmpty()
-        val writableMismatches = (result?.items
-            ?.filter { it.status == "mismatch" || it.status == "missing" }
-            .orEmpty()
-            .ifEmpty { result?.mismatches.orEmpty() + result?.missing.orEmpty() })
-            .filter { writableKeys.isEmpty() || it.key in writableKeys }
-        val canApply = !isServiceApp() &&
-            activeServerTemplate != null &&
-            result?.status in setOf("mismatch", "incomplete") &&
-            writableMismatches.isNotEmpty() &&
-            bluetoothGatt != null &&
-            !serviceWriteActive
+        content.addView(
+            configCheckSummaryBanner(result),
+            marginLp(-1, -2, 0, 0, 0, 10)
+        )
 
-        if (serviceWriteActive && clientTemplateApplyMode) {
-            content.addView(TextView(this).apply {
-                text = "Идёт запись параметров: $serviceWriteDone / $serviceWriteTotal"
-                textSize = 14f
-                typeface = interFont(700)
-                setTextColor(Color.rgb(16, 17, 20))
-                setPadding(dp(4), 0, dp(4), dp(10))
-            })
-        } else if (canApply) {
-            content.addView(TextView(this).apply {
-                text = "Настроить BMS"
-                textSize = 16f
-                typeface = interFont(760)
-                setTextColor(Color.WHITE)
-                gravity = Gravity.CENTER
-                setPadding(dp(12), dp(14), dp(12), dp(14))
-                background = round(red, dp(14), Color.TRANSPARENT, 0)
-                isClickable = true
-                isFocusable = true
-                setOnClickListener { startClientTemplateApply() }
-            }, marginLp(-1, -2, 0, 0, 0, 12))
-            content.addView(TextView(this).apply {
-                text = "Будут записаны только отличающиеся параметры шаблона. После каждой записи выполняется повторное чтение."
-                textSize = 12f
-                setTextColor(Color.rgb(111, 119, 129))
-                setPadding(dp(4), 0, dp(4), dp(12))
-            })
+        if (showWriteActions) {
+            val writableKeys = activeServerTemplate?.parameters
+                ?.filter { it.writable && it.enabled }
+                ?.map { it.key }
+                ?.toSet()
+                .orEmpty()
+            val writableMismatches = (result?.items
+                ?.filter { it.status == "mismatch" || it.status == "missing" }
+                .orEmpty()
+                .ifEmpty { result?.mismatches.orEmpty() + result?.missing.orEmpty() })
+                .filter { writableKeys.isEmpty() || it.key in writableKeys }
+            val canApply = !isServiceApp() &&
+                activeServerTemplate != null &&
+                result?.status in setOf("mismatch", "incomplete") &&
+                writableMismatches.isNotEmpty() &&
+                bluetoothGatt != null &&
+                !serviceWriteActive
+
+            if (serviceWriteActive && clientTemplateApplyMode) {
+                content.addView(TextView(this).apply {
+                    text = "Идёт запись параметров: $serviceWriteDone / $serviceWriteTotal"
+                    textSize = 14f
+                    typeface = interFont(700)
+                    setTextColor(Color.rgb(16, 17, 20))
+                    setPadding(dp(4), 0, dp(4), dp(10))
+                })
+            } else if (canApply) {
+                content.addView(TextView(this).apply {
+                    text = "Настроить BMS"
+                    textSize = 16f
+                    typeface = interFont(760)
+                    setTextColor(Color.WHITE)
+                    gravity = Gravity.CENTER
+                    setPadding(dp(12), dp(14), dp(12), dp(14))
+                    background = round(red, dp(14), Color.TRANSPARENT, 0)
+                    isClickable = true
+                    isFocusable = true
+                    setOnClickListener { startClientTemplateApply() }
+                }, marginLp(-1, -2, 0, 0, 0, 12))
+                content.addView(TextView(this).apply {
+                    text = "Будут записаны только отличающиеся параметры шаблона. После каждой записи выполняется повторное чтение."
+                    textSize = 12f
+                    setTextColor(Color.rgb(111, 119, 129))
+                    setPadding(dp(4), 0, dp(4), dp(12))
+                })
+            }
         }
 
         when {
             result?.status == "unavailable" ||
                 (serverTemplateFetchStatus == "error" && template == null) -> {
-                content.addView(
-                    manageSectionCard(
-                        "Статус",
-                        listOf(
-                            "Состояние" to (serverTemplateFetchError
-                                ?: "Не удалось получить актуальный шаблон конфигурации")
-                        )
-                    ),
-                    marginLp(-1, -2, 0, 0, 0, 12)
-                )
+                // summary banner already explains
             }
             result == null || result.status == "checking" -> {
-                content.addView(
-                    manageSectionCard(
-                        "Статус",
-                        listOf("Состояние" to "Проверка выполняется…")
-                    ),
-                    marginLp(-1, -2, 0, 0, 0, 12)
-                )
+                // summary banner already explains
             }
             else -> {
                 val rows = (if (result.items.isNotEmpty()) {
@@ -5585,8 +5597,8 @@ class MainActivity : ComponentActivity() {
                 }).filter { it.status != "disabled" }
                 for (item in rows) {
                     content.addView(
-                        configCheckDetailCard(item),
-                        marginLp(-1, -2, 0, 0, 0, 10)
+                        configParameterRow(item),
+                        marginLp(-1, -2, 0, 0, 0, 7)
                     )
                 }
                 if (rows.isEmpty()) {
@@ -5600,52 +5612,129 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-
-        scroll.addView(content)
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(fixedBottomNav("main"), LinearLayout.LayoutParams(-1, dp(70)))
-        setContentView(root)
     }
 
-    private fun configCheckDetailCard(item: TemplateCheckItem): LinearLayout {
-        val (mark, color, statusText) = when (item.status) {
-            "ok" -> Triple("✓", Color.rgb(31, 179, 90), "соответствует")
-            "mismatch" -> Triple("✗", Color.rgb(211, 47, 47), "не соответствует")
-            "missing" -> Triple("?", Color.rgb(224, 150, 0), "не удалось прочитать")
-            "skipped" -> Triple("—", Color.rgb(111, 119, 129), "не применяется")
-            "disabled" -> Triple("—", Color.rgb(111, 119, 129), "проверка отключена")
-            else -> Triple("•", Color.rgb(111, 119, 129), item.status)
+    private fun configCheckSummaryBanner(result: TemplateCheckResult?): LinearLayout {
+        val (mark, title, color) = when {
+            result?.status == "unavailable" ||
+                (serverTemplateFetchStatus == "error" && activeServerTemplate == null) ->
+                Triple("⚠", "Проверка конфигурации недоступна", Color.rgb(224, 150, 0))
+            result == null || result.status == "checking" || serverTemplateFetchStatus == "fetching" ->
+                Triple("…", "Проверка конфигурации…", Color.rgb(111, 119, 129))
+            result.status == "ok" ->
+                Triple("✓", "Конфигурация соответствует шаблону", Color.rgb(31, 179, 90))
+            result.status == "mismatch" || result.mismatches.isNotEmpty() -> {
+                val n = result.mismatches.size.takeIf { it > 0 }
+                    ?: result.items.count { it.status == "mismatch" }
+                Triple("⚠", "Найдено отклонений: $n", Color.rgb(224, 150, 0))
+            }
+            result.status == "incomplete" || result.missing.isNotEmpty() -> {
+                val n = result.missing.size.takeIf { it > 0 }
+                    ?: result.items.count { it.status == "missing" }
+                Triple("⚠", "Не удалось прочитать: $n", Color.rgb(224, 150, 0))
+            }
+            else -> Triple("•", "Статус: ${result.status}", Color.rgb(111, 119, 129))
         }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
+            addView(TextView(this@MainActivity).apply {
+                text = "$mark  $title"
+                textSize = 14f
+                typeface = interFont(720)
+                setTextColor(color)
+            })
+        }
+    }
+
+    /** Единый компактный ряд параметра для Конфигурации и Диагностики. */
+    private fun configParameterRow(item: TemplateCheckItem): LinearLayout {
         val unit = item.unit.trim()
         fun fmt(v: Double?): String {
             if (v == null) return "—"
             val num = formatTemplateNumber(v)
             return if (unit.isBlank()) num else "$num $unit"
         }
+        val (valueText, mark, markColor, expectedLine) = when (item.status) {
+            "ok" -> Quadruple(fmt(item.actual), "✓", Color.rgb(31, 179, 90), null as String?)
+            "mismatch" -> Quadruple(
+                fmt(item.actual),
+                "✕",
+                Color.rgb(211, 47, 47),
+                "Норма: ${fmt(item.expected)}"
+            )
+            "missing" -> Quadruple(
+                "Не удалось прочитать",
+                "⚠",
+                Color.rgb(224, 150, 0),
+                null
+            )
+            "skipped" -> Quadruple(
+                "Не поддерживается",
+                "—",
+                Color.rgb(111, 119, 129),
+                null
+            )
+            "disabled" -> Quadruple(
+                "Не проверяется",
+                "—",
+                Color.rgb(111, 119, 129),
+                null
+            )
+            else -> Quadruple(fmt(item.actual), "•", Color.rgb(111, 119, 129), null)
+        }
+
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+            setPadding(dp(13), dp(9), dp(13), dp(9))
+            background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
+
             addView(TextView(this@MainActivity).apply {
-                text = "$mark  ${item.label}"
-                textSize = 15f
+                text = item.label
+                textSize = 13f
+                typeface = interFont(650)
+                setTextColor(Color.rgb(90, 96, 104))
+            })
+
+            val valueRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(2), 0, 0)
+            }
+            valueRow.addView(TextView(this@MainActivity).apply {
+                text = valueText
+                textSize = 16f
                 typeface = interFont(720)
                 setTextColor(Color.rgb(16, 17, 20))
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            valueRow.addView(TextView(this@MainActivity).apply {
+                text = mark
+                textSize = 18f
+                typeface = interFont(780)
+                setTextColor(markColor)
+                gravity = Gravity.END
             })
-            addView(TextView(this@MainActivity).apply {
-                text = statusText
-                textSize = 12f
-                typeface = interFont(650)
-                setTextColor(color)
-                setPadding(0, dp(2), 0, dp(6))
-            })
-            addView(TextView(this@MainActivity).apply {
-                text = "Ожидалось: ${fmt(item.expected)}\nФактически: ${fmt(item.actual)}"
-                textSize = 13f
-                setTextColor(Color.rgb(75, 79, 84))
-            })
+            addView(valueRow)
+
+            if (expectedLine != null) {
+                addView(TextView(this@MainActivity).apply {
+                    text = expectedLine
+                    textSize = 12f
+                    typeface = interFont(600)
+                    setTextColor(Color.rgb(111, 119, 129))
+                    setPadding(0, dp(2), 0, 0)
+                })
+            }
         }
     }
+
+    private data class Quadruple<A, B, C, D>(
+        val first: A,
+        val second: B,
+        val third: C,
+        val fourth: D
+    )
 
     private fun String.trimTrailingZeros(): String {
         return this.replace(Regex("0+$"), "").replace(Regex("[.,]$"), "")
@@ -6643,20 +6732,70 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showSupportDiagnostics() {
-        val text = buildString {
-            appendLine("Устройство: ${selectedDeviceName.ifBlank { selectedAddress ?: "не выбрано" }}")
-            appendLine("Напряжение: ${data.voltage?.let { "%.2f В".format(it) } ?: "--"}")
-            appendLine("Ток: ${data.current?.let { "%.2f А".format(it) } ?: "--"}")
-            appendLine("SOC: ${data.soc?.let { "%.1f%%".format(it) } ?: "--"}")
-            appendLine("Ячеек: ${data.cellCount ?: "--"}")
-            appendLine("Температура: ${data.maxTemp?.let { "$it °C" } ?: "--"}")
-            append("Ошибки: ${if (data.errors.isEmpty()) "не обнаружены" else data.errors.joinToString()}")
+        enterScreen("support_diagnostics")
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
         }
-        AlertDialog.Builder(this)
-            .setTitle("Диагностика BMS")
-            .setMessage(text)
-            .setPositiveButton("Закрыть", null)
-            .show()
+        root.addView(
+            header(
+                "Диагностика",
+                selectedDeviceName.ifBlank { selectedAddress ?: "BMS" },
+                showBack = true
+            )
+        )
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(20))
+        }
+
+        val connected = bluetoothGatt != null
+        content.addView(
+            manageSectionCard(
+                "Состояние подключения",
+                listOf(
+                    "Статус" to if (connected) "Подключено" else "Нет подключения",
+                    "Устройство" to selectedDeviceName.ifBlank { selectedAddress ?: "—" },
+                    "Напряжение" to (data.voltage?.let { "%.2f В".format(it) } ?: "—"),
+                    "Ток" to (data.current?.let { "%.2f А".format(it) } ?: "—"),
+                    "SOC" to (data.soc?.let { "%.0f%%".format(it) } ?: "—"),
+                    "Ячеек" to (data.cellCount?.toString() ?: "—"),
+                    "Температура" to (data.maxTemp?.let { "$it °C" } ?: "—")
+                )
+            ),
+            marginLp(-1, -2, 0, 0, 0, 10)
+        )
+
+        content.addView(
+            manageSectionCard(
+                "Ошибки BMS",
+                listOf(
+                    "Состояние" to if (data.errors.isEmpty()) {
+                        "Нет ошибок"
+                    } else {
+                        data.errors.joinToString(", ")
+                    }
+                )
+            ),
+            marginLp(-1, -2, 0, 0, 0, 12)
+        )
+
+        content.addView(TextView(this).apply {
+            text = "Конфигурация BMS"
+            textSize = 17f
+            typeface = interFont(740)
+            setTextColor(Color.rgb(16, 17, 20))
+            setPadding(dp(2), 0, dp(2), dp(8))
+        })
+
+        // Тот же TemplateCheckResult / configParameterRow, что и на Главной.
+        appendConfigCheckContent(content, showWriteActions = false)
+
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(fixedBottomNav("support"), LinearLayout.LayoutParams(-1, dp(70)))
+        setContentView(root)
     }
 
     private fun clearWarrantyFormState() {
