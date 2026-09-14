@@ -3,6 +3,7 @@ import java.util.Properties
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("com.google.devtools.ksp")
 }
 
 val localProperties = Properties().apply {
@@ -37,16 +38,16 @@ android {
             dimension = "role"
             isDefault = true
             applicationId = "ru.liferych.bms"
-            versionCode = 112
-            versionName = "0.2.52"
+            versionCode = 113
+            versionName = "0.2.53"
             resValue("string", "app_name", "ЛИФЕРЫЧ BMS")
             buildConfigField("boolean", "IS_SERVICE", "false")
         }
         create("service") {
             dimension = "role"
             applicationId = "ru.liferych.bms.service"
-            versionCode = 104
-            versionName = "0.2.44"
+            versionCode = 105
+            versionName = "0.2.45"
             resValue("string", "app_name", "ЛИФЕРЫЧ Сервис")
             buildConfigField("boolean", "IS_SERVICE", "true")
         }
@@ -72,4 +73,11 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:1.5.3")
     implementation("androidx.camera:camera-view:1.5.3")
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
+    val room = "2.6.1"
+    implementation("androidx.room:room-runtime:$room")
+    implementation("androidx.room:room-ktx:$room")
+    ksp("androidx.room:room-compiler:$room")
+
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
 }

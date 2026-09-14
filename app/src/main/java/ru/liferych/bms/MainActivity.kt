@@ -13,6 +13,7 @@ import android.content.ClipData
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -27,6 +28,7 @@ import android.view.View
 import android.widget.*
 import android.util.TypedValue
 import androidx.activity.ComponentActivity
+import androidx.annotation.DrawableRes
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -43,6 +45,9 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
 import java.util.Calendar
+import java.util.Date
+import java.util.Locale
+import java.text.SimpleDateFormat
 import java.util.concurrent.Executors
 import org.json.JSONArray
 import org.json.JSONObject
@@ -94,6 +99,8 @@ private const val DALY_SOC_CALIBRATION_100_REG = 0x0229
 private const val DALY_CELL_OV_ALARM_REG = 0x0130
 private const val DALY_CELL_OV_PROTECT_REG = 0x0131
 private const val DALY_CELL_OV_RECOVERY_REG = 0x0132
+private const val METRIC_ICON_BOX_DP = 48
+private const val METRIC_ICON_DP = 34
 private const val SERVICE_SETTINGS_PASSWORD = "113355"
 private const val SERVICE_WRITE_MAX_RETRY_ROUNDS = 1
 private const val SERVICE_WRITE_VERIFY_MAX_ATTEMPTS = 2
@@ -244,6 +251,13 @@ data class TemplateCheckResult(
     val hardwareFamily: String = HARDWARE_FAMILY_STANDARD,
     val items: List<TemplateCheckItem> = emptyList(),
     val templateUpdatedAt: Long = 0L
+)
+
+/** Точка исторической телеметрии для графиков (server received_at + V/I). */
+data class TelemetryHistoryPoint(
+    val timestamp: Long,
+    val voltage: Double?,
+    val current: Double?
 )
 
 private enum class QtcDbStatus {
@@ -587,10 +601,29 @@ class MainActivity : ComponentActivity() {
     private var warrantyListLayout: LinearLayout? = null
     private var supportPrefs: SharedPreferences? = null
     private var editingWarrantyLocalId: String? = null
-    private var supportMode: String = "new"
+    private var supportMode: String = "home"
     private var currentTab: String = "main"
     private var manageSection: String = "general"
     private var screenState: String = "splash"
+
+    /** Режим периода графиков: day | week | month | custom. */
+    private var chartsPeriodMode: String = "day"
+    /** Начало выбранного дня (локальная timezone), для day/week/month навигации. */
+    private var chartsAnchorDayStartMs: Long = 0L
+    private var chartsCustomFromDayStartMs: Long = 0L
+    private var chartsCustomToDayStartMs: Long = 0L
+    private var chartsLoadToken: Int = 0
+    private var chartsStatus: String = "idle" // loading | ok | empty | error
+    private var chartsErrorText: String = ""
+    private var chartsPoints: List<TelemetryHistoryPoint> = emptyList()
+    private var chartsMinVoltage: Double? = null
+    private var chartsMaxVoltage: Double? = null
+    private var chartsMinCurrent: Double? = null
+    private var chartsMaxCurrent: Double? = null
+    private var chartsLoadedForUid: String = ""
+    private var chartsVoltageTooltipText: TextView? = null
+    private var chartsCurrentTooltipText: TextView? = null
+
     /** История UI-экранов для стрелки «Назад» и системной кнопки Back (без Jetpack Navigation). */
     private val uiBackStack = ArrayDeque<String>()
     private var navigatingBack: Boolean = false
@@ -720,7 +753,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var dischargeMosValue: TextView
     private var chargeMosDot: View? = null
     private var dischargeMosDot: View? = null
+    private var chargeMosSwitch: Switch? = null
+    private var dischargeMosSwitch: Switch? = null
+    private var suppressMosSwitchCallback: Boolean = false
     private lateinit var balanceValue: TextView
+    private var balanceIconHost: FrameLayout? = null
     private var balanceDot: View? = null
     private var stateValue: TextView? = null
     private var stateDot: View? = null
@@ -1716,7 +1753,7 @@ class MainActivity : ComponentActivity() {
         selectedDeviceName = displayName
         returnToBatteriesAfterConnect = false
         clearUiBackStack()
-        showLoadingScreen("Подключение к $displayName...")
+        showLoadingScreen("Идёт инициализация BMS")
         connectSelectedDevice()
     }
 
@@ -2098,8 +2135,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Компактная info-плитка: заголовок и значение в 1 строку, без иконки, без обрезки. */
-    private fun infoOneLineTile(label: String, initial: String): Pair<LinearLayout, TextView> {
+    /** Компактная info-плитка: иконка + заголовок и значение в 1 строку, без обрезки. */
+    private fun infoOneLineTile(
+        label: String,
+        initial: String,
+        @DrawableRes iconRes: Int? = null
+    ): Pair<LinearLayout, TextView> {
         val titleView = TextView(this).apply {
             text = label
             textSize = 11f
@@ -2125,103 +2166,245 @@ class MainActivity : ComponentActivity() {
         }
         enableWidthFit(titleView, 7f, 11f)
         enableWidthFit(valueView, 6f, 13f)
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            if (iconRes != null) {
+                addView(
+                    tileIconView(iconRes, 20),
+                    LinearLayout.LayoutParams(dp(20), dp(20)).apply { rightMargin = dp(4) }
+                )
+            }
+            addView(titleView, LinearLayout.LayoutParams(0, dp(16), 1f))
+        }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(6), dp(10), dp(6), dp(10))
             minimumHeight = dp(78)
             background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
-            addView(titleView, LinearLayout.LayoutParams(-1, dp(16)))
+            addView(titleRow, LinearLayout.LayoutParams(-1, -2))
             addView(valueView, LinearLayout.LayoutParams(-1, dp(24)).apply { topMargin = dp(4) })
         }
         return box to valueView
     }
 
-    private fun capacityInnerTile(label: String, valueView: TextView): LinearLayout {
+    private fun capacityInnerTile(
+        label: String,
+        valueView: TextView,
+        @DrawableRes iconRes: Int? = null
+    ): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(10), dp(10), dp(10))
             background = round(Color.rgb(248, 249, 251), dp(12), Color.rgb(223, 229, 235), 1)
-            addView(TextView(this@MainActivity).apply {
+            val titleView = TextView(this@MainActivity).apply {
                 text = label
                 textSize = 12f
                 setTextColor(Color.rgb(111, 119, 129))
                 typeface = interFont(650)
                 maxLines = 1
-            })
-            addView(valueView, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+                ellipsize = TextUtils.TruncateAt.END
+                includeFontPadding = false
+            }
+            addView(titleView, LinearLayout.LayoutParams(-1, -2))
+            if (iconRes != null) {
+                val valueRow = LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(
+                        tileIconView(iconRes, 28),
+                        LinearLayout.LayoutParams(dp(28), dp(28)).apply { rightMargin = dp(8) }
+                    )
+                    addView(valueView, LinearLayout.LayoutParams(0, -2, 1f))
+                }
+                addView(valueRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+            } else {
+                addView(valueView, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+            }
+            enableWidthFit(titleView, 8f, 12f)
         }
     }
 
-    /** Единая типографика карточек главного экрана (без смены визуального языка). */
+    /**
+     * Маленькая иконка плитки из drawable-nodpi.
+     * Без tint: PNG уже содержат нужный цвет; scale FIT в фиксированном контейнере.
+     */
+    private fun tileIconView(@DrawableRes iconRes: Int, sizeDp: Int): ImageView {
+        return ImageView(this).apply {
+            setImageResource(iconRes)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            adjustViewBounds = true
+            contentDescription = null
+            layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+        }
+    }
+
+    /** Единый контейнер иконки нижних metric-плиток. */
+    private fun metricIconBlock(
+        @DrawableRes iconRes: Int? = null,
+        glyph: String = "",
+        glyphColor: Int = Color.rgb(70, 85, 105)
+    ): FrameLayout {
+        return FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(METRIC_ICON_BOX_DP), dp(METRIC_ICON_BOX_DP))
+            fillMetricIconBlock(this, iconRes, glyph, glyphColor)
+        }
+    }
+
+    private fun fillMetricIconBlock(
+        host: FrameLayout,
+        @DrawableRes iconRes: Int? = null,
+        glyph: String = "",
+        glyphColor: Int = Color.rgb(70, 85, 105)
+    ) {
+        host.removeAllViews()
+        if (iconRes != null) {
+            host.addView(
+                tileIconView(iconRes, METRIC_ICON_DP),
+                FrameLayout.LayoutParams(dp(METRIC_ICON_DP), dp(METRIC_ICON_DP), Gravity.CENTER)
+            )
+        } else if (glyph.isNotBlank()) {
+            host.addView(
+                TextView(this).apply {
+                    text = glyph
+                    textSize = 26f
+                    gravity = Gravity.CENTER
+                    setTextColor(glyphColor)
+                    includeFontPadding = false
+                    typeface = interFont(700)
+                },
+                FrameLayout.LayoutParams(-1, -1, Gravity.CENTER)
+            )
+        }
+    }
+
+    /**
+     * Нижняя metric-плитка:
+     * строка 1 — название (целиком в плитку),
+     * строка 2 — иконка + значение.
+     */
     private fun classicMetricBox(
         icon: String,
         initial: String,
         label: String,
-        sub: String = "",
-        valueSize: Float = 18f,
-        titleSize: Float = 12f,
+        @Suppress("UNUSED_PARAMETER") sub: String = "",
+        valueSize: Float = 20f,
+        titleSize: Float = 13f,
         truncate: Boolean = false,
         fixedHeight: Boolean = true,
         compact: Boolean = false,
-        fitOneLine: Boolean = false
-    ): Pair<LinearLayout, TextView> {
+        fitOneLine: Boolean = false,
+        @DrawableRes iconRes: Int? = null,
+        glyphColor: Int = Color.rgb(70, 85, 105)
+    ): Triple<LinearLayout, TextView, FrameLayout> {
         val value = TextView(this).apply {
             text = initial
             textSize = valueSize
             setTextColor(Color.rgb(16, 17, 20))
             typeface = interFont(if (compact) 720 else 760)
             maxLines = if (truncate) 2 else 1
-            if (fitOneLine) {
-                setSingleLine(true)
-                ellipsize = null
-            } else {
-                ellipsize = TextUtils.TruncateAt.END
-            }
-            setLineSpacing(0f, 1.05f)
-        }
-        val subView = TextView(this).apply {
-            text = sub.ifBlank { " " }
-            textSize = 12f
-            setTextColor(Color.rgb(111, 119, 129))
-            typeface = interFont(600)
-            maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
-            visibility = View.VISIBLE
+            setLineSpacing(0f, 1.05f)
+            includeFontPadding = false
+            gravity = Gravity.CENTER_VERTICAL
         }
         val titleView = TextView(this).apply {
-            text = if (icon.isBlank()) label else "$icon  $label"
+            text = label
             textSize = titleSize
             setTextColor(Color.rgb(111, 119, 129))
             typeface = interFont(650)
             maxLines = 1
-            if (fitOneLine) {
-                setSingleLine(true)
-                ellipsize = null
-            } else {
-                ellipsize = TextUtils.TruncateAt.END
-            }
+            isSingleLine = true
+            ellipsize = null
             setLineSpacing(0f, 1.05f)
+            includeFontPadding = false
+        }
+        val iconHost = metricIconBlock(
+            iconRes = iconRes,
+            glyph = if (iconRes == null) icon else "",
+            glyphColor = glyphColor
+        )
+        val valueRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(iconHost)
+            addView(
+                value,
+                LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(8) }
+            )
         }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(if (compact) 10 else 12), dp(11), dp(if (compact) 10 else 12), dp(11))
-            if (fixedHeight) minimumHeight = dp(if (compact) 88 else 86)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(if (compact) 10 else 12), dp(10), dp(if (compact) 10 else 12), dp(10))
+            if (fixedHeight) minimumHeight = dp(if (compact) 86 else 90)
             background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
-            addView(titleView, LinearLayout.LayoutParams(-1, if (fitOneLine) dp(16) else -2))
-            addView(
-                value,
-                LinearLayout.LayoutParams(-1, if (fitOneLine) dp(22) else -2).apply {
-                    topMargin = dp(5)
-                }
-            )
-            addView(subView, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
+            addView(titleView, LinearLayout.LayoutParams(-1, -2))
+            addView(valueRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
         }
+        // Подгоняем title под ширину плитки, чтобы длинные надписи входили.
+        enableWidthFit(titleView, 8f, titleSize.coerceAtLeast(8f))
         if (fitOneLine) {
-            enableWidthFit(titleView, 7f, titleSize.coerceAtLeast(7f))
             enableWidthFit(value, 6f, valueSize.coerceAtLeast(6f))
         }
-        box.tag = subView
-        return box to value
+        box.tag = null
+        return Triple(box, value, iconHost)
+    }
+
+    /**
+     * MOS-плитка: только название слева и read-only Switch справа (без иконки и без ВКЛ/ВЫКЛ).
+     * Состояние берётся из BMS; переключение пользователем отключено.
+     */
+    private fun mosMetricBox(label: String): Pair<LinearLayout, Switch> {
+        val titleView = TextView(this).apply {
+            text = label
+            textSize = 14f
+            setTextColor(Color.rgb(16, 17, 20))
+            typeface = interFont(700)
+            maxLines = 1
+            isSingleLine = true
+            ellipsize = null
+            includeFontPadding = false
+        }
+        val sw = Switch(this).apply {
+            isChecked = false
+            isClickable = false
+            isFocusable = false
+            isEnabled = false
+            styleMosSwitch(this)
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(titleView, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(sw, LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(8) })
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(12), dp(12), dp(12))
+            minimumHeight = dp(86)
+            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
+            isClickable = false
+            addView(row, LinearLayout.LayoutParams(-1, -2))
+        }
+        enableWidthFit(titleView, 9f, 14f)
+        return box to sw
+    }
+
+    /** Зелёный ON / нейтральный серый OFF для Switch MOS. */
+    private fun styleMosSwitch(sw: Switch) {
+        val on = Color.rgb(31, 179, 90)
+        val offThumb = Color.rgb(200, 205, 210)
+        val offTrack = Color.rgb(220, 224, 228)
+        sw.thumbTintList = ColorStateList(
+            arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+            intArrayOf(on, offThumb)
+        )
+        sw.trackTintList = ColorStateList(
+            arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+            intArrayOf(Color.argb(120, 31, 179, 90), offTrack)
+        )
     }
 
     private fun classicMetricSub(box: LinearLayout): TextView? = box.tag as? TextView
@@ -2248,54 +2431,26 @@ class MainActivity : ComponentActivity() {
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(hPad(), 0, hPad(), dp(22))
+            setPadding(hPad(), dp(8), hPad(), dp(22))
         }
 
-        // Список BMS — в стиле старых карточек
-        val listRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { openBatteriesListFromDashboard() }
-            addView(TextView(this@MainActivity).apply {
-                text = "≡"
-                textSize = 18f
-                setTextColor(Color.rgb(16, 17, 20))
-                gravity = Gravity.CENTER
-            }, LinearLayout.LayoutParams(dp(28), -2))
-            addView(TextView(this@MainActivity).apply {
-                text = "Список BMS / Добавить новую"
-                textSize = 14f
-                setTextColor(Color.rgb(16, 17, 20))
-                typeface = interFont(700)
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-            }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = dp(6) })
-            addView(TextView(this@MainActivity).apply {
-                text = "›"
-                textSize = 22f
-                setTextColor(Color.rgb(111, 119, 129))
-            })
-        }
-        content.addView(listRow, marginLp(-1, -2, 0, 8, 0, 8))
-
-        // Имя | Серийный номер | Версия — 1 строка, полный текст (без иконок, auto-size)
+        // Имя | Серийный номер | Версия
         val nameMetric = infoOneLineTile(
             "Имя устройства",
-            selectedDeviceName.ifBlank { selectedAddress ?: "--" }
+            selectedDeviceName.ifBlank { selectedAddress ?: "--" },
+            R.drawable.icon_device
         )
         deviceNameValue = nameMetric.second
         val snMetric = infoOneLineTile(
             "Серийный номер",
-            displayFactorySn().ifBlank { "--" }
+            displayFactorySn().ifBlank { "--" },
+            R.drawable.icon_serial
         )
         bmsSnValue = snMetric.second
         val verMetric = infoOneLineTile(
             "Версия BMS",
-            displayBmsVersion().ifBlank { "--" }
+            displayBmsVersion().ifBlank { "--" },
+            R.drawable.icon_bms_version
         )
         bmsVersionValue = verMetric.second
         val infoRow = LinearLayout(this).apply {
@@ -2335,6 +2490,18 @@ class MainActivity : ComponentActivity() {
             ellipsize = TextUtils.TruncateAt.END
         }
         socCol.addView(socStatusText, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+        socCol.addView(TextView(this).apply {
+            text = "📊 График"
+            textSize = 13f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(25, 118, 210))
+            gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, dp(2))
+            isClickable = true
+            isFocusable = true
+            contentDescription = "Открыть графики заряда и разряда"
+            setOnClickListener { openChartsScreen() }
+        }, LinearLayout.LayoutParams(-1, -2))
         hero.addView(socCol, LinearLayout.LayoutParams(0, -2, 0.95f))
 
         val capacityCol = LinearLayout(this).apply {
@@ -2359,7 +2526,7 @@ class MainActivity : ComponentActivity() {
             ellipsize = TextUtils.TruncateAt.END
         }
         capacityCol.addView(
-            capacityInnerTile("Полная ёмкость", fullCapacityValue!!),
+            capacityInnerTile("Полная ёмкость", fullCapacityValue!!, R.drawable.icon_capacity),
             LinearLayout.LayoutParams(-1, -2)
         )
         capacityCol.addView(
@@ -2383,61 +2550,60 @@ class MainActivity : ComponentActivity() {
         }
 
         val voltageMetric = classicMetricBox(
-            "⚡", "-- В", "Напряжение", "Напряжение батареи",
-            valueSize = 18f, titleSize = 12f
+            "", "-- В", "Напряжение",
+            valueSize = 20f, titleSize = 13f, iconRes = R.drawable.icon_voltage
         )
         voltageValue = voltageMetric.second
         val currentMetric = classicMetricBox(
-            "↯",
+            "",
             "-- А",
             "Ток",
-            currentDirectionLabel(data.current),
-            valueSize = 18f,
-            titleSize = 12f
+            valueSize = 20f,
+            titleSize = 13f,
+            iconRes = R.drawable.icon_current
         )
         currentValue = currentMetric.second
-        currentSubValue = classicMetricSub(currentMetric.first)
+        currentSubValue = null
         addPair(voltageMetric.first, currentMetric.first)
 
         val tempMetric = classicMetricBox(
-            "°", "-- °C", "Температура", "Датчик BMS",
-            valueSize = 18f, titleSize = 12f
+            "", "-- °C", "Температура",
+            valueSize = 20f, titleSize = 13f, iconRes = R.drawable.icon_temperature
         )
         t1Text = tempMetric.second
         val cellsMetric = classicMetricBox(
-            "▤",
+            "",
             data.cellCount?.toString() ?: "--",
             "Количество ячеек",
-            "LiFePO4",
-            valueSize = 18f,
-            titleSize = 12f
+            valueSize = 20f,
+            titleSize = 12f,
+            iconRes = R.drawable.icon_cells
         )
         cellCountValue = cellsMetric.second
         addPair(tempMetric.first, cellsMetric.first)
 
-        val chargeMetric = classicMetricBox(
-            "⏻", "—", "MOS зарядки", " ",
-            valueSize = 18f, titleSize = 12f
-        )
-        chargeMosValue = chargeMetric.second
+        // Скрытые TextView — совместимость с applyMos/updateDashboardUi (ВКЛ/ВЫКЛ на экране не показываем).
+        chargeMosValue = TextView(this).apply { visibility = View.GONE }
+        dischargeMosValue = TextView(this).apply { visibility = View.GONE }
+        val chargeMetric = mosMetricBox("MOS зарядки")
+        chargeMosSwitch = chargeMetric.second
         chargeMosDot = null
-        val dischargeMetric = classicMetricBox(
-            "⏻", "—", "MOS разрядки", " ",
-            valueSize = 18f, titleSize = 12f
-        )
-        dischargeMosValue = dischargeMetric.second
+        val dischargeMetric = mosMetricBox("MOS разрядки")
+        dischargeMosSwitch = dischargeMetric.second
         dischargeMosDot = null
         addPair(chargeMetric.first, dischargeMetric.first)
 
         val statusMetric = classicMetricBox(
-            "◉", "—", "Статус BMS", " ",
-            valueSize = 18f, titleSize = 12f
+            "✓", "Норма", "Статус BMS",
+            valueSize = 18f, titleSize = 13f,
+            glyphColor = Color.rgb(31, 179, 90)
         )
         balanceValue = statusMetric.second
+        balanceIconHost = statusMetric.third
         balanceDot = null
         val stateMetric = classicMetricBox(
-            "≈", "—", "Состояние", " ",
-            valueSize = 18f, titleSize = 12f
+            "", "—", "Состояние",
+            valueSize = 18f, titleSize = 13f, iconRes = R.drawable.icon_state
         )
         stateValue = stateMetric.second
         stateDot = null
@@ -2669,9 +2835,10 @@ class MainActivity : ComponentActivity() {
             "manage" -> showManageScreen()
             "config_check" -> showConfigCheckScreen()
             "support_diagnostics" -> showSupportDiagnostics()
+            "charts" -> showChartsScreen(reload = false)
             "service" -> showServiceScreen()
             "qtc" -> showQtcScreen()
-            "auth" -> showAuthScreen()
+            "auth" -> showProfileScreen()
             "search" -> showSearchScreen()
             else -> goHomeFromMenu()
         }
@@ -2841,23 +3008,14 @@ class MainActivity : ComponentActivity() {
                     if (screenState == "journal") return@setOnClickListener
                     showJournalScreen()
                 } else if (text.contains("Поддержка") || text.contains("Техподдержка")) {
-                    if (screenState == "support") return@setOnClickListener
+                    if (screenState == "support" && supportMode == "home") return@setOnClickListener
+                    supportMode = "home"
+                    editingWarrantyLocalId = null
+                    clearWarrantyFormState()
                     showSupportScreen()
                 } else if (text.contains("Профиль")) {
-                    if (isServiceApp()) {
-                        if (screenState == "profile") return@setOnClickListener
-                        showProfileScreen()
-                    } else {
-                        val loggedIn = getSharedPreferences("user_profile", MODE_PRIVATE)
-                            .getBoolean("logged_in", false)
-                        if (loggedIn) {
-                            if (screenState == "profile") return@setOnClickListener
-                            showProfileScreen()
-                        } else {
-                            if (screenState == "auth") return@setOnClickListener
-                            showAuthScreen()
-                        }
-                    }
+                    if (screenState == "profile") return@setOnClickListener
+                    showProfileScreen()
                 }
             }
         }, LinearLayout.LayoutParams(0, -1, 1f))
@@ -3159,7 +3317,7 @@ class MainActivity : ComponentActivity() {
         }
         val series = result?.seriesCount?.let { "${it}S" } ?: data.cellCount?.let { "${it}S" } ?: "—"
         val title = when (status) {
-            "checking" -> "Проверка конфигурации…"
+            "checking" -> "Идёт инициализация BMS"
             "ok" -> "Конфигурация соответствует шаблону"
             "mismatch" -> "Конфигурация не соответствует шаблону"
             "incomplete" -> "Проверка конфигурации неполная"
@@ -4260,6 +4418,7 @@ class MainActivity : ComponentActivity() {
     private fun manageTabs(): HorizontalScrollView {
         val scroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
         }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -4269,13 +4428,34 @@ class MainActivity : ComponentActivity() {
             "general" to "Основные",
             "voltage_current" to "Напряжение",
             "temperature" to "Температура",
-            "cell" to "Параметры элемента",
-            "balancing" to "Балансировка"
+            "balancing" to "Настройка балансировки",
+            "cell" to "Параметры элемента"
         )
+        var selectedView: View? = null
         for ((key, title) in tabs) {
-            row.addView(manageTabButton(key, title), marginLp(-2, dp(42), 0, 0, 8, 0))
+            val btn = manageTabButton(key, title)
+            row.addView(btn, marginLp(-2, dp(42), 0, 0, 8, 0))
+            if (manageSection == key) selectedView = btn
         }
         scroll.addView(row)
+        // Автоматически сдвигаем выбранную плитку в видимую область.
+        selectedView?.let { target ->
+            scroll.post {
+                val left = target.left - dp(16)
+                val right = target.right + dp(16)
+                val visibleLeft = scroll.scrollX
+                val visibleRight = visibleLeft + scroll.width
+                when {
+                    left < visibleLeft -> scroll.smoothScrollTo(left.coerceAtLeast(0), 0)
+                    right > visibleRight -> scroll.smoothScrollTo((right - scroll.width).coerceAtLeast(0), 0)
+                    else -> {
+                        // Центрируем выбранный пункт, если места достаточно.
+                        val center = target.left + target.width / 2 - scroll.width / 2
+                        scroll.smoothScrollTo(center.coerceAtLeast(0), 0)
+                    }
+                }
+            }
+        }
         return scroll
     }
 
@@ -5444,7 +5624,7 @@ class MainActivity : ComponentActivity() {
             else -> Color.rgb(110, 118, 128)
         }
         val title = when (status) {
-            "checking" -> "Проверка конфигурации…"
+            "checking" -> "Идёт инициализация BMS"
             "ok" -> "Конфигурация соответствует шаблону"
             "mismatch" -> "Есть отклонения конфигурации"
             "incomplete" -> "Проверка конфигурации неполная"
@@ -5478,6 +5658,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Экран по тапу «Батарея в норме» на Главной.
+     * Содержимое совпадает с Поддержка → Диагностика; дополнительно — запись шаблона при отклонениях.
+     */
     private fun showConfigCheckScreen() {
         enterScreen("config_check")
         val root = LinearLayout(this).apply {
@@ -5486,7 +5670,7 @@ class MainActivity : ComponentActivity() {
         }
         root.addView(
             header(
-                "Конфигурация BMS",
+                "Диагностика",
                 selectedDeviceName.ifBlank { selectedAddress ?: "" },
                 showBack = true
             )
@@ -5496,245 +5680,72 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(20))
         }
-        appendConfigCheckContent(content, showWriteActions = true)
+        // Тот же presentation-слой, что и Поддержка → Диагностика.
+        appendDiagnosticsConfigPresentation(content)
+        appendClientTemplateApplyActions(content)
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(fixedBottomNav("main"), LinearLayout.LayoutParams(-1, dp(70)))
         setContentView(root)
     }
 
-    /** Общий блок конфигурации для Главной (подробно) и Поддержка → Диагностика. */
-    private fun appendConfigCheckContent(content: LinearLayout, showWriteActions: Boolean) {
+    /**
+     * Клиентская запись отличающихся параметров шаблона.
+     * Показывается только на экране с Главной (не дублируется в Поддержка → Диагностика).
+     *
+     * @param content контейнер экрана диагностики
+     * Side effects: добавляет UI; по клику запускает startClientTemplateApply().
+     */
+    private fun appendClientTemplateApplyActions(content: LinearLayout) {
         val result = currentTemplateCheck()
-        val template = activeServerTemplate
-        val meta = buildString {
-            append("Шаблон конфигурации: v")
-            append(template?.version?.toString() ?: result?.templateVersion?.takeIf { it > 0 }?.toString() ?: "—")
-            val checked = result?.checkedAt?.takeIf { it > 0 }?.let {
-                java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
-                    .format(java.util.Date(it))
-            }
-            if (checked != null) {
-                append("  ·  Проверка: ")
-                append(checked)
-            }
+        val writableKeys = activeServerTemplate?.parameters
+            ?.filter { it.writable && it.enabled }
+            ?.map { it.key }
+            ?.toSet()
+            .orEmpty()
+        val writableMismatches = (result?.items
+            ?.filter { it.status == "mismatch" || it.status == "missing" }
+            .orEmpty()
+            .ifEmpty { result?.mismatches.orEmpty() + result?.missing.orEmpty() })
+            .filter { writableKeys.isEmpty() || it.key in writableKeys }
+        val canApply = !isServiceApp() &&
+            activeServerTemplate != null &&
+            result?.status in setOf("mismatch", "incomplete") &&
+            writableMismatches.isNotEmpty() &&
+            bluetoothGatt != null &&
+            !serviceWriteActive
+
+        if (serviceWriteActive && clientTemplateApplyMode) {
+            content.addView(TextView(this).apply {
+                text = "Идёт запись параметров: $serviceWriteDone / $serviceWriteTotal"
+                textSize = 14f
+                typeface = interFont(700)
+                setTextColor(Color.rgb(16, 17, 20))
+                setPadding(dp(4), dp(8), dp(4), dp(10))
+            })
+            return
         }
+        if (!canApply) return
+
         content.addView(TextView(this).apply {
-            text = meta
+            text = "Настроить BMS"
+            textSize = 16f
+            typeface = interFont(760)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(14), dp(12), dp(14))
+            background = round(red, dp(14), Color.TRANSPARENT, 0)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { startClientTemplateApply() }
+        }, marginLp(-1, -2, 0, dp(8), 0, 12))
+        content.addView(TextView(this).apply {
+            text = "Будут записаны только отличающиеся параметры шаблона. После каждой записи выполняется повторное чтение."
             textSize = 12f
             setTextColor(Color.rgb(111, 119, 129))
-            typeface = interFont(600)
-            setPadding(dp(2), 0, dp(2), dp(8))
+            setPadding(dp(4), 0, dp(4), dp(12))
         })
-
-        content.addView(
-            configCheckSummaryBanner(result),
-            marginLp(-1, -2, 0, 0, 0, 10)
-        )
-
-        if (showWriteActions) {
-            val writableKeys = activeServerTemplate?.parameters
-                ?.filter { it.writable && it.enabled }
-                ?.map { it.key }
-                ?.toSet()
-                .orEmpty()
-            val writableMismatches = (result?.items
-                ?.filter { it.status == "mismatch" || it.status == "missing" }
-                .orEmpty()
-                .ifEmpty { result?.mismatches.orEmpty() + result?.missing.orEmpty() })
-                .filter { writableKeys.isEmpty() || it.key in writableKeys }
-            val canApply = !isServiceApp() &&
-                activeServerTemplate != null &&
-                result?.status in setOf("mismatch", "incomplete") &&
-                writableMismatches.isNotEmpty() &&
-                bluetoothGatt != null &&
-                !serviceWriteActive
-
-            if (serviceWriteActive && clientTemplateApplyMode) {
-                content.addView(TextView(this).apply {
-                    text = "Идёт запись параметров: $serviceWriteDone / $serviceWriteTotal"
-                    textSize = 14f
-                    typeface = interFont(700)
-                    setTextColor(Color.rgb(16, 17, 20))
-                    setPadding(dp(4), 0, dp(4), dp(10))
-                })
-            } else if (canApply) {
-                content.addView(TextView(this).apply {
-                    text = "Настроить BMS"
-                    textSize = 16f
-                    typeface = interFont(760)
-                    setTextColor(Color.WHITE)
-                    gravity = Gravity.CENTER
-                    setPadding(dp(12), dp(14), dp(12), dp(14))
-                    background = round(red, dp(14), Color.TRANSPARENT, 0)
-                    isClickable = true
-                    isFocusable = true
-                    setOnClickListener { startClientTemplateApply() }
-                }, marginLp(-1, -2, 0, 0, 0, 12))
-                content.addView(TextView(this).apply {
-                    text = "Будут записаны только отличающиеся параметры шаблона. После каждой записи выполняется повторное чтение."
-                    textSize = 12f
-                    setTextColor(Color.rgb(111, 119, 129))
-                    setPadding(dp(4), 0, dp(4), dp(12))
-                })
-            }
-        }
-
-        when {
-            result?.status == "unavailable" ||
-                (serverTemplateFetchStatus == "error" && template == null) -> {
-                // summary banner already explains
-            }
-            result == null || result.status == "checking" -> {
-                // summary banner already explains
-            }
-            else -> {
-                val rows = (if (result.items.isNotEmpty()) {
-                    result.items
-                } else {
-                    result.mismatches.map { it.copy(status = "mismatch") } +
-                        result.missing.map { it.copy(status = "missing") }
-                }).filter { it.status != "disabled" }
-                for (item in rows) {
-                    content.addView(
-                        configParameterRow(item),
-                        marginLp(-1, -2, 0, 0, 0, 7)
-                    )
-                }
-                if (rows.isEmpty()) {
-                    content.addView(
-                        manageSectionCard(
-                            "Статус",
-                            listOf("Состояние" to "Нет параметров для отображения")
-                        ),
-                        marginLp(-1, -2, 0, 0, 0, 12)
-                    )
-                }
-            }
-        }
     }
-
-    private fun configCheckSummaryBanner(result: TemplateCheckResult?): LinearLayout {
-        val (mark, title, color) = when {
-            result?.status == "unavailable" ||
-                (serverTemplateFetchStatus == "error" && activeServerTemplate == null) ->
-                Triple("⚠", "Проверка конфигурации недоступна", Color.rgb(224, 150, 0))
-            result == null || result.status == "checking" || serverTemplateFetchStatus == "fetching" ->
-                Triple("…", "Проверка конфигурации…", Color.rgb(111, 119, 129))
-            result.status == "ok" ->
-                Triple("✓", "Конфигурация соответствует шаблону", Color.rgb(31, 179, 90))
-            result.status == "mismatch" || result.mismatches.isNotEmpty() -> {
-                val n = result.mismatches.size.takeIf { it > 0 }
-                    ?: result.items.count { it.status == "mismatch" }
-                Triple("⚠", "Найдено отклонений: $n", Color.rgb(224, 150, 0))
-            }
-            result.status == "incomplete" || result.missing.isNotEmpty() -> {
-                val n = result.missing.size.takeIf { it > 0 }
-                    ?: result.items.count { it.status == "missing" }
-                Triple("⚠", "Не удалось прочитать: $n", Color.rgb(224, 150, 0))
-            }
-            else -> Triple("•", "Статус: ${result.status}", Color.rgb(111, 119, 129))
-        }
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
-            addView(TextView(this@MainActivity).apply {
-                text = "$mark  $title"
-                textSize = 14f
-                typeface = interFont(720)
-                setTextColor(color)
-            })
-        }
-    }
-
-    /** Единый компактный ряд параметра для Конфигурации и Диагностики. */
-    private fun configParameterRow(item: TemplateCheckItem): LinearLayout {
-        val unit = item.unit.trim()
-        fun fmt(v: Double?): String {
-            if (v == null) return "—"
-            val num = formatTemplateNumber(v)
-            return if (unit.isBlank()) num else "$num $unit"
-        }
-        val (valueText, mark, markColor, expectedLine) = when (item.status) {
-            "ok" -> Quadruple(fmt(item.actual), "✓", Color.rgb(31, 179, 90), null as String?)
-            "mismatch" -> Quadruple(
-                fmt(item.actual),
-                "✕",
-                Color.rgb(211, 47, 47),
-                "Норма: ${fmt(item.expected)}"
-            )
-            "missing" -> Quadruple(
-                "Не удалось прочитать",
-                "⚠",
-                Color.rgb(224, 150, 0),
-                null
-            )
-            "skipped" -> Quadruple(
-                "Не поддерживается",
-                "—",
-                Color.rgb(111, 119, 129),
-                null
-            )
-            "disabled" -> Quadruple(
-                "Не проверяется",
-                "—",
-                Color.rgb(111, 119, 129),
-                null
-            )
-            else -> Quadruple(fmt(item.actual), "•", Color.rgb(111, 119, 129), null)
-        }
-
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(13), dp(9), dp(13), dp(9))
-            background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
-
-            addView(TextView(this@MainActivity).apply {
-                text = item.label
-                textSize = 13f
-                typeface = interFont(650)
-                setTextColor(Color.rgb(90, 96, 104))
-            })
-
-            val valueRow = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(2), 0, 0)
-            }
-            valueRow.addView(TextView(this@MainActivity).apply {
-                text = valueText
-                textSize = 16f
-                typeface = interFont(720)
-                setTextColor(Color.rgb(16, 17, 20))
-            }, LinearLayout.LayoutParams(0, -2, 1f))
-            valueRow.addView(TextView(this@MainActivity).apply {
-                text = mark
-                textSize = 18f
-                typeface = interFont(780)
-                setTextColor(markColor)
-                gravity = Gravity.END
-            })
-            addView(valueRow)
-
-            if (expectedLine != null) {
-                addView(TextView(this@MainActivity).apply {
-                    text = expectedLine
-                    textSize = 12f
-                    typeface = interFont(600)
-                    setTextColor(Color.rgb(111, 119, 129))
-                    setPadding(0, dp(2), 0, 0)
-                })
-            }
-        }
-    }
-
-    private data class Quadruple<A, B, C, D>(
-        val first: A,
-        val second: B,
-        val third: C,
-        val fourth: D
-    )
 
     private fun String.trimTrailingZeros(): String {
         return this.replace(Regex("0+$"), "").replace(Regex("[.,]$"), "")
@@ -6084,12 +6095,24 @@ class MainActivity : ComponentActivity() {
             setTextColor(Color.rgb(90, 90, 90))
             setPadding(0, dp(10), 0, 0)
         })
-        content.addView(contactCard, marginLp(-1, -2, 0, 0, 0, 10))
-
         when (supportMode) {
             "new" -> renderWarrantyForm(content, null)
             "edit" -> renderWarrantyForm(content, editingWarrantyLocalId)
-            else -> renderWarrantyList(content)
+            "list" -> renderWarrantyList(content)
+            else -> {
+                // Базовое состояние: только контакты + диагностика.
+                content.addView(contactCard, marginLp(-1, -2, 0, 0, 0, 10))
+                content.addView(TextView(this).apply {
+                    text = "ДИАГНОСТИКА"
+                    textSize = 15f
+                    typeface = interFont(760)
+                    setTextColor(Color.rgb(16, 17, 20))
+                    gravity = Gravity.CENTER
+                    setPadding(dp(10), dp(12), dp(10), dp(12))
+                    background = round(Color.WHITE, dp(14), red, 1)
+                    setOnClickListener { showSupportDiagnostics() }
+                }, marginLp(-1, -2, 0, 0, 0, 10))
+            }
         }
 
         scroll.addView(content)
@@ -6099,113 +6122,6 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
         updateWarrantyMediaText()
         if (supportMode == "list") refreshWarrantyStatuses(false)
-    }
-
-    private fun showAuthScreen() {
-        enterScreen("auth")
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
-        }
-        root.addView(header("Вход", showBack = true))
-        val scroll = ScrollView(this)
-        val content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), 0, dp(16), dp(18))
-        }
-        content.addView(TextView(this).apply {
-            text = "Вход в профиль"
-            textSize = 22f
-            typeface = interFont(750)
-            setTextColor(Color.rgb(16, 17, 20))
-        }, marginLp(-1, -2, 0, 4, 0, 14))
-        content.addView(TextView(this).apply {
-            text = "☎   Вход по номеру телефона\nУкажите номер. В тестовом режиме используйте код 1234."
-            textSize = 13f
-            setTextColor(Color.rgb(111, 119, 129))
-            setPadding(dp(16), dp(16), dp(16), dp(16))
-            background = round(Color.rgb(246, 247, 249), dp(18), Color.rgb(223, 229, 235), 1)
-        })
-        val phone = EditText(this).apply {
-            hint = "+7 (___) ___-__-__"
-            textSize = 15f
-            inputType = android.text.InputType.TYPE_CLASS_PHONE
-            setSingleLine(true)
-            setPadding(dp(14), 0, dp(14), 0)
-            background = round(Color.WHITE, dp(12), Color.rgb(223, 229, 235), 1)
-        }
-        content.addView(TextView(this).apply {
-            text = "Номер телефона"
-            textSize = 12f
-            typeface = interFont(700)
-            setTextColor(Color.rgb(16, 17, 20))
-        }, marginLp(-1, -2, 0, 16, 0, 6))
-        content.addView(phone, LinearLayout.LayoutParams(-1, dp(52)))
-
-        val codeBlock = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-        }
-        val code = EditText(this).apply {
-            hint = "••••"
-            textSize = 22f
-            letterSpacing = 0.28f
-            gravity = Gravity.CENTER
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER
-            filters = arrayOf(android.text.InputFilter.LengthFilter(4))
-            setSingleLine(true)
-            background = round(Color.WHITE, dp(12), Color.rgb(223, 229, 235), 1)
-        }
-        codeBlock.addView(TextView(this).apply {
-            text = "Код подтверждения · демо-код 1234"
-            textSize = 12f
-            typeface = interFont(700)
-            setTextColor(Color.rgb(111, 119, 129))
-        }, marginLp(-1, -2, 0, 14, 0, 6))
-        codeBlock.addView(code, LinearLayout.LayoutParams(-1, dp(52)))
-        codeBlock.addView(TextView(this).apply {
-            text = "ВВЕСТИ КОД"
-            textSize = 15f
-            typeface = interFont(780)
-            gravity = Gravity.CENTER
-            setTextColor(Color.rgb(16, 17, 20))
-            background = round(red, dp(14), Color.TRANSPARENT, 0)
-            setOnClickListener {
-                if (code.text.toString() != "1234") {
-                    toast("Неверный демо-код")
-                } else {
-                    getSharedPreferences("user_profile", MODE_PRIVATE).edit()
-                        .putBoolean("logged_in", true)
-                        .putString("phone", phone.text.toString())
-                        .apply()
-                    showProfileScreen()
-                }
-            }
-        }, marginLp(-1, dp(52), 0, 14, 0, 0))
-        content.addView(codeBlock)
-
-        content.addView(TextView(this).apply {
-            text = "ПОЛУЧИТЬ ЗВОНОК"
-            textSize = 15f
-            typeface = interFont(780)
-            gravity = Gravity.CENTER
-            setTextColor(Color.rgb(16, 17, 20))
-            background = round(red, dp(14), Color.TRANSPARENT, 0)
-            setOnClickListener {
-                if (phone.text.toString().filter(Char::isDigit).length < 10) {
-                    toast("Введите номер телефона")
-                } else {
-                    codeBlock.visibility = View.VISIBLE
-                    visibility = View.GONE
-                    code.requestFocus()
-                    toast("Демо-звонок отправлен. Код: 1234")
-                }
-            }
-        }, marginLp(-1, dp(52), 0, 16, 0, 0))
-
-        scroll.addView(content)
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        setContentView(root)
     }
 
     private fun adminServerBaseUrl(): String {
@@ -6478,49 +6394,28 @@ class MainActivity : ComponentActivity() {
                 setPadding(dp(8), dp(10), dp(8), dp(10))
                 background = round(if (selected) red else Color.WHITE, dp(14), red, dp(1))
                 setOnClickListener {
-                    supportMode = mode
-                    if (mode == "new") editingWarrantyLocalId = null
+                    // Повторный тап по уже выбранному режиму возвращает в базовое состояние.
+                    supportMode = if (supportMode == mode) "home" else mode
+                    if (supportMode == "new") {
+                        editingWarrantyLocalId = null
+                    }
+                    if (supportMode == "home") {
+                        editingWarrantyLocalId = null
+                        clearWarrantyFormState()
+                    }
                     showSupportScreen()
                 }
             }
         }
-        row.addView(seg("Ваши обращения", "list"), LinearLayout.LayoutParams(0, -2, 1f))
-        row.addView(seg("Новое обращение", "new"), marginLp(0, -2, 8, 0, 0, 0).apply { weight = 1f })
+        // Порядок: Новое обращение → Ваши обращения. В режиме home ни один не выбран.
+        row.addView(seg("Новое обращение", "new"), LinearLayout.LayoutParams(0, -2, 1f))
+        row.addView(seg("Ваши обращения", "list"), marginLp(0, -2, 8, 0, 0, 0).apply { weight = 1f })
         return row
     }
 
     private fun renderWarrantyList(content: LinearLayout) {
         val c = card()
         c.addView(sectionTitle("Ваши обращения", ""))
-
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(TextView(this).apply {
-            text = "＋ Новое обращение"
-            textSize = 15f
-            typeface = interFont(700)
-            setTextColor(Color.WHITE)
-            gravity = Gravity.CENTER
-            setPadding(dp(8), dp(11), dp(8), dp(11))
-            background = round(red, dp(12), Color.TRANSPARENT, 0)
-            setOnClickListener {
-                supportMode = "new"
-                editingWarrantyLocalId = null
-                clearWarrantyFormState()
-                showSupportScreen()
-            }
-        }, LinearLayout.LayoutParams(0, -2, 1f))
-        row.addView(TextView(this).apply {
-            text = "↻ Обновить статусы"
-            textSize = 15f
-            typeface = interFont(700)
-            setTextColor(red)
-            gravity = Gravity.CENTER
-            setPadding(dp(8), dp(11), dp(8), dp(11))
-            background = round(Color.WHITE, dp(12), red, dp(1))
-            setOnClickListener { refreshWarrantyStatuses(true) }
-        }, marginLp(0, -2, 8, 0, 0, 0).apply { weight = 1f })
-        c.addView(row, marginLp(-1, -2, 0, 0, 0, 12))
-
         warrantyListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         c.addView(warrantyListLayout)
         content.addView(c, marginLp(-1, -2, 0, 0, 0, 10))
@@ -6548,7 +6443,7 @@ class MainActivity : ComponentActivity() {
 
         if (items.isEmpty()) {
             layout.addView(TextView(this).apply {
-                text = "Обращений пока нет. Нажмите «Новое обращение», чтобы создать заявку по гарантии."
+                text = "Обращений пока нет. Выберите «Новое обращение», чтобы создать заявку."
                 textSize = 14f
                 setTextColor(Color.rgb(100,100,100))
                 setPadding(0, dp(8), 0, dp(8))
@@ -6710,17 +6605,6 @@ class MainActivity : ComponentActivity() {
         }
         formCard.addView(sendButton, marginLp(-1, -2, 0, 12, 0, 0))
 
-        formCard.addView(TextView(this).apply {
-            text = "ДИАГНОСТИКА"
-            textSize = 15f
-            typeface = interFont(760)
-            setTextColor(Color.rgb(16, 17, 20))
-            gravity = Gravity.CENTER
-            setPadding(dp(10), dp(12), dp(10), dp(12))
-            background = round(Color.WHITE, dp(14), red, 1)
-            setOnClickListener { showSupportDiagnostics() }
-        }, marginLp(-1, -2, 0, 10, 0, 0))
-
         warrantyStatusText = TextView(this).apply {
             text = existing?.let { "Текущий статус: ${warrantyStatusRu(it.optString("status"))}" } ?: ""
             textSize = 13f
@@ -6750,52 +6634,345 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(16), dp(12), dp(16), dp(20))
         }
 
-        val connected = bluetoothGatt != null
-        content.addView(
-            manageSectionCard(
-                "Состояние подключения",
-                listOf(
-                    "Статус" to if (connected) "Подключено" else "Нет подключения",
-                    "Устройство" to selectedDeviceName.ifBlank { selectedAddress ?: "—" },
-                    "Напряжение" to (data.voltage?.let { "%.2f В".format(it) } ?: "—"),
-                    "Ток" to (data.current?.let { "%.2f А".format(it) } ?: "—"),
-                    "SOC" to (data.soc?.let { "%.0f%%".format(it) } ?: "—"),
-                    "Ячеек" to (data.cellCount?.toString() ?: "—"),
-                    "Температура" to (data.maxTemp?.let { "$it °C" } ?: "—")
-                )
-            ),
-            marginLp(-1, -2, 0, 0, 0, 10)
-        )
-
-        content.addView(
-            manageSectionCard(
-                "Ошибки BMS",
-                listOf(
-                    "Состояние" to if (data.errors.isEmpty()) {
-                        "Нет ошибок"
-                    } else {
-                        data.errors.joinToString(", ")
-                    }
-                )
-            ),
-            marginLp(-1, -2, 0, 0, 0, 12)
-        )
-
-        content.addView(TextView(this).apply {
-            text = "Конфигурация BMS"
-            textSize = 17f
-            typeface = interFont(740)
-            setTextColor(Color.rgb(16, 17, 20))
-            setPadding(dp(2), 0, dp(2), dp(8))
-        })
-
-        // Тот же TemplateCheckResult / configParameterRow, что и на Главной.
-        appendConfigCheckContent(content, showWriteActions = false)
+        // Клиентская Диагностика: только результат проверки конфигурации (группированный UI).
+        // Механизм ConfigCheck / TemplateCheckResult не меняется.
+        appendDiagnosticsConfigPresentation(content)
 
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(fixedBottomNav("support"), LinearLayout.LayoutParams(-1, dp(70)))
         setContentView(root)
+    }
+
+    /**
+     * Общий presentation-слой диагностики конфигурации:
+     * Главная (тап «Батарея в норме») и Поддержка → Диагностика.
+     * Использует TemplateCheckResult; без версии шаблона, expected values и глобального banner.
+     */
+    private fun appendDiagnosticsConfigPresentation(content: LinearLayout) {
+        val result = currentTemplateCheck()
+        val checkedText = result?.checkedAt?.takeIf { it > 0 }?.let {
+            java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+                .format(java.util.Date(it))
+        }
+        if (checkedText != null) {
+            content.addView(TextView(this).apply {
+                text = "Проверено: $checkedText"
+                textSize = 13f
+                typeface = interFont(600)
+                setTextColor(Color.rgb(111, 119, 129))
+                setPadding(dp(2), 0, dp(2), dp(10))
+            })
+        }
+
+        when {
+            result?.status == "unavailable" ||
+                (serverTemplateFetchStatus == "error" && activeServerTemplate == null) -> {
+                content.addView(
+                    diagnosticsStatusCard(
+                        "⚠",
+                        "Проверка конфигурации недоступна",
+                        Color.rgb(224, 150, 0)
+                    ),
+                    marginLp(-1, -2, 0, 0, 0, 8)
+                )
+            }
+            result == null || result.status == "checking" || serverTemplateFetchStatus == "fetching" -> {
+                content.addView(
+                    diagnosticsStatusCard(
+                        "…",
+                        "Идёт инициализация BMS",
+                        Color.rgb(111, 119, 129)
+                    ),
+                    marginLp(-1, -2, 0, 0, 0, 8)
+                )
+            }
+            else -> {
+                val items = (if (result.items.isNotEmpty()) {
+                    result.items
+                } else {
+                    result.mismatches.map { it.copy(status = "mismatch") } +
+                        result.missing.map { it.copy(status = "missing") }
+                }).filter { it.status != "disabled" }
+
+                if (items.isEmpty()) {
+                    content.addView(
+                        diagnosticsStatusCard(
+                            "•",
+                            "Нет параметров для отображения",
+                            Color.rgb(111, 119, 129)
+                        ),
+                        marginLp(-1, -2, 0, 0, 0, 8)
+                    )
+                    return
+                }
+
+                val byKey = items.associateBy { it.key }
+                val used = mutableSetOf<String>()
+                val groups = diagnosticsParamGroups()
+
+                for (item in items) {
+                    if (item.key in used) continue
+                    val group = groups.firstOrNull { item.key in it.keys }
+                    if (group != null) {
+                        val children = group.keys.mapNotNull { byKey[it] }
+                        children.forEach { used.add(it.key) }
+                        val view = diagnosticsGroupedCard(group.title, children) ?: continue
+                        content.addView(view, marginLp(-1, -2, 0, 0, 0, 7))
+                    } else {
+                        used.add(item.key)
+                        content.addView(
+                            diagnosticsStandaloneCard(item),
+                            marginLp(-1, -2, 0, 0, 0, 7)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private data class DiagnosticsParamGroup(
+        val id: String,
+        val title: String,
+        val keys: Set<String>
+    )
+
+    private enum class DiagnosticsGroupStatus {
+        MATCH,
+        MISMATCH,
+        PARTIAL,
+        SKIPPED
+    }
+
+    /** UI-группы поверх отдельных TemplateCheckItem (backend keys не меняются). */
+    private fun diagnosticsParamGroups(): List<DiagnosticsParamGroup> {
+        return listOf(
+            DiagnosticsParamGroup(
+                id = "capacity_cal",
+                title = "Калибровка ёмкости",
+                keys = setOf("soc_calibration_0", "soc_calibration_100")
+            ),
+            DiagnosticsParamGroup(
+                id = "cells",
+                title = "Параметры ячеек",
+                keys = setOf(
+                    "cell_over_voltage",
+                    "cell_under_voltage",
+                    "pack_over_voltage",
+                    "pack_under_voltage"
+                )
+            ),
+            DiagnosticsParamGroup(
+                id = "temps",
+                title = "Температуры",
+                keys = setOf(
+                    "charge_high_temp",
+                    "charge_low_temp",
+                    "discharge_high_temp",
+                    "discharge_low_temp"
+                )
+            ),
+            DiagnosticsParamGroup(
+                id = "balance",
+                title = "Параметры балансировки",
+                keys = setOf("balance_start_voltage", "balance_stop_voltage")
+            )
+        )
+    }
+
+    private fun diagnosticsGroupStatus(children: List<TemplateCheckItem>): DiagnosticsGroupStatus {
+        val active = children.filter { it.status != "skipped" && it.status != "disabled" }
+        if (active.isEmpty()) return DiagnosticsGroupStatus.SKIPPED
+        if (active.any { it.status == "mismatch" }) return DiagnosticsGroupStatus.MISMATCH
+        if (active.any { it.status == "missing" }) return DiagnosticsGroupStatus.PARTIAL
+        if (active.all { it.status == "ok" }) return DiagnosticsGroupStatus.MATCH
+        return DiagnosticsGroupStatus.PARTIAL
+    }
+
+    private fun diagnosticsProblemItems(children: List<TemplateCheckItem>): List<TemplateCheckItem> {
+        return children.filter { it.status == "mismatch" || it.status == "missing" }
+    }
+
+    private fun diagnosticsFormatActual(item: TemplateCheckItem): String {
+        val value = item.actual ?: return "—"
+        val num = formatTemplateNumber(value)
+        val unit = item.unit.trim()
+        return if (unit.isBlank()) num else "$num $unit"
+    }
+
+    private fun diagnosticsStatusCard(mark: String, title: String, color: Int): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(13), dp(11), dp(13), dp(11))
+            background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 15f
+                typeface = interFont(700)
+                setTextColor(Color.rgb(16, 17, 20))
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(TextView(this@MainActivity).apply {
+                text = mark
+                textSize = 18f
+                typeface = interFont(780)
+                setTextColor(color)
+            })
+        }
+    }
+
+    private fun diagnosticsGroupedCard(
+        title: String,
+        children: List<TemplateCheckItem>
+    ): LinearLayout? {
+        val status = diagnosticsGroupStatus(children)
+        if (status == DiagnosticsGroupStatus.SKIPPED) return null
+
+        val (mark, markColor, subtitle) = when (status) {
+            DiagnosticsGroupStatus.MATCH ->
+                Triple("✓", Color.rgb(31, 179, 90), null as String?)
+            DiagnosticsGroupStatus.MISMATCH ->
+                Triple("✕", Color.rgb(211, 47, 47), "Не соответствует")
+            DiagnosticsGroupStatus.PARTIAL ->
+                Triple("⚠", Color.rgb(224, 150, 0), "Проверено не полностью")
+            DiagnosticsGroupStatus.SKIPPED ->
+                Triple("—", Color.rgb(111, 119, 129), null)
+        }
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), dp(10), dp(13), dp(10))
+            background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
+
+            val headerRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            headerRow.addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 15f
+                typeface = interFont(720)
+                setTextColor(Color.rgb(16, 17, 20))
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            headerRow.addView(TextView(this@MainActivity).apply {
+                text = mark
+                textSize = 18f
+                typeface = interFont(780)
+                setTextColor(markColor)
+            })
+            addView(headerRow)
+
+            if (subtitle != null) {
+                addView(TextView(this@MainActivity).apply {
+                    text = subtitle
+                    textSize = 13f
+                    typeface = interFont(600)
+                    setTextColor(markColor)
+                    setPadding(0, dp(4), 0, 0)
+                })
+            }
+
+            // Успешные child-параметры не разворачиваем — только проблемные.
+            if (status != DiagnosticsGroupStatus.MATCH) {
+                for (problem in diagnosticsProblemItems(children)) {
+                    addView(diagnosticsProblemChildBlock(problem), marginLp(-1, -2, 0, dp(8), 0, 0))
+                }
+            }
+        }
+    }
+
+    private fun diagnosticsStandaloneCard(item: TemplateCheckItem): LinearLayout {
+        val status = when (item.status) {
+            "ok" -> DiagnosticsGroupStatus.MATCH
+            "mismatch" -> DiagnosticsGroupStatus.MISMATCH
+            "missing" -> DiagnosticsGroupStatus.PARTIAL
+            "skipped" -> DiagnosticsGroupStatus.SKIPPED
+            else -> DiagnosticsGroupStatus.PARTIAL
+        }
+        val (mark, markColor, subtitle) = when (status) {
+            DiagnosticsGroupStatus.MATCH ->
+                Triple("✓", Color.rgb(31, 179, 90), null as String?)
+            DiagnosticsGroupStatus.MISMATCH ->
+                Triple("✕", Color.rgb(211, 47, 47), "Не соответствует")
+            DiagnosticsGroupStatus.PARTIAL ->
+                Triple("⚠", Color.rgb(224, 150, 0), "Проверено не полностью")
+            DiagnosticsGroupStatus.SKIPPED ->
+                Triple("—", Color.rgb(111, 119, 129), "Не поддерживается")
+        }
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), dp(10), dp(13), dp(10))
+            background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
+
+            val headerRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            headerRow.addView(TextView(this@MainActivity).apply {
+                text = item.label
+                textSize = 15f
+                typeface = interFont(720)
+                setTextColor(Color.rgb(16, 17, 20))
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            headerRow.addView(TextView(this@MainActivity).apply {
+                text = mark
+                textSize = 18f
+                typeface = interFont(780)
+                setTextColor(markColor)
+            })
+            addView(headerRow)
+
+            if (status == DiagnosticsGroupStatus.MISMATCH) {
+                addView(TextView(this@MainActivity).apply {
+                    text = diagnosticsFormatActual(item)
+                    textSize = 15f
+                    typeface = interFont(700)
+                    setTextColor(Color.rgb(16, 17, 20))
+                    setPadding(0, dp(4), 0, 0)
+                })
+            }
+            if (subtitle != null) {
+                addView(TextView(this@MainActivity).apply {
+                    text = subtitle
+                    textSize = 13f
+                    typeface = interFont(600)
+                    setTextColor(markColor)
+                    setPadding(0, dp(2), 0, 0)
+                })
+            }
+        }
+    }
+
+    private fun diagnosticsProblemChildBlock(item: TemplateCheckItem): LinearLayout {
+        val isMissing = item.status == "missing"
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(this@MainActivity).apply {
+                text = item.label
+                textSize = 14f
+                typeface = interFont(650)
+                setTextColor(Color.rgb(90, 96, 104))
+            })
+            if (!isMissing) {
+                addView(TextView(this@MainActivity).apply {
+                    text = diagnosticsFormatActual(item)
+                    textSize = 15f
+                    typeface = interFont(700)
+                    setTextColor(Color.rgb(16, 17, 20))
+                    setPadding(0, dp(2), 0, 0)
+                })
+            }
+            addView(TextView(this@MainActivity).apply {
+                text = if (isMissing) "Проверено не полностью" else "Не соответствует"
+                textSize = 13f
+                typeface = interFont(600)
+                setTextColor(
+                    if (isMissing) Color.rgb(224, 150, 0) else Color.rgb(211, 47, 47)
+                )
+                setPadding(0, dp(2), 0, 0)
+            })
+        }
     }
 
     private fun clearWarrantyFormState() {
@@ -7229,6 +7406,513 @@ class MainActivity : ComponentActivity() {
         return "warranty_${System.currentTimeMillis()}_${idx + 1}.$ext"
     }
 
+    private fun openChartsScreen() {
+        ensureChartsAnchorsInitialized()
+        chartsPeriodMode = "day"
+        chartsStatus = "loading"
+        chartsErrorText = ""
+        chartsPoints = emptyList()
+        chartsMinVoltage = null
+        chartsMaxVoltage = null
+        chartsMinCurrent = null
+        chartsMaxCurrent = null
+        chartsLoadedForUid = ""
+        showChartsScreen(reload = true)
+    }
+
+    private fun ensureChartsAnchorsInitialized() {
+        if (chartsAnchorDayStartMs > 0L) return
+        val today = startOfLocalDay(System.currentTimeMillis())
+        chartsAnchorDayStartMs = today
+        chartsCustomToDayStartMs = today
+        chartsCustomFromDayStartMs = today - 6L * 24L * 60L * 60L * 1000L
+    }
+
+    private fun startOfLocalDay(epochMs: Long): Long {
+        return Calendar.getInstance().apply {
+            timeInMillis = epochMs
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
+    }
+
+    private fun endOfLocalDay(dayStartMs: Long): Long {
+        return dayStartMs + 24L * 60L * 60L * 1000L - 1L
+    }
+
+    private fun maxChartsSelectableDayStart(): Long {
+        return startOfLocalDay(System.currentTimeMillis())
+    }
+
+    /**
+     * Назначение: границы выбранного периода графиков в локальной timezone.
+     * @return Pair(fromMs inclusive, toMs inclusive)
+     */
+    private fun chartsSelectedRange(): Pair<Long, Long> {
+        ensureChartsAnchorsInitialized()
+        return when (chartsPeriodMode) {
+            "week" -> {
+                val cal = Calendar.getInstance().apply { timeInMillis = chartsAnchorDayStartMs }
+                val dayOfWeek = cal.get(Calendar.DAY_OF_WEEK)
+                val offset = when (dayOfWeek) {
+                    Calendar.SUNDAY -> -6
+                    else -> Calendar.MONDAY - dayOfWeek
+                }
+                cal.add(Calendar.DAY_OF_MONTH, offset)
+                val from = startOfLocalDay(cal.timeInMillis)
+                from to endOfLocalDay(from + 6L * 24L * 60L * 60L * 1000L)
+            }
+            "month" -> {
+                val cal = Calendar.getInstance().apply { timeInMillis = chartsAnchorDayStartMs }
+                cal.set(Calendar.DAY_OF_MONTH, 1)
+                val from = startOfLocalDay(cal.timeInMillis)
+                cal.add(Calendar.MONTH, 1)
+                cal.add(Calendar.DAY_OF_MONTH, -1)
+                from to endOfLocalDay(startOfLocalDay(cal.timeInMillis))
+            }
+            "custom" -> {
+                val from = minOf(chartsCustomFromDayStartMs, chartsCustomToDayStartMs)
+                val toDay = maxOf(chartsCustomFromDayStartMs, chartsCustomToDayStartMs)
+                from to endOfLocalDay(toDay)
+            }
+            else -> chartsAnchorDayStartMs to endOfLocalDay(chartsAnchorDayStartMs)
+        }
+    }
+
+    private fun chartsPeriodLabel(): String {
+        val (from, to) = chartsSelectedRange()
+        val ru = Locale("ru")
+        return when (chartsPeriodMode) {
+            "day" -> SimpleDateFormat("d MMMM yyyy 'г.'", ru).format(Date(from))
+            "week" -> {
+                val a = SimpleDateFormat("dd.MM", ru).format(Date(from))
+                val b = SimpleDateFormat("dd.MM", ru).format(Date(to))
+                "$a — $b"
+            }
+            "month" -> SimpleDateFormat("LLLL yyyy", ru).format(Date(from))
+                .replaceFirstChar { if (it.isLowerCase()) it.titlecase(ru) else it.toString() }
+            else -> {
+                val a = SimpleDateFormat("dd.MM.yyyy", ru).format(Date(from))
+                val b = SimpleDateFormat("dd.MM.yyyy", ru).format(Date(to))
+                "$a — $b"
+            }
+        }
+    }
+
+    private fun shiftChartsPeriod(direction: Int) {
+        ensureChartsAnchorsInitialized()
+        val cal = Calendar.getInstance().apply { timeInMillis = chartsAnchorDayStartMs }
+        when (chartsPeriodMode) {
+            "week" -> cal.add(Calendar.WEEK_OF_YEAR, direction)
+            "month" -> cal.add(Calendar.MONTH, direction)
+            "custom" -> return
+            else -> cal.add(Calendar.DAY_OF_MONTH, direction)
+        }
+        var next = startOfLocalDay(cal.timeInMillis)
+        val maxDay = maxChartsSelectableDayStart()
+        if (next > maxDay) next = maxDay
+        // Не уводим якорь слишком далеко в прошлое без нужды — оставляем разумный горизонт ~2 года.
+        val minDay = maxDay - 800L * 24L * 60L * 60L * 1000L
+        if (next < minDay) next = minDay
+        chartsAnchorDayStartMs = next
+        showChartsScreen(reload = true)
+    }
+
+    private fun showChartsScreen(reload: Boolean) {
+        enterScreen("charts")
+        currentTab = "main"
+        ensureChartsAnchorsInitialized()
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+        root.addView(
+            header(
+                "Графики",
+                selectedDeviceName.ifBlank { bmsUid() },
+                showBack = true
+            )
+        )
+
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(10), dp(16), dp(18))
+        }
+
+        content.addView(chartsPeriodSelector(), marginLp(-1, -2, 0, 0, 0, 10))
+        content.addView(chartsDateNavigator(), marginLp(-1, -2, 0, 0, 0, 12))
+
+        when (chartsStatus) {
+            "loading" -> {
+                content.addView(TextView(this).apply {
+                    text = "Загрузка данных…"
+                    textSize = 15f
+                    typeface = interFont(650)
+                    setTextColor(Color.rgb(111, 119, 129))
+                    gravity = Gravity.CENTER
+                    setPadding(0, dp(40), 0, dp(40))
+                })
+            }
+            "error" -> {
+                content.addView(TextView(this).apply {
+                    text = chartsErrorText.ifBlank { "Не удалось загрузить данные графика" }
+                    textSize = 15f
+                    typeface = interFont(650)
+                    setTextColor(Color.rgb(180, 60, 60))
+                    gravity = Gravity.CENTER
+                    setPadding(0, dp(24), 0, dp(12))
+                })
+                content.addView(TextView(this).apply {
+                    text = "Повторить"
+                    textSize = 15f
+                    typeface = interFont(760)
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.rgb(16, 17, 20))
+                    setPadding(dp(12), dp(12), dp(12), dp(12))
+                    background = round(red, dp(14), Color.TRANSPARENT, 0)
+                    setOnClickListener { showChartsScreen(reload = true) }
+                }, marginLp(-1, -2, 0, 0, 0, 12))
+            }
+            "empty" -> {
+                content.addView(TextView(this).apply {
+                    text = "Нет данных за выбранный период"
+                    textSize = 15f
+                    typeface = interFont(650)
+                    setTextColor(Color.rgb(111, 119, 129))
+                    gravity = Gravity.CENTER
+                    setPadding(0, dp(40), 0, dp(40))
+                })
+            }
+            else -> {
+                val (from, to) = chartsSelectedRange()
+                content.addView(
+                    chartsMetricBlock(
+                        title = "Напряжение АКБ",
+                        minText = chartsMinVoltage?.let { "Мин: %.2f В".format(it) } ?: "Мин: —",
+                        maxText = chartsMaxVoltage?.let { "Макс: %.2f В".format(it) } ?: "Макс: —",
+                        color = Color.rgb(31, 179, 90),
+                        values = chartsPoints.mapNotNull { p ->
+                            val v = p.voltage ?: return@mapNotNull null
+                            TelemetryChartView.Point(p.timestamp, v)
+                        },
+                        fromMs = from,
+                        toMs = to,
+                        showZero = false,
+                        tooltipTarget = "voltage"
+                    ),
+                    marginLp(-1, -2, 0, 0, 0, 12)
+                )
+                content.addView(
+                    chartsMetricBlock(
+                        title = "Ток АКБ",
+                        minText = chartsMinCurrent?.let { "Мин: %+.1f А".format(it) } ?: "Мин: —",
+                        maxText = chartsMaxCurrent?.let { "Макс: %+.1f А".format(it) } ?: "Макс: —",
+                        color = Color.rgb(66, 133, 244),
+                        values = chartsPoints.mapNotNull { p ->
+                            val c = p.current ?: return@mapNotNull null
+                            TelemetryChartView.Point(p.timestamp, c)
+                        },
+                        fromMs = from,
+                        toMs = to,
+                        showZero = true,
+                        tooltipTarget = "current"
+                    ),
+                    marginLp(-1, -2, 0, 0, 0, 8)
+                )
+                content.addView(TextView(this).apply {
+                    // Семантика тока совпадает с currentDirectionLabel: <0 заряд, >0 разряд.
+                    text = "Ток: отрицательный — заряд, положительный — разряд"
+                    textSize = 12f
+                    setTextColor(Color.rgb(111, 119, 129))
+                    setPadding(dp(4), dp(4), dp(4), 0)
+                })
+            }
+        }
+
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(fixedBottomNav("main"), LinearLayout.LayoutParams(-1, dp(70)))
+        setContentView(root)
+
+        if (reload) loadChartsHistory()
+    }
+
+    private fun chartsPeriodSelector(): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        fun chip(title: String, mode: String): TextView {
+            val selected = chartsPeriodMode == mode
+            return TextView(this).apply {
+                text = title
+                gravity = Gravity.CENTER
+                textSize = 13f
+                typeface = interFont(if (selected) 760 else 650)
+                setTextColor(if (selected) Color.WHITE else Color.rgb(16, 17, 20))
+                setPadding(dp(8), dp(10), dp(8), dp(10))
+                background = round(
+                    if (selected) green else Color.WHITE,
+                    dp(12),
+                    if (selected) green else Color.rgb(223, 229, 235),
+                    1
+                )
+                setOnClickListener {
+                    if (mode == "custom") {
+                        pickChartsCustomPeriod()
+                    } else {
+                        chartsPeriodMode = mode
+                        showChartsScreen(reload = true)
+                    }
+                }
+            }
+        }
+        listOf(
+            "День" to "day",
+            "Неделя" to "week",
+            "Месяц" to "month",
+            "Период" to "custom"
+        ).forEachIndexed { index, (title, mode) ->
+            val lp = LinearLayout.LayoutParams(0, -2, 1f)
+            if (index > 0) lp.marginStart = dp(6)
+            row.addView(chip(title, mode), lp)
+        }
+        return row
+    }
+
+    private fun chartsDateNavigator(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+            background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
+
+            val canNavigate = chartsPeriodMode != "custom"
+            addView(TextView(this@MainActivity).apply {
+                text = "‹"
+                textSize = 28f
+                typeface = interFont(700)
+                setTextColor(if (canNavigate) Color.rgb(16, 17, 20) else Color.rgb(200, 200, 200))
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(4), dp(12), dp(4))
+                isEnabled = canNavigate
+                setOnClickListener { if (canNavigate) shiftChartsPeriod(-1) }
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = chartsPeriodLabel()
+                textSize = 15f
+                typeface = interFont(720)
+                setTextColor(Color.rgb(16, 17, 20))
+                gravity = Gravity.CENTER
+                maxLines = 2
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(TextView(this@MainActivity).apply {
+                text = "›"
+                textSize = 28f
+                typeface = interFont(700)
+                setTextColor(if (canNavigate) Color.rgb(16, 17, 20) else Color.rgb(200, 200, 200))
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(4), dp(12), dp(4))
+                isEnabled = canNavigate
+                setOnClickListener { if (canNavigate) shiftChartsPeriod(1) }
+            })
+        }
+    }
+
+    private fun pickChartsCustomPeriod() {
+        ensureChartsAnchorsInitialized()
+        val fromCal = Calendar.getInstance().apply { timeInMillis = chartsCustomFromDayStartMs }
+        android.app.DatePickerDialog(
+            this,
+            { _, y1, m1, d1 ->
+                val start = Calendar.getInstance().apply {
+                    set(y1, m1, d1, 0, 0, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }.timeInMillis
+                val toCal = Calendar.getInstance().apply { timeInMillis = chartsCustomToDayStartMs }
+                android.app.DatePickerDialog(
+                    this,
+                    { _, y2, m2, d2 ->
+                        var end = Calendar.getInstance().apply {
+                            set(y2, m2, d2, 0, 0, 0)
+                            set(Calendar.MILLISECOND, 0)
+                        }.timeInMillis
+                        val maxDay = maxChartsSelectableDayStart()
+                        if (end > maxDay) end = maxDay
+                        var from = start
+                        if (from > maxDay) from = maxDay
+                        if (from > end) {
+                            toast("Дата начала не может быть позже даты окончания")
+                            return@DatePickerDialog
+                        }
+                        chartsCustomFromDayStartMs = from
+                        chartsCustomToDayStartMs = end
+                        chartsPeriodMode = "custom"
+                        showChartsScreen(reload = true)
+                    },
+                    toCal.get(Calendar.YEAR),
+                    toCal.get(Calendar.MONTH),
+                    toCal.get(Calendar.DAY_OF_MONTH)
+                ).apply {
+                    datePicker.maxDate = maxChartsSelectableDayStart()
+                    setTitle("Дата окончания")
+                    show()
+                }
+            },
+            fromCal.get(Calendar.YEAR),
+            fromCal.get(Calendar.MONTH),
+            fromCal.get(Calendar.DAY_OF_MONTH)
+        ).apply {
+            datePicker.maxDate = maxChartsSelectableDayStart()
+            setTitle("Дата начала")
+            show()
+        }
+    }
+
+    private fun chartsMetricBlock(
+        title: String,
+        minText: String,
+        maxText: String,
+        color: Int,
+        values: List<TelemetryChartView.Point>,
+        fromMs: Long,
+        toMs: Long,
+        showZero: Boolean,
+        tooltipTarget: String
+    ): LinearLayout {
+        val card = card()
+        card.addView(TextView(this).apply {
+            text = title
+            textSize = 17f
+            typeface = interFont(740)
+            setTextColor(Color.rgb(16, 17, 20))
+        })
+        val meta = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(6), 0, dp(4))
+        }
+        meta.addView(TextView(this).apply {
+            text = minText
+            textSize = 13f
+            typeface = interFont(650)
+            setTextColor(Color.rgb(90, 96, 104))
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        meta.addView(TextView(this).apply {
+            text = maxText
+            textSize = 13f
+            typeface = interFont(650)
+            setTextColor(Color.rgb(90, 96, 104))
+            gravity = Gravity.END
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        card.addView(meta)
+
+        val tooltip = TextView(this).apply {
+            text = " "
+            textSize = 13f
+            typeface = interFont(700)
+            setTextColor(color)
+            setPadding(0, 0, 0, dp(4))
+            minHeight = dp(20)
+        }
+        if (tooltipTarget == "voltage") chartsVoltageTooltipText = tooltip
+        else chartsCurrentTooltipText = tooltip
+        card.addView(tooltip)
+
+        val chart = TelemetryChartView(this, showZeroLine = showZero)
+        chart.setData(values, fromMs, toMs, color)
+        chart.setTooltipListener { point ->
+            val tv = if (tooltipTarget == "voltage") chartsVoltageTooltipText else chartsCurrentTooltipText
+            if (point == null) {
+                tv?.text = " "
+                return@setTooltipListener
+            }
+            val valueText = if (tooltipTarget == "voltage") {
+                "%.2f В".format(point.value)
+            } else {
+                "%+.1f А".format(point.value)
+            }
+            val (rangeFrom, rangeTo) = chartsSelectedRange()
+            val span = rangeTo - rangeFrom
+            val timeText = if (span <= 26L * 60L * 60L * 1000L) {
+                SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(point.timestamp))
+            } else {
+                SimpleDateFormat("dd.MM HH:mm", Locale.getDefault()).format(Date(point.timestamp))
+            }
+            tv?.text = "$valueText\n$timeText"
+        }
+        card.addView(chart, LinearLayout.LayoutParams(-1, dp(220)))
+        return card
+    }
+
+    /**
+     * Загружает историю V/I с backend для текущей BMS и выбранного периода.
+     * Side effects: обновляет charts* state и перерисовывает экран при успехе/ошибке.
+     */
+    private fun loadChartsHistory() {
+        val uid = bmsUid()
+        if (uid.isBlank() || uid == "unknown_bms") {
+            chartsStatus = "error"
+            chartsErrorText = "Не удалось определить BMS для загрузки графика"
+            if (screenState == "charts") showChartsScreen(reload = false)
+            return
+        }
+        val (from, to) = chartsSelectedRange()
+        val token = ++chartsLoadToken
+        chartsStatus = "loading"
+        chartsPoints = emptyList()
+        chartsLoadedForUid = ""
+        if (screenState == "charts") showChartsScreen(reload = false)
+
+        thread {
+            val encoded = URLEncoder.encode(uid, "UTF-8")
+            val path = "/api/v1/batteries/$encoded/telemetry?from=$from&to=$to&max_points=720"
+            val json = adminJsonRequest(
+                method = "GET",
+                path = path,
+                body = null,
+                connectTimeoutMs = 10000,
+                readTimeoutMs = 25000
+            )
+            runOnUiThread {
+                if (token != chartsLoadToken || screenState != "charts") return@runOnUiThread
+                if (json == null || !json.optBoolean("ok", false)) {
+                    chartsStatus = "error"
+                    chartsErrorText = when (json?.optString("error")) {
+                        "unauthorized" -> "Не удалось загрузить данные графика: нет доступа к серверу"
+                        "battery_not_found" -> "АКБ ещё нет на сервере. Нужна хотя бы одна отправка телеметрии."
+                        "invalid_range" -> "Некорректный период"
+                        else -> "Не удалось загрузить данные графика"
+                    }
+                    showChartsScreen(reload = false)
+                    return@runOnUiThread
+                }
+                val arr = json.optJSONArray("points") ?: JSONArray()
+                val points = mutableListOf<TelemetryHistoryPoint>()
+                for (i in 0 until arr.length()) {
+                    val item = arr.optJSONObject(i) ?: continue
+                    val ts = item.optLong("timestamp", 0L)
+                    if (ts <= 0L) continue
+                    val voltage = if (item.isNull("voltage")) null else item.optDouble("voltage")
+                    val current = if (item.isNull("current")) null else item.optDouble("current")
+                    points.add(TelemetryHistoryPoint(ts, voltage, current))
+                }
+                points.sortBy { it.timestamp }
+                chartsPoints = points
+                chartsMinVoltage = json.optDouble("min_voltage").takeIf { json.has("min_voltage") && !json.isNull("min_voltage") }
+                chartsMaxVoltage = json.optDouble("max_voltage").takeIf { json.has("max_voltage") && !json.isNull("max_voltage") }
+                chartsMinCurrent = json.optDouble("min_current").takeIf { json.has("min_current") && !json.isNull("min_current") }
+                chartsMaxCurrent = json.optDouble("max_current").takeIf { json.has("max_current") && !json.isNull("max_current") }
+                chartsLoadedForUid = uid
+                chartsStatus = if (points.isEmpty()) "empty" else "ok"
+                chartsErrorText = ""
+                showChartsScreen(reload = false)
+            }
+        }
+    }
+
     private fun showJournalScreen() {
         enterScreen("journal")
         currentTab = "journal"
@@ -7259,9 +7943,10 @@ class MainActivity : ComponentActivity() {
             setPadding(0, dp(4), 0, dp(14))
         }, LinearLayout.LayoutParams(-1, -2))
 
-        if (localEvents.isEmpty()) {
+        val journalEvents = journalDisplayEvents()
+        if (journalEvents.isEmpty()) {
             val empty = TextView(this).apply {
-                text = "Событий BMS пока нет"
+                text = "Ошибок BMS нет"
                 textSize = 17f
                 setTextColor(Color.rgb(100,100,100))
                 gravity = Gravity.CENTER
@@ -7270,11 +7955,9 @@ class MainActivity : ComponentActivity() {
             }
             content.addView(empty, LinearLayout.LayoutParams(-1, -2))
         } else {
-            val events = localEvents.takeLast(100).asReversed()
-            val details = localEventDetails.takeLast(100).asReversed()
-            for ((idx, e) in events.withIndex()) {
+            for ((idx, item) in journalEvents.withIndex()) {
                 content.addView(
-                    journalRow(idx + 1, e, details.getOrNull(idx) ?: e),
+                    journalRow(idx + 1, item.first, item.second),
                     marginLp(-1, -2, 0, 0, 0, 8)
                 )
             }
@@ -8330,27 +9013,24 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        fun applyMos(valueView: TextView, dot: View?, on: Boolean?) {
-            when (on) {
-                true -> {
-                    valueView.text = "ВКЛ"
-                    valueView.setTextColor(Color.rgb(31, 179, 90))
-                    applyStatusDot(dot, true)
+        fun applyMos(on: Boolean?, sw: Switch?) {
+            if (sw == null) return
+            suppressMosSwitchCallback = true
+            try {
+                if (on != null) {
+                    sw.isChecked = on
+                    sw.visibility = View.VISIBLE
                 }
-                false -> {
-                    valueView.text = "ВЫКЛ"
-                    valueView.setTextColor(Color.rgb(111, 119, 129))
-                    applyStatusDot(dot, null)
-                }
-                null -> {
-                    valueView.text = "—"
-                    valueView.setTextColor(Color.rgb(111, 119, 129))
-                    applyStatusDot(dot, null)
-                }
+                // Только отображение: пользователь не переключает MOS.
+                sw.isClickable = false
+                sw.isFocusable = false
+                sw.isEnabled = false
+            } finally {
+                suppressMosSwitchCallback = false
             }
         }
-        if (::chargeMosValue.isInitialized) applyMos(chargeMosValue, chargeMosDot, data.chargeMos)
-        if (::dischargeMosValue.isInitialized) applyMos(dischargeMosValue, dischargeMosDot, data.dischargeMos)
+        applyMos(data.chargeMos, chargeMosSwitch)
+        applyMos(data.dischargeMos, dischargeMosSwitch)
 
         if (hasTemperatureSensorError()) {
             t1Text.text = "Нет датчика"
@@ -8369,10 +9049,16 @@ class MainActivity : ComponentActivity() {
             if (data.errors.isNotEmpty()) {
                 balanceValue.text = "Ошибка"
                 balanceValue.setTextColor(Color.rgb(239, 83, 80))
+                balanceIconHost?.let {
+                    fillMetricIconBlock(it, glyph = "⚠", glyphColor = Color.rgb(239, 83, 80))
+                }
                 applyStatusDot(balanceDot, false)
             } else {
                 balanceValue.text = "Норма"
                 balanceValue.setTextColor(Color.rgb(31, 179, 90))
+                balanceIconHost?.let {
+                    fillMetricIconBlock(it, glyph = "✓", glyphColor = Color.rgb(31, 179, 90))
+                }
                 applyStatusDot(balanceDot, true)
             }
         }
@@ -8389,7 +9075,7 @@ class MainActivity : ComponentActivity() {
                     applyStatusDot(stateDot, null, warn = true)
                 }
                 polling || bluetoothGatt != null -> {
-                    state.text = "Работает"
+                    state.text = "Активна"
                     state.setTextColor(Color.rgb(31, 179, 90))
                     applyStatusDot(stateDot, true)
                 }
@@ -8452,9 +9138,9 @@ class MainActivity : ComponentActivity() {
                 }
                 check?.status == "checking" || serverTemplateFetchStatus == "fetching" -> {
                     banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
-                    title?.text = "…  Проверка конфигурации"
+                    title?.text = "…  Идёт инициализация BMS"
                     title?.setTextColor(Color.rgb(111, 119, 129))
-                    sub?.text = "Сверяем параметры BMS с серверным шаблоном"
+                    sub?.text = ""
                     sub?.setTextColor(Color.rgb(111, 119, 129))
                 }
                 check?.status == "mismatch" -> {
@@ -8485,9 +9171,9 @@ class MainActivity : ComponentActivity() {
                 }
                 else -> {
                     banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
-                    title?.text = "✓  Батарея в норме"
-                    title?.setTextColor(Color.rgb(31, 179, 90))
-                    sub?.text = "Ожидается проверка конфигурации"
+                    title?.text = "…  Идёт инициализация BMS"
+                    title?.setTextColor(Color.rgb(111, 119, 129))
+                    sub?.text = ""
                     sub?.setTextColor(Color.rgb(111, 119, 129))
                 }
             }
@@ -9028,6 +9714,7 @@ class MainActivity : ComponentActivity() {
             "Получено RAW"
         )
         if (serviceWords.any { text.contains(it, ignoreCase = true) }) return
+        if (isRoutineMosJournalLine(text) || isRoutineMosJournalLine(" — $text")) return
 
         val line = "${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())} — $text"
         localEvents.add(line)
@@ -9036,6 +9723,34 @@ class MainActivity : ComponentActivity() {
             localEvents.removeAt(0)
             if (localEventDetails.isNotEmpty()) localEventDetails.removeAt(0)
         }
+    }
+
+    /**
+     * Routine MOS ON/OFF из 0x93 — текущее состояние BMS, не ошибка журнала.
+     * Реальные fault/protection по 0x98 (в т.ч. залипание/обрыв MOS) сюда не попадают.
+     */
+    private fun isRoutineMosJournalLine(line: String): Boolean {
+        val eventText = line.substringAfter(" — ", line)
+        val patterns = listOf(
+            Regex("""^MOS зарядки:\s*(ON|OFF)$""", RegexOption.IGNORE_CASE),
+            Regex("""^MOS разрядки:\s*(ON|OFF)$""", RegexOption.IGNORE_CASE),
+            Regex("""^MOS зарядки\s+(ВКЛ|ВЫКЛ)$""", RegexOption.IGNORE_CASE),
+            Regex("""^MOS разрядки\s+(ВКЛ|ВЫКЛ)$""", RegexOption.IGNORE_CASE)
+        )
+        return patterns.any { it.containsMatchIn(eventText.trim()) }
+    }
+
+    /** События журнала для UI: без routine MOS ON/OFF, новые сверху. */
+    private fun journalDisplayEvents(): List<Pair<String, String>> {
+        val events = localEvents.takeLast(100)
+        val details = localEventDetails.takeLast(100)
+        val result = mutableListOf<Pair<String, String>>()
+        for (i in events.indices.reversed()) {
+            val line = events[i]
+            if (isRoutineMosJournalLine(line)) continue
+            result.add(line to (details.getOrNull(i) ?: line))
+        }
+        return result
     }
 
     private fun dalyErrorDescription(globalBit: Int): String {
@@ -9156,19 +9871,12 @@ class MainActivity : ComponentActivity() {
 
         val chg = data.chargeMos
         if (chg != null && chg != lastChargeMos) {
-            addLocalEvent(
-                "MOS зарядки: ${if (chg) "ON" else "OFF"}",
-                "Состояние MOS зарядки изменилось.\nТекущее состояние: ${if (chg) "ON / включен" else "OFF / отключен"}\n\nRAW 0x93: ${data.raw["0x93"] ?: "нет"}"
-            )
+            // Routine MOS ON/OFF — текущее состояние, не событие журнала ошибок.
             lastChargeMos = chg
         }
 
         val dsg = data.dischargeMos
         if (dsg != null && dsg != lastDischargeMos) {
-            addLocalEvent(
-                "MOS разрядки: ${if (dsg) "ON" else "OFF"}",
-                "Состояние MOS разрядки изменилось.\nТекущее состояние: ${if (dsg) "ON / включен" else "OFF / отключен"}\n\nRAW 0x93: ${data.raw["0x93"] ?: "нет"}"
-            )
             lastDischargeMos = dsg
         }
 
@@ -9262,21 +9970,40 @@ class MainActivity : ComponentActivity() {
         if (!force && now - lastUploadAt < UPLOAD_INTERVAL_MS) return
 
         uploading = true
-        lastUploadStatus = "Отправка..."
+        lastUploadStatus = "Сохранение…"
         refreshUploadStatusUi()
+        lastUploadAt = now
 
         thread {
-            val result = postCurrentTelemetry()
+            val payload = buildUploadJson()
+            var ok = false
+            var message: String
+            try {
+                // 1) LOCAL SAVE (независимо от сети и BLE после этого момента)
+                ru.liferych.bms.telemetry.TelemetryLocalRepository.enqueue(this, payload)
+                // 2) Попытка sync (не требует BLE)
+                val done = ru.liferych.bms.telemetry.TelemetryLocalRepository.syncOnce(this)
+                val pending = ru.liferych.bms.telemetry.TelemetryLocalRepository.pendingCount(this)
+                ru.liferych.bms.telemetry.TelemetrySyncScheduler.enqueueImmediate(this)
+                ok = true
+                message = when {
+                    pending > 0 && done == 0 -> "Локально сохранено, ожидает отправки: $pending"
+                    pending > 0 -> "Синхронизировано +$done, ожидает: $pending"
+                    else -> "Синхронизировано"
+                }
+            } catch (e: Exception) {
+                message = "Ошибка локального сохранения: ${e.message ?: "unknown"}"
+                Log.w(BLE_LOG_TAG, message)
+            }
             uploading = false
-            lastUploadStatus = result.message
+            lastUploadStatus = message
             runOnUiThread {
                 refreshUploadStatusUi()
-                // Успех — тихо (только Logcat); ошибку пользователю показываем.
-                if (!result.ok && (force || isServiceApp())) {
+                if (!ok && (force || isServiceApp())) {
                     toast(lastUploadStatus)
                 }
-                if (result.ok) {
-                    Log.i(BLE_LOG_TAG, "telemetry upload OK: $lastUploadStatus")
+                if (ok) {
+                    Log.i(BLE_LOG_TAG, "telemetry local+sync: $lastUploadStatus")
                 }
                 if (screenState == "journal") showJournalScreen()
             }
@@ -9841,12 +10568,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun adminJsonRequest(method: String, path: String, body: JSONObject? = null): JSONObject? {
+    private fun adminJsonRequest(
+        method: String,
+        path: String,
+        body: JSONObject? = null,
+        connectTimeoutMs: Int = 8000,
+        readTimeoutMs: Int = 8000
+    ): JSONObject? {
         return try {
             val conn = (URL(adminServerUrl(path)).openConnection() as HttpURLConnection).apply {
                 requestMethod = method
-                connectTimeout = 8000
-                readTimeout = 8000
+                connectTimeout = connectTimeoutMs
+                readTimeout = readTimeoutMs
                 setRequestProperty("Accept", "application/json")
                 applyBmsApiAuth(this)
                 if (body != null) {
@@ -10569,10 +11302,14 @@ class MainActivity : ComponentActivity() {
 
     private fun buildUploadJson(): JSONObject {
         val obj = JSONObject()
+        val recordedAt = System.currentTimeMillis()
+        val eventId = java.util.UUID.randomUUID().toString()
         obj.put("api_key", BmsApiConfig.API_KEY)
         obj.put("bms_uid", bmsUid())
         obj.put("bluetooth_name", dalyBluetoothDeviceId())
         obj.put("bluetooth_address", selectedAddress ?: "")
+        obj.put("event_id", eventId)
+        obj.put("recorded_at", recordedAt)
         putHardwareIdentity(obj)
         putNullable(obj, "voltage", data.voltage)
         putNullable(obj, "current", data.current)
@@ -10862,7 +11599,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        ru.liferych.bms.telemetry.TelemetrySyncScheduler.enqueueImmediate(this)
+        ru.liferych.bms.telemetry.TelemetryLocalRepository.syncAsync(this)
+    }
+
     override fun onDestroy() {
+        ru.liferych.bms.telemetry.TelemetrySyncScheduler.enqueueImmediate(this)
+        ru.liferych.bms.telemetry.TelemetryLocalRepository.syncAsync(this)
         stopQrCamera()
         barcodeScanner.close()
         cameraExecutor.shutdown()
