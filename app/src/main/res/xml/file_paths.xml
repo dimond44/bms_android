@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
     <cache-path name="warranty_photos" path="warranty_photos/" />
+    <files-path name="profile_avatars" path="profile_avatars/" />
 </paths>

@@ -33,6 +33,8 @@ import android.view.View
 import android.widget.*
 import android.util.TypedValue
 import androidx.activity.ComponentActivity
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.DrawableRes
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -83,6 +85,10 @@ private const val CONFIG_UPLOAD_PATH = "/api/config_upload.php"
 private const val SERVICE_REPORT_PATH = "/api/v1/service-report"
 private const val WARRANTY_SUBMIT_PATH = "/api/warranty_submit.php"
 private const val WARRANTY_LIST_PATH = "/api/warranty_list.php"
+private const val USER_LOGIN_PATH = "/api/v1/users/login"
+private const val USER_REGISTER_PATH = "/api/v1/users/register"
+private const val USER_PROFILE_PATH = "/api/v1/users/profile"
+private const val USER_LINK_BATTERY_PATH = "/api/v1/users/batteries/link"
 private val APP_VERSION = BuildConfig.VERSION_NAME
 private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
@@ -493,8 +499,17 @@ class MainActivity : ComponentActivity() {
     private val WARRANTY_MEDIA_REQUEST_CODE = 4501
     private val WARRANTY_CAMERA_REQUEST_CODE = 4503
     private val PROFILE_AVATAR_REQUEST_CODE = 4502
+    private val PROFILE_CAMERA_PERMISSION_REQUEST_CODE = 1004
     private val CAMERA_PERMISSION_REQUEST_CODE = 1002
     private val WARRANTY_CAMERA_PERMISSION_REQUEST_CODE = 1003
+    /** Временный URI для камеры аватара. */
+    private var profilePendingCameraUri: Uri? = null
+    private var loginLoading: Boolean = false
+    private var loginStatusText: TextView? = null
+    /** Отмена устаревших ответов login при logout / повторном входе. */
+    private var loginGeneration: Int = 0
+    /** Национальная часть номера, переносимая Login → Register. */
+    private var authPendingNationalPhone: String = ""
     private val WARRANTY_PAGE_SIZE = 5
     private val warrantyMediaUris: MutableList<Uri> = mutableListOf()
     /** Временный URI для системной камеры (ACTION_IMAGE_CAPTURE). */
@@ -719,6 +734,29 @@ class MainActivity : ComponentActivity() {
     private var qtcDbError: String = ""
     private var qtcDbJobToken: Int = 0
 
+    private val profileGalleryLauncher =
+        registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+            if (uri != null) persistProfileAvatarFromUri(uri)
+        }
+
+    private val profileCameraLauncher =
+        registerForActivityResult(ActivityResultContracts.TakePicture()) { success ->
+            val uri = profilePendingCameraUri
+            profilePendingCameraUri = null
+            if (success && uri != null) {
+                persistProfileAvatarFromUri(uri)
+            }
+        }
+
+    private val profileCameraPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                launchProfileCamera()
+            } else {
+                toast("Для съёмки фото необходимо разрешение на камеру")
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         Thread.setDefaultUncaughtExceptionHandler { _, e ->
             try {
@@ -743,7 +781,14 @@ class MainActivity : ComponentActivity() {
         val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = manager.adapter
         requestBlePermissions()
-        showSplashScreen()
+        if (isServiceApp()) {
+            showSplashScreen()
+        } else if (isUserSessionActive()) {
+            // Уже вошли: сразу список АКБ текущего пользователя.
+            showBatteriesScreen(asRootHome = true)
+        } else {
+            showLoginScreen()
+        }
         val debugAddress = intent.getStringExtra("debug_connect_address")
         val isDebuggable =
             (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
@@ -1355,6 +1400,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showBatteriesScreen(asRootHome: Boolean = false) {
+        if (!isServiceApp() && !isUserSessionActive()) {
+            showLoginScreen()
+            return
+        }
         if (asRootHome) clearUiBackStack()
         enterScreen("batteries", track = !asRootHome)
         currentTab = "main"
@@ -2071,39 +2120,78 @@ class MainActivity : ComponentActivity() {
         return userProfilePrefs().getString("phone", "")?.trim().orEmpty()
     }
 
-    private fun profilePhoneDigits(phone: String = profilePhoneStored()): String {
+    /**
+     * Извлекает национальные 10 цифр RU-номера (без кода страны).
+     * Не подставляет «7» в пустое поле.
+     */
+    private fun extractRuNationalDigits(phone: String): String {
         var digits = phone.filter { it.isDigit() }
         if (digits.startsWith("8") && digits.length == 11) {
-            digits = "7" + digits.drop(1)
-        } else if (digits.length == 10 && !digits.startsWith("7")) {
-            digits = "7$digits"
+            digits = digits.drop(1)
+        } else if (digits.startsWith("7") && digits.length == 11) {
+            digits = digits.drop(1)
+        } else if (digits.startsWith("7") && digits.length > 10) {
+            digits = digits.drop(1)
         }
-        return digits
+        return digits.take(10)
+    }
+
+    private fun profilePhoneDigits(phone: String = profilePhoneStored()): String {
+        val national = extractRuNationalDigits(phone)
+        return if (national.length == 10) "7$national" else ""
+    }
+
+    /** E.164 для RU: +7XXXXXXXXXX. */
+    private fun normalizePhoneE164(phone: String = profilePhoneStored()): String {
+        val digits = profilePhoneDigits(phone)
+        return if (digits.length == 11 && digits.startsWith("7")) "+$digits" else ""
     }
 
     private fun isValidRuPhone(phone: String): Boolean {
-        val digits = profilePhoneDigits(phone)
-        return digits.length == 11 && digits.startsWith("7")
+        return normalizePhoneE164(phone).isNotBlank()
+    }
+
+    /** Активная локальная сессия пользователя (не путать с удалением данных на сервере). */
+    private fun isUserSessionActive(): Boolean {
+        if (isServiceApp()) return true
+        return userProfilePrefs().getBoolean("logged_in", false) &&
+            isValidRuPhone(profilePhoneStored()) &&
+            profileFullName().isNotBlank()
     }
 
     /** Единая проверка заполненности профиля пользователя (ФИО + телефон). */
     private fun isProfileComplete(): Boolean {
         if (isServiceApp()) return true
-        return profileFullName().isNotBlank() && isValidRuPhone(profilePhoneStored())
+        return isUserSessionActive()
     }
 
-    private fun formatRuPhoneMask(input: String): String {
-        var digits = input.filter { it.isDigit() }
-        when {
-            digits.isEmpty() -> return "+7"
-            digits.startsWith("8") -> digits = "7" + digits.drop(1)
-            !digits.startsWith("7") -> digits = "7$digits"
+    /**
+     * Форматирует только национальную часть: 999 123-45-67.
+     * Пустая строка остаётся пустой — без автоподстановки «+7» / «7».
+     */
+    private fun formatRuNationalMask(input: String): String {
+        val n = extractRuNationalDigits(input)
+        if (n.isEmpty()) return ""
+        return buildString {
+            append(n.take(3))
+            if (n.length <= 3) return@buildString
+            append(" ")
+            append(n.drop(3).take(3))
+            if (n.length <= 6) return@buildString
+            append("-")
+            append(n.drop(6).take(2))
+            if (n.length <= 8) return@buildString
+            append("-")
+            append(n.drop(8).take(2))
         }
-        digits = digits.take(11)
-        val n = digits.drop(1)
+    }
+
+    /** Полный отображаемый номер для профиля/гарантии: +7 (999) 123-45-67. */
+    private fun formatRuPhoneMask(input: String): String {
+        val n = extractRuNationalDigits(input)
+        if (n.isEmpty()) return ""
         return buildString {
             append("+7")
-            if (n.isEmpty()) return@buildString
             append(" (")
             append(n.take(3))
             if (n.length < 3) return@buildString
@@ -2116,6 +2204,24 @@ class MainActivity : ComponentActivity() {
             append("-")
             append(n.drop(8).take(2))
         }
+    }
+
+    private fun attachRuNationalPhoneMask(edit: EditText) {
+        edit.inputType = android.text.InputType.TYPE_CLASS_PHONE
+        var selfChange = false
+        edit.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) {
+                if (selfChange) return
+                val formatted = formatRuNationalMask(s?.toString().orEmpty())
+                if (formatted == s?.toString()) return
+                selfChange = true
+                edit.setText(formatted)
+                edit.setSelection(formatted.length.coerceAtMost(edit.text?.length ?: 0))
+                selfChange = false
+            }
+        })
     }
 
     private fun attachRuPhoneMask(edit: EditText) {
@@ -2136,12 +2242,40 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    /** Строка «+7 | номер» без editable кода страны. */
+    private fun buildRuPhoneInputRow(initialPhone: String = ""): Pair<LinearLayout, EditText> {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        row.addView(TextView(this).apply {
+            text = "+7"
+            gravity = Gravity.CENTER
+            textSize = 15f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(Color.rgb(236, 238, 241), dp(12), Color.rgb(223, 229, 235), 1)
+            setPadding(dp(12), 0, dp(12), 0)
+        }, LinearLayout.LayoutParams(dp(56), dp(52)).apply { rightMargin = dp(8) })
+        val national = EditText(this).apply {
+            setText(formatRuNationalMask(initialPhone))
+            hint = "999 123-45-67"
+            textSize = 15f
+            setSingleLine(true)
+            setPadding(dp(12), 0, dp(12), 0)
+            background = round(Color.rgb(246, 247, 249), dp(12), Color.rgb(223, 229, 235), 1)
+        }
+        attachRuNationalPhoneMask(national)
+        row.addView(national, LinearLayout.LayoutParams(0, dp(52), 1f))
+        return row to national
+    }
+
     private fun beginAddBatteryFlow() {
         if (!isProfileComplete()) {
             AlertDialog.Builder(this)
-                .setTitle("Сначала заполните профиль")
-                .setMessage("Для добавления АКБ необходимо указать ФИО и номер телефона.")
-                .setPositiveButton("Перейти в профиль") { _, _ -> showProfileScreen() }
+                .setTitle("Сначала войдите в профиль")
+                .setMessage("Для добавления АКБ необходимо войти по номеру телефона.")
+                .setPositiveButton("Войти") { _, _ -> showLoginScreen() }
                 .setNegativeButton("Отмена", null)
                 .show()
             return
@@ -2266,6 +2400,7 @@ class MainActivity : ComponentActivity() {
         )
         if (index >= 0) current[index] = updated else current += updated
         saveBatteries(current)
+        if (!isServiceApp()) linkCurrentBatteryToUserAsync()
     }
 
     private fun showSearchScreen() {
@@ -3063,7 +3198,7 @@ class MainActivity : ComponentActivity() {
 
     private fun isTrackableScreen(state: String): Boolean {
         return state in setOf(
-            "batteries", "dashboard", "journal", "support", "profile",
+            "batteries", "dashboard", "journal", "support", "profile", "login", "register",
             "manage", "service", "qtc", "auth", "search"
         )
     }
@@ -3141,6 +3276,8 @@ class MainActivity : ComponentActivity() {
             }
             "support" -> showSupportScreen()
             "profile" -> showProfileScreen()
+            "login" -> showLoginScreen()
+            "register" -> showRegisterScreen()
             "manage" -> showManageScreen()
             "config_check" -> showConfigCheckScreen()
             "support_diagnostics" -> showSupportDiagnostics()
@@ -3156,6 +3293,14 @@ class MainActivity : ComponentActivity() {
     /** Возврат по UI-стеку. true — обработано; false — на корне, можно выйти из приложения. */
     private fun navigateBackUi(): Boolean {
         when (screenState) {
+            "login" -> {
+                // Экран входа — корень после logout; Back не возвращает в профиль.
+                return false
+            }
+            "register" -> {
+                showLoginScreen()
+                return true
+            }
             "qr_scan" -> {
                 stopQrCamera()
                 showQrInputScreen()
@@ -3317,6 +3462,10 @@ class MainActivity : ComponentActivity() {
             typeface = interFont(if (selected) 700 else 650)
             setOnClickListener {
                 if (text.contains("Главная")) {
+                    if (!isServiceApp() && !isUserSessionActive()) {
+                        showLoginScreen()
+                        return@setOnClickListener
+                    }
                     val onWorkingHome = screenState == "dashboard" && currentSavedBatteryOrNull() != null
                     val onListHome = screenState == "batteries" && currentSavedBatteryOrNull() == null
                     if (onWorkingHome || onListHome) return@setOnClickListener
@@ -3353,6 +3502,10 @@ class MainActivity : ComponentActivity() {
                     clearWarrantyFormState()
                     showSupportScreen()
                 } else if (text.contains("Профиль")) {
+                    if (!isServiceApp() && !isUserSessionActive()) {
+                        showLoginScreen()
+                        return@setOnClickListener
+                    }
                     if (screenState == "profile") return@setOnClickListener
                     showProfileScreen()
                 }
@@ -6549,9 +6702,627 @@ class MainActivity : ComponentActivity() {
         return value.trimEnd('/')
     }
 
+
+
+    /**
+     * Экран входа: только поиск пользователя по телефону.
+     * Не создаёт профиль — для этого showRegisterScreen.
+     */
+    private fun showLoginScreen(prefillPhone: String = authPendingNationalPhone) {
+        if (isServiceApp()) {
+            showSplashScreen()
+            return
+        }
+        clearUiBackStack()
+        enterScreen("login", track = false)
+        currentTab = "profile"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+        root.addView(header("Вход", showBack = false, showBrand = true))
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(18), dp(16), dp(18))
+        }
+        content.addView(TextView(this).apply {
+            text = "Вход"
+            textSize = 22f
+            typeface = interFont(750)
+            setTextColor(Color.rgb(16, 17, 20))
+        }, marginLp(-1, -2, 0, 4, 0, 8))
+        content.addView(TextView(this).apply {
+            text = "Введите номер телефона. Если профиль ещё не создан — зарегистрируйтесь."
+            textSize = 13f
+            setTextColor(Color.rgb(90, 90, 90))
+            setPadding(0, 0, 0, dp(12))
+        })
+
+        val card = card()
+        card.addView(TextView(this).apply {
+            text = "Номер телефона *"
+            textSize = 12f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(0, 0, 0, dp(5))
+        })
+        val initial = prefillPhone.ifBlank { profilePhoneStored() }
+        val (phoneRow, phoneNational) = buildRuPhoneInputRow(initial)
+        card.addView(phoneRow, LinearLayout.LayoutParams(-1, -2))
+        content.addView(card)
+
+        loginStatusText = TextView(this).apply {
+            text = ""
+            textSize = 13f
+            setTextColor(Color.rgb(90, 90, 90))
+            setPadding(0, dp(10), 0, 0)
+        }
+        content.addView(loginStatusText)
+
+        content.addView(TextView(this).apply {
+            text = "ВОЙТИ"
+            gravity = Gravity.CENTER
+            textSize = 15f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(red, dp(14), Color.TRANSPARENT, 0)
+            setOnClickListener {
+                val national = extractRuNationalDigits(phoneNational.text.toString())
+                authPendingNationalPhone = national
+                if (national.length != 10) {
+                    toast("Укажите 10 цифр номера")
+                    return@setOnClickListener
+                }
+                val e164 = normalizePhoneE164(national)
+                if (e164.isBlank()) {
+                    toast("Укажите полный номер телефона")
+                    return@setOnClickListener
+                }
+                performUserLogin(e164)
+            }
+        }, marginLp(-1, dp(54), 0, 14, 0, 0))
+
+        content.addView(TextView(this).apply {
+            text = "Зарегистрироваться"
+            gravity = Gravity.CENTER
+            textSize = 14f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(16, 17, 20))
+            setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener {
+                authPendingNationalPhone = extractRuNationalDigits(phoneNational.text.toString())
+                showRegisterScreen()
+            }
+        }, marginLp(-1, -2, 0, 8, 0, 0))
+
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        setContentView(root)
+    }
+
+    /**
+     * Экран регистрации: создаёт пользователя на backend (phone UNIQUE).
+     */
+    private fun showRegisterScreen(prefillPhone: String = authPendingNationalPhone) {
+        if (isServiceApp()) {
+            showSplashScreen()
+            return
+        }
+        enterScreen("register", track = false)
+        currentTab = "profile"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+        root.addView(header("Регистрация", showBack = true, showBrand = true))
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(18), dp(16), dp(18))
+        }
+        content.addView(TextView(this).apply {
+            text = "Регистрация"
+            textSize = 22f
+            typeface = interFont(750)
+            setTextColor(Color.rgb(16, 17, 20))
+        }, marginLp(-1, -2, 0, 4, 0, 8))
+        content.addView(TextView(this).apply {
+            text = "Создайте профиль по номеру телефона. Номер будет уникальным идентификатором."
+            textSize = 13f
+            setTextColor(Color.rgb(90, 90, 90))
+            setPadding(0, 0, 0, dp(12))
+        })
+
+        val card = card()
+        card.addView(TextView(this).apply {
+            text = "ФИО *"
+            textSize = 12f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(0, 0, 0, dp(5))
+        })
+        val name = EditText(this).apply {
+            setText(profileFullName())
+            hint = "Иванов Иван Иванович"
+            textSize = 15f
+            setSingleLine(true)
+            setPadding(dp(12), 0, dp(12), 0)
+            background = round(Color.rgb(246, 247, 249), dp(12), Color.rgb(223, 229, 235), 1)
+        }
+        card.addView(name, LinearLayout.LayoutParams(-1, dp(52)))
+        card.addView(TextView(this).apply {
+            text = "Номер телефона *"
+            textSize = 12f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(0, dp(10), 0, dp(5))
+        })
+        val initial = prefillPhone.ifBlank { profilePhoneStored() }
+        val (phoneRow, phoneNational) = buildRuPhoneInputRow(initial)
+        card.addView(phoneRow, LinearLayout.LayoutParams(-1, -2))
+        content.addView(card)
+
+        loginStatusText = TextView(this).apply {
+            text = ""
+            textSize = 13f
+            setTextColor(Color.rgb(90, 90, 90))
+            setPadding(0, dp(10), 0, 0)
+        }
+        content.addView(loginStatusText)
+
+        content.addView(TextView(this).apply {
+            text = "ЗАРЕГИСТРИРОВАТЬСЯ"
+            gravity = Gravity.CENTER
+            textSize = 15f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(red, dp(14), Color.TRANSPARENT, 0)
+            setOnClickListener {
+                val nameText = name.text.toString().trim()
+                val national = extractRuNationalDigits(phoneNational.text.toString())
+                authPendingNationalPhone = national
+                if (nameText.isBlank()) {
+                    toast("Укажите ФИО")
+                    return@setOnClickListener
+                }
+                if (national.length != 10) {
+                    toast("Укажите 10 цифр номера")
+                    return@setOnClickListener
+                }
+                val e164 = normalizePhoneE164(national)
+                if (e164.isBlank()) {
+                    toast("Укажите полный номер телефона")
+                    return@setOnClickListener
+                }
+                performUserRegister(
+                    name = nameText,
+                    phone = e164,
+                    email = userProfilePrefs().getString("email", "")?.trim().orEmpty(),
+                    birth = userProfilePrefs().getString("birth", "")?.trim().orEmpty(),
+                )
+            }
+        }, marginLp(-1, dp(54), 0, 14, 0, 0))
+
+        content.addView(TextView(this).apply {
+            text = "Уже есть профиль? Войти"
+            gravity = Gravity.CENTER
+            textSize = 14f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(16, 17, 20))
+            setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener {
+                authPendingNationalPhone = extractRuNationalDigits(phoneNational.text.toString())
+                showLoginScreen()
+            }
+        }, marginLp(-1, -2, 0, 8, 0, 0))
+
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        setContentView(root)
+    }
+
+    /**
+     * Login: поиск пользователя. Не создаёт запись в БД.
+     */
+    private fun performUserLogin(phoneE164: String) {
+        if (loginLoading) return
+        loginLoading = true
+        val generation = ++loginGeneration
+        loginStatusText?.text = "Вход…"
+        loginStatusText?.setTextColor(Color.rgb(90, 90, 90))
+        saveBatteries(emptyList())
+        selectedAddress = null
+        selectedDeviceName = ""
+        disconnectGatt()
+
+        thread {
+            val result = requestUserAuth(USER_LOGIN_PATH, phone = phoneE164, name = null, email = null, birth = null)
+            runOnUiThread {
+                if (generation != loginGeneration) return@runOnUiThread
+                loginLoading = false
+                val (httpCode, body) = result ?: (0 to null)
+                if (body == null) {
+                    loginStatusText?.text = "Не удалось связаться с сервером. Проверьте интернет и повторите."
+                    toast("Ошибка входа. Попробуйте ещё раз.")
+                    return@runOnUiThread
+                }
+                val error = body.optString("error")
+                if (httpCode == 404 || error == "user_not_found" || !body.optBoolean("ok")) {
+                    if (error == "user_not_found" || httpCode == 404) {
+                        loginStatusText?.setTextColor(Color.rgb(180, 35, 45))
+                        loginStatusText?.text =
+                            "Пользователь с таким номером не найден.\nЗарегистрируйтесь, чтобы создать профиль."
+                        toast("Пользователь не найден")
+                        // Кнопка перехода уже есть на экране; дополнительно предложим диалог.
+                        AlertDialog.Builder(this)
+                            .setTitle("Пользователь не найден")
+                            .setMessage("Зарегистрируйтесь, чтобы создать профиль.")
+                            .setPositiveButton("Зарегистрироваться") { _, _ -> showRegisterScreen() }
+                            .setNegativeButton("Отмена", null)
+                            .show()
+                        return@runOnUiThread
+                    }
+                    loginStatusText?.text = "Ошибка входа. Проверьте номер телефона."
+                    toast("Ошибка входа")
+                    return@runOnUiThread
+                }
+                applyAuthSuccess(body, fallbackPhone = phoneE164, fallbackName = "")
+            }
+        }
+    }
+
+    /**
+     * Registration: создание пользователя. Не делает silent login upsert.
+     */
+    private fun performUserRegister(name: String, phone: String, email: String, birth: String) {
+        if (loginLoading) return
+        loginLoading = true
+        val generation = ++loginGeneration
+        loginStatusText?.text = "Регистрация…"
+        loginStatusText?.setTextColor(Color.rgb(90, 90, 90))
+        saveBatteries(emptyList())
+        selectedAddress = null
+        selectedDeviceName = ""
+        disconnectGatt()
+
+        thread {
+            val result = requestUserAuth(
+                USER_REGISTER_PATH,
+                phone = phone,
+                name = name,
+                email = email,
+                birth = birth,
+            )
+            runOnUiThread {
+                if (generation != loginGeneration) return@runOnUiThread
+                loginLoading = false
+                val (httpCode, body) = result ?: (0 to null)
+                if (body == null) {
+                    loginStatusText?.text = "Не удалось связаться с сервером. Проверьте интернет и повторите."
+                    toast("Ошибка регистрации")
+                    return@runOnUiThread
+                }
+                val error = body.optString("error")
+                if (httpCode == 409 || error == "phone_already_exists") {
+                    loginStatusText?.setTextColor(Color.rgb(180, 35, 45))
+                    loginStatusText?.text =
+                        "Пользователь с таким номером уже зарегистрирован.\nВыполните вход."
+                    AlertDialog.Builder(this)
+                        .setTitle("Уже зарегистрирован")
+                        .setMessage("Пользователь с таким номером уже зарегистрирован. Выполните вход.")
+                        .setPositiveButton("Войти") { _, _ -> showLoginScreen() }
+                        .setNegativeButton("Отмена", null)
+                        .show()
+                    return@runOnUiThread
+                }
+                if (!body.optBoolean("ok") && httpCode !in 200..299) {
+                    loginStatusText?.text = "Ошибка регистрации."
+                    toast("Ошибка регистрации")
+                    return@runOnUiThread
+                }
+                applyAuthSuccess(body, fallbackPhone = phone, fallbackName = name)
+            }
+        }
+    }
+
+    private fun applyAuthSuccess(body: JSONObject, fallbackPhone: String, fallbackName: String) {
+        val user = body.optJSONObject("user")
+        val remotePhone = normalizePhoneE164(user?.optString("phone").orEmpty().ifBlank { fallbackPhone })
+        val remoteName = user?.optString("name").orEmpty().ifBlank { fallbackName }
+        userProfilePrefs().edit()
+            .putBoolean("logged_in", true)
+            .putString("name", remoteName)
+            .putString("phone", remotePhone)
+            .putString("email", user?.optString("email").orEmpty())
+            .putString("birth", user?.optString("birth").orEmpty())
+            .apply()
+        authPendingNationalPhone = extractRuNationalDigits(remotePhone)
+        val batteries = mapServerBatteriesToSaved(body.optJSONArray("batteries"))
+        saveBatteries(batteries)
+        clearUiBackStack()
+        showBatteriesScreen(asRootHome = true)
+        if (batteries.isEmpty()) {
+            toast("Готово")
+        } else {
+            toast("АКБ: ${batteries.size}")
+        }
+    }
+
+    /**
+     * HTTP к users login/register/profile.
+     * @return Pair(httpCode, JSON) или null при сетевой ошибке.
+     */
+    private fun requestUserAuth(
+        path: String,
+        phone: String,
+        name: String?,
+        email: String?,
+        birth: String?,
+    ): Pair<Int, JSONObject>? {
+        return try {
+            val body = JSONObject().apply {
+                putBmsApiKey(this)
+                put("phone", phone)
+                if (name != null) put("name", name)
+                if (email != null) put("email", email)
+                if (birth != null) put("birth", birth)
+            }
+            val conn = (URL(adminServerUrl(path)).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 12000
+                readTimeout = 20000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Accept", "application/json")
+                applyBmsApiAuth(this)
+            }
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val response = try {
+                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                stream?.bufferedReader(Charsets.UTF_8)?.readText().orEmpty()
+            } catch (_: Exception) {
+                ""
+            }
+            conn.disconnect()
+            Log.i(BLE_LOG_TAG, "USER AUTH $path http=$code body=${response.take(300)}")
+            if (response.isBlank()) null else code to JSONObject(response)
+        } catch (e: Exception) {
+            Log.w(BLE_LOG_TAG, "USER AUTH $path EXCEPTION: ${e.message}")
+            null
+        }
+    }
+
+    private fun mapServerBatteriesToSaved(arr: JSONArray?): List<SavedBattery> {
+        if (arr == null) return emptyList()
+        val out = mutableListOf<SavedBattery>()
+        val seen = HashSet<String>()
+        for (i in 0 until arr.length()) {
+            val item = arr.optJSONObject(i) ?: continue
+            val address = item.optString("bluetooth_address").trim()
+                .ifBlank { item.optString("bluetooth_id").trim() }
+                .ifBlank { item.optString("bms_uid").trim() }
+            if (address.isBlank()) continue
+            val key = address.uppercase()
+            if (!seen.add(key)) continue
+            val name = item.optString("advertised_name").ifBlank {
+                item.optString("bluetooth_name")
+            }
+            out += SavedBattery(
+                address = address,
+                bluetoothName = name,
+                customName = "",
+                soc = if (item.has("soc") && !item.isNull("soc")) item.optDouble("soc") else null,
+                capacityAh = if (item.has("capacity_ah") && !item.isNull("capacity_ah")) {
+                    item.optDouble("capacity_ah")
+                } else null,
+                lastSeenAt = item.optLong("last_seen_at", 0L)
+            )
+        }
+        return out.sortedByDescending { it.lastSeenAt }
+    }
+
+    /**
+     * Logout: только локальная сессия. АКБ на сервере НЕ удаляются.
+     */
+    private fun logoutUserSession() {
+        if (isServiceApp()) return
+        loginGeneration += 1
+        loginLoading = false
+        disconnectGatt()
+        selectedAddress = null
+        selectedDeviceName = ""
+        saveBatteries(emptyList())
+        clearUiBackStack()
+        stopBatteriesPresenceScan()
+        // Профиль и аватар очищаем локально; серверные АКБ остаются.
+        val avatarFile = profileAvatarFile()
+        if (avatarFile.exists()) avatarFile.delete()
+        userProfilePrefs().edit().clear().apply()
+        supportPrefs?.edit()?.clear()?.apply()
+        loginLoading = false
+        showLoginScreen()
+        toast("Вы вышли из профиля")
+    }
+
+    private fun confirmLogout() {
+        AlertDialog.Builder(this)
+            .setTitle("Выход")
+            .setMessage("Вы действительно хотите выйти из профиля?")
+            .setNegativeButton("Отмена", null)
+            .setPositiveButton("Выйти") { _, _ -> logoutUserSession() }
+            .show()
+    }
+
+    private fun profileAvatarFile(): File {
+        val dir = File(filesDir, "profile_avatars").apply { mkdirs() }
+        return File(dir, "avatar.jpg")
+    }
+
+    private fun showProfileAvatarChooser() {
+        AlertDialog.Builder(this)
+            .setTitle("Фото профиля")
+            .setItems(arrayOf("Сделать фото", "Выбрать из галереи", "Отмена")) { dialog, which ->
+                when (which) {
+                    0 -> takeProfilePhoto()
+                    1 -> pickProfileAvatarFromGallery()
+                    else -> dialog.dismiss()
+                }
+            }
+            .show()
+    }
+
+    private fun takeProfilePhoto() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            profileCameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            return
+        }
+        launchProfileCamera()
+    }
+
+    private fun launchProfileCamera() {
+        try {
+            val file = File(File(filesDir, "profile_avatars").apply { mkdirs() }, "avatar_capture.jpg")
+            val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", file)
+            profilePendingCameraUri = uri
+            profileCameraLauncher.launch(uri)
+        } catch (e: Exception) {
+            profilePendingCameraUri = null
+            Log.w(BLE_LOG_TAG, "PROFILE CAMERA launch failed: ${e.message}")
+            toast("Не удалось открыть камеру")
+        }
+    }
+
+    private fun pickProfileAvatarFromGallery() {
+        profileGalleryLauncher.launch(
+            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+        )
+    }
+
+    /**
+     * Копирует выбранное изображение во внутреннее хранилище приложения.
+     * Так аватар переживает перезапуск и не зависит от content:// URI галереи.
+     */
+    private fun persistProfileAvatarFromUri(source: Uri) {
+        thread {
+            try {
+                val decoded = contentResolver.openInputStream(source)?.use { input ->
+                    BitmapFactory.decodeStream(input)
+                }
+                if (decoded == null) {
+                    runOnUiThread { toast("Не удалось прочитать изображение") }
+                    return@thread
+                }
+                val maxSide = 1024
+                val scale = min(1f, maxSide.toFloat() / max(decoded.width, decoded.height).toFloat())
+                val bitmap = if (scale < 0.999f) {
+                    Bitmap.createScaledBitmap(
+                        decoded,
+                        max(1, (decoded.width * scale).toInt()),
+                        max(1, (decoded.height * scale).toInt()),
+                        true
+                    ).also { if (it != decoded) decoded.recycle() }
+                } else {
+                    decoded
+                }
+                val outFile = profileAvatarFile()
+                outFile.outputStream().use { output ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 88, output)
+                }
+                if (bitmap != decoded) bitmap.recycle() else decoded.recycle()
+                userProfilePrefs().edit()
+                    .putString("avatar_uri", outFile.absolutePath)
+                    .apply()
+                runOnUiThread {
+                    toast("Фото профиля сохранено")
+                    if (screenState == "profile") showProfileScreen()
+                }
+            } catch (e: Exception) {
+                Log.w(BLE_LOG_TAG, "PROFILE AVATAR persist failed: ${e.message}")
+                runOnUiThread { toast("Не удалось сохранить фото") }
+            }
+        }
+    }
+
+    private fun loadProfileAvatarInto(imageView: ImageView) {
+        val path = userProfilePrefs().getString("avatar_uri", "").orEmpty()
+        if (path.isBlank()) {
+            imageView.setImageResource(android.R.drawable.ic_menu_myplaces)
+            return
+        }
+        try {
+            val file = File(path)
+            if (file.exists()) {
+                imageView.setImageBitmap(BitmapFactory.decodeFile(file.absolutePath))
+            } else {
+                // Совместимость со старым content:// URI.
+                imageView.setImageURI(Uri.parse(path))
+            }
+        } catch (_: Exception) {
+            imageView.setImageResource(android.R.drawable.ic_menu_myplaces)
+        }
+    }
+
+    /**
+     * Привязка текущей АКБ к пользователю на backend (owner_phone).
+     * Не удаляет АКБ — только обновляет владельца.
+     */
+    private fun linkCurrentBatteryToUserAsync() {
+        if (isServiceApp() || !isUserSessionActive()) return
+        val address = selectedAddress ?: return
+        val phone = normalizePhoneE164()
+        if (phone.isBlank()) return
+        val name = profileFullName()
+        val bluetoothName = sanitizeBleText(
+            scanNames[address] ?: selectedDeviceName
+        ).ifBlank { address }
+        val bmsUid = bmsUid().takeIf { it.isNotBlank() && it != "unknown_bms" }.orEmpty()
+        thread {
+            try {
+                val body = JSONObject().apply {
+                    putBmsApiKey(this)
+                    put("phone", phone)
+                    put("name", name)
+                    put("owner_name", name)
+                    put("email", userProfilePrefs().getString("email", "")?.trim().orEmpty())
+                    put("bluetooth_address", address)
+                    put("bluetooth_name", bluetoothName)
+                    put("advertised_name", bluetoothName)
+                    if (bmsUid.isNotBlank()) put("bms_uid", bmsUid)
+                }
+                val conn = (URL(adminServerUrl(USER_LINK_BATTERY_PATH)).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 10000
+                    readTimeout = 15000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                    setRequestProperty("Accept", "application/json")
+                    applyBmsApiAuth(this)
+                }
+                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCode
+                val response = try {
+                    val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                    stream?.bufferedReader(Charsets.UTF_8)?.readText().orEmpty()
+                } catch (_: Exception) {
+                    ""
+                }
+                conn.disconnect()
+                Log.i(BLE_LOG_TAG, "USER LINK BATTERY http=$code body=${response.take(200)}")
+            } catch (e: Exception) {
+                Log.w(BLE_LOG_TAG, "USER LINK BATTERY EXCEPTION: ${e.message}")
+            }
+        }
+    }
+
     private fun showProfileScreen() {
         if (isServiceApp()) {
             showServiceProfileScreen()
+            return
+        }
+        if (!isUserSessionActive()) {
+            showLoginScreen()
             return
         }
         enterScreen("profile")
@@ -6582,17 +7353,9 @@ class MainActivity : ComponentActivity() {
             scaleType = ImageView.ScaleType.CENTER_CROP
             background = round(Color.rgb(246, 247, 249), dp(52), redDark, 2)
             clipToOutline = true
-            val savedUri = prefs.getString("avatar_uri", "").orEmpty()
-            if (savedUri.isNotBlank()) {
-                try {
-                    setImageURI(Uri.parse(savedUri))
-                } catch (_: Exception) {
-                    setImageResource(android.R.drawable.ic_menu_myplaces)
-                }
-            } else {
-                setImageResource(android.R.drawable.ic_menu_myplaces)
-            }
+            setOnClickListener { showProfileAvatarChooser() }
         }
+        loadProfileAvatarInto(avatar)
         avatarWrap.addView(avatar, LinearLayout.LayoutParams(dp(104), dp(104)))
         avatarWrap.addView(TextView(this).apply {
             text = "✎  Изменить фото"
@@ -6601,7 +7364,7 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER
             setTextColor(Color.rgb(16, 17, 20))
             background = round(Color.WHITE, dp(12), Color.rgb(223, 229, 235), 1)
-            setOnClickListener { pickProfileAvatar() }
+            setOnClickListener { showProfileAvatarChooser() }
         }, marginLp(-2, dp(40), 0, 10, 0, 10))
         content.addView(avatarWrap)
 
@@ -6626,12 +7389,15 @@ class MainActivity : ComponentActivity() {
         }
         val name = field("ФИО *", prefs.getString("name", "") ?: "", "Иванов Иван Иванович")
         val savedPhone = prefs.getString("phone", "")?.trim().orEmpty()
-        val phone = field(
-            "Номер телефона *",
-            if (savedPhone.isBlank()) "+7" else formatRuPhoneMask(savedPhone),
-            "+7 (___) ___-__-__"
-        )
-        attachRuPhoneMask(phone)
+        profileCard.addView(TextView(this).apply {
+            text = "Номер телефона *"
+            textSize = 12f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(0, dp(10), 0, dp(5))
+        })
+        val (phoneRow, phoneNational) = buildRuPhoneInputRow(savedPhone)
+        profileCard.addView(phoneRow, LinearLayout.LayoutParams(-1, -2))
         val email = field("Email", prefs.getString("email", "") ?: "", "name@example.ru")
         val birth = field("Дата рождения", prefs.getString("birth", "") ?: "", "ДД.ММ.ГГГГ")
         profileCard.addView(TextView(this).apply {
@@ -6650,25 +7416,73 @@ class MainActivity : ComponentActivity() {
             background = round(red, dp(14), Color.TRANSPARENT, 0)
             setOnClickListener {
                 val nameText = name.text.toString().trim()
-                val phoneText = formatRuPhoneMask(phone.text.toString())
+                val national = extractRuNationalDigits(phoneNational.text.toString())
                 if (nameText.isBlank()) {
                     toast("Укажите ФИО")
                     return@setOnClickListener
                 }
-                if (!isValidRuPhone(phoneText)) {
+                if (national.length != 10) {
+                    toast("Укажите 10 цифр номера")
+                    return@setOnClickListener
+                }
+                val nextPhone = normalizePhoneE164(national)
+                if (nextPhone.isBlank()) {
                     toast("Укажите полный номер телефона")
                     return@setOnClickListener
                 }
+                val previousPhone = normalizePhoneE164()
+                val emailText = email.text.toString().trim()
+                val birthText = birth.text.toString().trim()
                 prefs.edit()
+                    .putBoolean("logged_in", true)
                     .putString("name", nameText)
-                    .putString("phone", phoneText)
-                    .putString("email", email.text.toString().trim())
-                    .putString("birth", birth.text.toString().trim())
+                    .putString("phone", nextPhone)
+                    .putString("email", emailText)
+                    .putString("birth", birthText)
                     .apply()
-                phone.setText(phoneText)
-                toast("Профиль сохранён")
+                phoneNational.setText(formatRuNationalMask(national))
+                // Синхронизация профиля (не login/register).
+                thread {
+                    val result = requestUserAuth(
+                        USER_PROFILE_PATH,
+                        phone = nextPhone,
+                        name = nameText,
+                        email = emailText,
+                        birth = birthText,
+                    )
+                    runOnUiThread {
+                        val body = result?.second
+                        if (body == null || !body.optBoolean("ok")) {
+                            toast("Профиль сохранён локально, сервер недоступен")
+                            return@runOnUiThread
+                        }
+                        if (previousPhone.isNotBlank() && previousPhone != nextPhone) {
+                            // Смена номера: войти заново, чтобы подтянуть АКБ нового профиля.
+                            performUserLogin(nextPhone)
+                            return@runOnUiThread
+                        }
+                        toast("Профиль сохранён")
+                    }
+                }
             }
         }, marginLp(-1, dp(54), 0, 14, 0, 0))
+
+        content.addView(TextView(this).apply {
+            text = "Выйти из профиля"
+            gravity = Gravity.CENTER
+            textSize = 15f
+            typeface = interFont(700)
+            setTextColor(Color.WHITE)
+            background = round(Color.rgb(180, 35, 45), dp(14), Color.TRANSPARENT, 0)
+            setOnClickListener { confirmLogout() }
+        }, marginLp(-1, dp(54), 0, 18, 0, 8))
+        content.addView(TextView(this).apply {
+            text = "При выходе локальные АКБ очищаются. На сервере ваши АКБ сохраняются и вернутся при повторном входе."
+            textSize = 12f
+            setTextColor(Color.rgb(111, 119, 129))
+            setPadding(0, 0, 0, dp(12))
+        })
+
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(fixedBottomNav("profile"), LinearLayout.LayoutParams(-1, dp(70)))
@@ -7787,12 +8601,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** @deprecated Используйте showProfileAvatarChooser / Photo Picker. */
     private fun pickProfileAvatar() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "image/*"
-        }
-        startActivityForResult(intent, PROFILE_AVATAR_REQUEST_CODE)
+        showProfileAvatarChooser()
     }
 
     /**
@@ -7851,20 +8662,7 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
-        if (requestCode == PROFILE_AVATAR_REQUEST_CODE) {
-            val uri = resultData?.data ?: return
-            try {
-                contentResolver.takePersistableUriPermission(
-                    uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: Exception) {}
-            getSharedPreferences("user_profile", MODE_PRIVATE).edit()
-                .putString("avatar_uri", uri.toString())
-                .apply()
-            showProfileScreen()
-            return
-        }
+        // PROFILE_AVATAR_REQUEST_CODE: заменён на Activity Result / Photo Picker.
         if (requestCode == WARRANTY_CAMERA_REQUEST_CODE) {
             val uri = warrantyPendingCameraUri
             warrantyPendingCameraUri = null
@@ -10538,7 +11336,10 @@ class MainActivity : ComponentActivity() {
     private fun putOwnerProfile(obj: JSONObject) {
         val prefs = getSharedPreferences("user_profile", MODE_PRIVATE)
         obj.put("owner_name", prefs.getString("name", "")?.trim().orEmpty())
-        obj.put("owner_phone", prefs.getString("phone", "")?.trim().orEmpty())
+        obj.put(
+            "owner_phone",
+            normalizePhoneE164(prefs.getString("phone", "")?.trim().orEmpty())
+        )
         obj.put("owner_email", prefs.getString("email", "")?.trim().orEmpty())
     }
 
