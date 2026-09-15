@@ -6,7 +6,9 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.bluetooth.*
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.ClipboardManager
 import android.content.ClipData
@@ -21,7 +23,10 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.text.TextUtils
+import android.util.Base64
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -34,10 +39,13 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.core.content.FileProvider
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -51,6 +59,9 @@ import java.text.SimpleDateFormat
 import java.util.concurrent.Executors
 import org.json.JSONArray
 import org.json.JSONObject
+import ru.liferych.bms.cellcode.CellCodeDecoder
+import ru.liferych.bms.cellcode.CellCodeRecognition
+import ru.liferych.bms.cellcode.CellQrDecodeResult
 import kotlin.concurrent.thread
 import kotlin.math.max
 import kotlin.math.min
@@ -59,6 +70,12 @@ private const val FRAME_START: Byte = 0xA5.toByte()
 private const val REQUEST_ADDRESS: Byte = 0x40
 private const val DATA_LEN: Byte = 0x08
 private const val BLE_LOG_TAG = "LiferychBmsBle"
+private const val BMS_BLE_TAG = "BMS-BLE"
+private const val BMS_WAKE_TAG = "BMS-WAKE"
+/** Targeted scan for a previously saved BMS (Android 10+ friendly). */
+private const val TARGETED_SCAN_TIMEOUT_MS = 10000L
+private const val WAKE_MAX_ATTEMPTS = 5
+private val WAKE_RETRY_DELAYS_MS = longArrayOf(400L, 400L, 500L, 500L, 500L)
 
 private const val DEFAULT_ADMIN_SERVER_BASE_URL = BmsApiConfig.BASE_URL
 private const val UPLOAD_PATH = "/api/upload.php"
@@ -280,6 +297,14 @@ data class SavedBattery(
     val lastSeenAt: Long
 )
 
+/** Присутствие сохранённой BMS на экране «Мои батареи» (не путать с lastSeen). */
+private enum class BatteryPresenceState {
+    CHECKING,
+    ONLINE,
+    SLEEPING,
+    UNAVAILABLE
+}
+
 private class SectionSwipeScrollView(
     context: Context,
     private val onSectionSwipe: (direction: Int) -> Unit
@@ -305,42 +330,6 @@ private class SectionSwipeScrollView(
             }
         }
         return super.dispatchTouchEvent(event)
-    }
-}
-
-private class BatteryIconView(
-    context: Context,
-    private val iconColor: Int,
-    private val iconSizeDp: Float = 23f
-) : View(context) {
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = iconColor
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        val scale = minOf(width.toFloat(), height.toFloat(), iconSizeDp * resources.displayMetrics.density) / 24f
-        val offsetX = (width - 24f * scale) / 2f
-        val offsetY = (height - 24f * scale) / 2f
-        fun x(value: Float) = offsetX + value * scale
-        fun y(value: Float) = offsetY + value * scale
-        stroke.strokeWidth = 1.8f * scale
-
-        canvas.drawRoundRect(
-            x(3.5f),
-            y(7f),
-            x(18f),
-            y(17f),
-            2f * scale,
-            2f * scale,
-            stroke
-        )
-        canvas.drawLine(x(19.5f), y(10f), x(19.5f), y(14f), stroke)
-        canvas.drawLine(x(9f), y(9.8f), x(9f), y(14.2f), stroke)
-        canvas.drawLine(x(6.8f), y(12f), x(11.2f), y(12f), stroke)
     }
 }
 
@@ -486,79 +475,6 @@ private class DashIconView(
     }
 }
 
-private class BluetoothIconView(
-    context: Context,
-    private val iconColor: Int
-) : View(context) {
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = iconColor
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        val scale = minOf(width, height) / 24f
-        val offsetX = (width - 24f * scale) / 2f
-        val offsetY = (height - 24f * scale) / 2f
-        // Canvas scaling also scales the stroke, so keep it in SVG coordinates.
-        stroke.strokeWidth = 1.8f
-        canvas.save()
-        canvas.translate(offsetX, offsetY)
-        canvas.scale(scale, scale)
-        canvas.drawPath(Path().apply {
-            moveTo(12f, 3f)
-            lineTo(12f, 21f)
-            lineTo(18f, 15f)
-            lineTo(12f, 12f)
-            lineTo(18f, 9f)
-            close()
-            moveTo(6f, 7f)
-            lineTo(12f, 12f)
-            lineTo(6f, 17f)
-        }, stroke)
-        canvas.restore()
-    }
-}
-
-private class QrIconView(
-    context: Context,
-    private val iconColor: Int
-) : View(context) {
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = iconColor
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        val scale = minOf(width, height) / 24f
-        val offsetX = (width - 24f * scale) / 2f
-        val offsetY = (height - 24f * scale) / 2f
-        // Canvas scaling also scales the stroke, so keep it in SVG coordinates.
-        stroke.strokeWidth = 1.8f
-        canvas.save()
-        canvas.translate(offsetX, offsetY)
-        canvas.scale(scale, scale)
-        canvas.drawRect(4f, 4f, 10f, 10f, stroke)
-        canvas.drawRect(14f, 4f, 20f, 10f, stroke)
-        canvas.drawRect(4f, 14f, 10f, 20f, stroke)
-        listOf(
-            floatArrayOf(16f, 14f, 17.5f, 14f),
-            floatArrayOf(14f, 16f, 16f, 16f),
-            floatArrayOf(18f, 16f, 20f, 16f),
-            floatArrayOf(14f, 18f, 15.5f, 18f),
-            floatArrayOf(17.5f, 18f, 20f, 18f),
-            floatArrayOf(18f, 14f, 18f, 15.5f),
-            floatArrayOf(20f, 18f, 20f, 20f)
-        ).forEach { canvas.drawLine(it[0], it[1], it[2], it[3], stroke) }
-        canvas.restore()
-    }
-}
-
 @androidx.annotation.OptIn(markerClass = [androidx.camera.core.ExperimentalGetImage::class])
 class MainActivity : ComponentActivity() {
     private lateinit var configPrefs: SharedPreferences
@@ -575,9 +491,19 @@ class MainActivity : ComponentActivity() {
     }
     private var bleDebugText: String = ""
     private val WARRANTY_MEDIA_REQUEST_CODE = 4501
+    private val WARRANTY_CAMERA_REQUEST_CODE = 4503
     private val PROFILE_AVATAR_REQUEST_CODE = 4502
     private val CAMERA_PERMISSION_REQUEST_CODE = 1002
+    private val WARRANTY_CAMERA_PERMISSION_REQUEST_CODE = 1003
+    private val WARRANTY_PAGE_SIZE = 5
     private val warrantyMediaUris: MutableList<Uri> = mutableListOf()
+    /** Временный URI для системной камеры (ACTION_IMAGE_CAPTURE). */
+    private var warrantyPendingCameraUri: Uri? = null
+    private var warrantyListPage: Int = 1
+    private var warrantyListTotal: Int = 0
+    private var warrantyListTotalPages: Int = 1
+    private var warrantyListLoading: Boolean = false
+    private var warrantyPaginationRow: LinearLayout? = null
     private var qrCodeValue: String = ""
     private var qrProcessing = false
     private var cameraProvider: ProcessCameraProvider? = null
@@ -596,7 +522,7 @@ class MainActivity : ComponentActivity() {
     private var warrantyPhoneEdit: EditText? = null
     private var warrantyModelEdit: EditText? = null
     private var warrantyProblemEdit: EditText? = null
-    private var warrantyMediaText: TextView? = null
+    private var warrantyMediaListLayout: LinearLayout? = null
     private var warrantyStatusText: TextView? = null
     private var warrantyListLayout: LinearLayout? = null
     private var supportPrefs: SharedPreferences? = null
@@ -708,6 +634,20 @@ class MainActivity : ComponentActivity() {
     private var lastKnownDischargeMosTextText: String? = null
     private var polling = false
     private var pollLoopToken = 0
+    /** Targeted reconnect: scan only for this BLE MAC (SavedBattery.address). */
+    private var targetedScanAddress: String? = null
+    private var targetedScanToken = 0
+    /** Presence scan for «Мои батареи»: visible MAC ≠ sleeping. */
+    private var batteriesPresenceScanActive = false
+    private var batteriesPresenceScanToken = 0
+    private var batteriesPresenceScanCompleted = false
+    private val batteriesSeenInScan = mutableSetOf<String>()
+    private val batteryCardStatusHosts = linkedMapOf<String, LinearLayout>()
+    private val batteryCardPresenceByAddress = linkedMapOf<String, BatteryPresenceState>()
+    /** Post-GATT wake via safe Daly 0x90 read before normal poll loop. */
+    private var wakeInProgress = false
+    private var wakeToken = 0
+    private var wakeAttempt = 0
     private var runtimeCommands: List<Int> = emptyList()
     private var runtimeCommandIndex = 0
     private var pendingRuntimeCommand: Int? = null
@@ -899,8 +839,12 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        val connect = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+        // Текстовая кнопка: тот же BLE-flow (loading + scan), без иконки и подписи «по Bluetooth».
+        val connect = TextView(this).apply {
+            text = "Подключить батарею"
+            textSize = 17f
+            setTextColor(Color.rgb(16, 17, 20))
+            typeface = interFont(720)
             gravity = Gravity.CENTER
             isClickable = true
             isFocusable = true
@@ -914,58 +858,11 @@ class MainActivity : ComponentActivity() {
                 startScan()
             }
         }
-        connect.addView(
-            BluetoothIconView(this, Color.rgb(16, 17, 20)),
-            LinearLayout.LayoutParams(dp(34), dp(42))
-        )
-        connect.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(TextView(this@MainActivity).apply {
-                text = "Подключить батарею"
-                textSize = 17f
-                setTextColor(Color.rgb(16, 17, 20))
-                typeface = interFont(720)
-            })
-            addView(TextView(this@MainActivity).apply {
-                text = "по Bluetooth"
-                textSize = 11f
-                setTextColor(Color.rgb(70, 70, 70))
-                typeface = interFont(600)
-            })
-        })
         launchTop.addView(connect, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             dp(62)
         ).apply {
             setMargins(dp(14), dp(26), dp(14), 0)
-        })
-
-        val qrButton = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            isClickable = true
-            isFocusable = true
-            background = round(Color.rgb(251, 251, 252), dp(16), Color.rgb(202, 211, 220), 1)
-            elevation = dp(3).toFloat()
-            addView(
-                QrIconView(this@MainActivity, Color.rgb(16, 17, 20)),
-                LinearLayout.LayoutParams(dp(34), dp(40))
-            )
-            addView(TextView(this@MainActivity).apply {
-                text = "Проверить ячейку по QR-коду"
-                textSize = 15f
-                setTextColor(Color.rgb(16, 17, 20))
-                typeface = interFont(760)
-                gravity = Gravity.CENTER
-            })
-            setOnClickListener { showQrInputScreen() }
-        }
-        launchTop.addView(qrButton, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(56)
-        ).apply {
-            setMargins(dp(14), dp(12), dp(14), 0)
         })
 
         root.addView(Space(this), LinearLayout.LayoutParams(1, 0, 1f))
@@ -1053,7 +950,8 @@ class MainActivity : ComponentActivity() {
 
     private fun showQrInputScreen() {
         stopQrCamera()
-        screenState = "qr_input"
+        enterScreen("qr_input")
+        currentTab = "qr"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
@@ -1066,13 +964,13 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(16), 0, dp(16), dp(14))
         }
         content.addView(TextView(this).apply {
-            text = "Проверка ячейки по QR-коду"
+            text = "Проверить QR-код"
             textSize = 22f
             setTextColor(Color.rgb(16, 17, 20))
             typeface = interFont(750)
         }, marginLp(-1, -2, 0, 4, 0, 14))
         content.addView(TextView(this).apply {
-            text = "▦   Проверка по коду ячейки\nНажмите кнопку сканера или введите код вручную."
+            text = "Наведите камеру на QR/Data Matrix код элемента или введите код вручную."
             textSize = 13f
             setTextColor(Color.rgb(111, 119, 129))
             setPadding(dp(14), dp(14), dp(14), dp(14))
@@ -1080,7 +978,7 @@ class MainActivity : ComponentActivity() {
         })
 
         content.addView(TextView(this).apply {
-            text = "QR-код / код ячейки"
+            text = "Код элемента"
             textSize = 12f
             setTextColor(Color.rgb(16, 17, 20))
             typeface = interFont(700)
@@ -1096,11 +994,12 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER
             setTextColor(redDark)
             background = round(Color.rgb(255, 248, 218), dp(18), redDark, 1)
+            contentDescription = "Сканировать"
             setOnClickListener { showQrScannerScreen() }
         }, LinearLayout.LayoutParams(dp(64), dp(64)))
         val input = EditText(this).apply {
             setText(qrCodeValue)
-            hint = "Введите код"
+            hint = "Ввести код вручную"
             textSize = 14f
             setSingleLine(false)
             gravity = Gravity.CENTER_VERTICAL
@@ -1112,19 +1011,19 @@ class MainActivity : ComponentActivity() {
         })
         content.addView(entry)
         content.addView(TextView(this).apply {
-            text = "Допускается многострочный код — служебные пробелы будут удалены."
+            text = "Допускается код из двух частей — пробелы и переносы будут убраны."
             textSize = 12f
             setTextColor(Color.rgb(111, 119, 129))
         }, marginLp(-1, -2, 0, 10, 0, 0))
         content.addView(TextView(this).apply {
-            text = "ДЕКОДИРОВАТЬ"
+            text = "ПРОВЕРИТЬ"
             textSize = 15f
             typeface = interFont(780)
             setTextColor(Color.rgb(16, 17, 20))
             gravity = Gravity.CENTER
             background = round(red, dp(14), Color.TRANSPARENT, 0)
             setOnClickListener {
-                qrCodeValue = input.text.toString().replace(Regex("\\s+"), "")
+                qrCodeValue = input.text.toString()
                 if (qrCodeValue.isBlank()) {
                     toast("Введите или отсканируйте код")
                 } else {
@@ -1132,10 +1031,19 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }, marginLp(-1, dp(52), 0, 16, 0, 0))
+        content.addView(TextView(this).apply {
+            text = "Открыть сканер камеры"
+            textSize = 14f
+            typeface = interFont(700)
+            gravity = Gravity.CENTER
+            setTextColor(redDark)
+            setPadding(dp(12), dp(14), dp(12), dp(14))
+            setOnClickListener { showQrScannerScreen() }
+        }, marginLp(-1, -2, 0, 8, 0, 0))
 
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(fixedBottomNav(""), LinearLayout.LayoutParams(-1, dp(70)))
+        root.addView(fixedBottomNav("qr"), LinearLayout.LayoutParams(-1, dp(70)))
         setContentView(root)
     }
 
@@ -1145,7 +1053,8 @@ class MainActivity : ComponentActivity() {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_REQUEST_CODE)
             return
         }
-        screenState = "qr_scan"
+        enterScreen("qr_scan")
+        currentTab = "qr"
         qrProcessing = false
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1190,16 +1099,19 @@ class MainActivity : ComponentActivity() {
         })
         content.addView(scannerFrame, LinearLayout.LayoutParams(-1, 0, 1f))
         content.addView(TextView(this).apply {
-            text = "◉  Сканирование запущено автоматически"
-            textSize = 12f
+            text = "Ввести код вручную"
+            textSize = 14f
             typeface = interFont(700)
-            setTextColor(Color.rgb(16, 17, 20))
             gravity = Gravity.CENTER
-            setPadding(dp(12), dp(9), dp(12), dp(9))
-            background = round(Color.rgb(255, 248, 218), dp(16), redDark, 1)
+            setTextColor(redDark)
+            setPadding(dp(12), dp(14), dp(12), dp(14))
+            setOnClickListener {
+                stopQrCamera()
+                showQrInputScreen()
+            }
         }, marginLp(-1, -2, 0, 12, 0, 0))
         root.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(fixedBottomNav(""), LinearLayout.LayoutParams(-1, dp(70)))
+        root.addView(fixedBottomNav("qr"), LinearLayout.LayoutParams(-1, dp(70)))
         setContentView(root)
         startQrCamera(previewView)
     }
@@ -1232,19 +1144,21 @@ class MainActivity : ComponentActivity() {
                     .addOnSuccessListener { codes ->
                         val value = codes.firstNotNullOfOrNull { it.rawValue?.takeIf(String::isNotBlank) }
                         if (value != null) {
+                            // Оставляем qrProcessing=true, чтобы не ловить повторные кадры.
                             qrCodeValue = value
                             runOnUiThread {
                                 stopQrCamera()
-                                showQrInputScreen()
-                                toast("Код найден")
+                                showQrResultScreen(value)
                             }
+                        } else if (screenState == "qr_scan") {
+                            qrProcessing = false
                         }
                     }
                     .addOnFailureListener {
+                        if (screenState == "qr_scan") qrProcessing = false
                         runOnUiThread { toast("Не удалось распознать код") }
                     }
                     .addOnCompleteListener {
-                        if (screenState == "qr_scan") qrProcessing = false
                         proxy.close()
                     }
             }
@@ -1266,49 +1180,91 @@ class MainActivity : ComponentActivity() {
 
     private fun showQrResultScreen(code: String) {
         stopQrCamera()
-        screenState = "qr_result"
+        enterScreen("qr_result")
+        currentTab = "qr"
+        val decoded: CellQrDecodeResult = CellCodeDecoder.decode(code)
+        qrCodeValue = decoded.normalizedCode.ifBlank { code }
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.WHITE)
         }
-        root.addView(header("Результат QR-кода", showBack = true))
+        root.addView(header("Проверка элемента", showBack = true))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), 0, dp(16), dp(14))
         }
         content.addView(TextView(this).apply {
-            text = "Результат проверки"
+            text = "Проверка элемента"
             textSize = 22f
             typeface = interFont(750)
             setTextColor(Color.rgb(16, 17, 20))
         }, marginLp(-1, -2, 0, 4, 0, 14))
+
+        val (statusText, statusColor, statusBg) = when (decoded.recognition) {
+            CellCodeRecognition.FULL -> Triple(
+                "Код распознан",
+                Color.rgb(31, 179, 90),
+                Color.rgb(237, 250, 242)
+            )
+            CellCodeRecognition.PARTIAL -> Triple(
+                "Код распознан частично",
+                Color.rgb(224, 150, 0),
+                Color.rgb(255, 248, 218)
+            )
+            CellCodeRecognition.FAILED -> Triple(
+                "Не удалось распознать код элемента",
+                Color.rgb(111, 119, 129),
+                Color.rgb(241, 243, 245)
+            )
+        }
         content.addView(TextView(this).apply {
-            text = "✓  Код успешно декодирован"
+            text = statusText
             textSize = 14f
             typeface = interFont(760)
-            setTextColor(Color.rgb(31, 179, 90))
+            setTextColor(statusColor)
             setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = round(Color.rgb(237, 250, 242), dp(16), Color.rgb(31, 179, 90), 1)
+            background = round(statusBg, dp(16), statusColor, 1)
         })
+
         content.addView(TextView(this).apply {
-            text = code
+            text = "Код элемента"
+            textSize = 12f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(111, 119, 129))
+        }, marginLp(-1, -2, 0, 12, 0, 4))
+        content.addView(TextView(this).apply {
+            text = decoded.normalizedCode.ifBlank { decoded.rawCode }
             textSize = 14f
             typeface = interFont(700)
             setTextColor(Color.rgb(16, 17, 20))
             setPadding(dp(14), dp(14), dp(14), dp(14))
             background = round(Color.rgb(246, 247, 249), dp(14), Color.rgb(223, 229, 235), 1)
-        }, marginLp(-1, -2, 0, 12, 0, 12))
+        })
 
-        val rows = listOf(
-            "Производитель" to "Пока неизвестно",
-            "Тип изделия" to "Ячейка",
-            "Тип батареи" to "Неизвестно",
-            "Ёмкость" to "Пока неизвестно",
-            "Напряжение" to "Пока неизвестно",
-            "Дата выпуска" to "Пока неизвестно",
-            "Сайт" to "liferych.ru"
-        )
+        fun displayOrDash(value: String?): String = value?.takeIf { it.isNotBlank() } ?: "Не определено"
+        fun capacityText(): String = decoded.nominalCapacityAh?.let { "%.0f Ач".format(it) }
+            ?: "Не определено"
+        fun voltageText(): String = decoded.nominalVoltageV?.let { "%.1f В".format(it) }
+            ?: "Не определено"
+
+        val rows = buildList {
+            add("Производитель" to displayOrDash(decoded.manufacturer))
+            add("Тип продукта" to displayOrDash(decoded.productType))
+            add("Тип аккумулятора" to displayOrDash(decoded.batteryType))
+            add("Номинальная ёмкость" to capacityText())
+            add("Номинальное напряжение" to voltageText())
+            add("Дата производства" to displayOrDash(decoded.productionDateDisplay))
+            add("Серия" to displayOrDash(decoded.productSeries))
+            if (decoded.productAttribute != null) {
+                add("Атрибут" to decoded.productAttribute)
+            }
+            if (decoded.subsidiary != null) {
+                add("Дочерняя компания" to decoded.subsidiary)
+            }
+        }
+
         val report = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
@@ -1329,12 +1285,14 @@ class MainActivity : ComponentActivity() {
                     textSize = 13f
                     typeface = interFont(700)
                     setTextColor(Color.rgb(16, 17, 20))
-                }, LinearLayout.LayoutParams(0, -2, 1f))
+                    gravity = Gravity.END
+                }, LinearLayout.LayoutParams(0, -2, 1.2f))
             })
         }
-        content.addView(report)
+        content.addView(report, marginLp(-1, -2, 0, 12, 0, 0))
+
         content.addView(TextView(this).apply {
-            text = "ДЕКОДИРОВАТЬ ЕЩЁ"
+            text = "СКАНИРОВАТЬ ЕЩЁ"
             textSize = 15f
             typeface = interFont(780)
             gravity = Gravity.CENTER
@@ -1342,12 +1300,22 @@ class MainActivity : ComponentActivity() {
             background = round(red, dp(14), Color.TRANSPARENT, 0)
             setOnClickListener {
                 qrCodeValue = ""
-                showQrInputScreen()
+                showQrScannerScreen()
             }
         }, marginLp(-1, dp(52), 0, 14, 0, 0))
+        content.addView(TextView(this).apply {
+            text = "Ввести код вручную"
+            textSize = 14f
+            typeface = interFont(700)
+            gravity = Gravity.CENTER
+            setTextColor(redDark)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setOnClickListener { showQrInputScreen() }
+        }, marginLp(-1, -2, 0, 4, 0, 0))
+
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(fixedBottomNav(""), LinearLayout.LayoutParams(-1, dp(70)))
+        root.addView(fixedBottomNav("qr"), LinearLayout.LayoutParams(-1, dp(70)))
         setContentView(root)
     }
 
@@ -1419,16 +1387,7 @@ class MainActivity : ComponentActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { leftMargin = dp(10) })
         }
-        top.addView(brand, LinearLayout.LayoutParams(0, dp(56), 1f))
-        top.addView(BatteryIconView(this, Color.rgb(16, 17, 20)).apply {
-            isClickable = true
-            isFocusable = true
-            contentDescription = "Добавить батарею"
-            background = round(Color.rgb(246, 247, 249), dp(19), Color.rgb(223, 229, 235), 1)
-            setOnClickListener {
-                beginAddBatteryFlow()
-            }
-        }, LinearLayout.LayoutParams(dp(38), dp(38)))
+        top.addView(brand, LinearLayout.LayoutParams(-1, dp(56)))
         root.addView(top, LinearLayout.LayoutParams(-1, dp(74)))
 
         val scroll = ScrollView(this)
@@ -1443,31 +1402,20 @@ class MainActivity : ComponentActivity() {
             typeface = interFont(750)
         }, marginLp(-1, -2, 0, 4, 0, 14))
 
-        val addButton = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
+        // Только текст: иконка убрана, click → beginAddBatteryFlow() без изменений.
+        val addButton = TextView(this).apply {
+            text = if (isServiceApp()) "+ ДОБАВИТЬ АКБ" else "ДОБАВИТЬ БАТАРЕЮ"
+            textSize = 15f
             gravity = Gravity.CENTER
+            setTextColor(Color.rgb(16, 17, 20))
+            typeface = interFont(780)
             isClickable = true
             isFocusable = true
-            setPadding(dp(10), 0, dp(10), 0)
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
                 intArrayOf(Color.rgb(255, 217, 87), Color.rgb(255, 196, 0))
             ).apply { cornerRadius = dp(15).toFloat() }
             elevation = dp(4).toFloat()
-            addView(BatteryIconView(
-                this@MainActivity,
-                Color.rgb(16, 17, 20)
-            ).apply {
-                background = round(Color.argb(120, 255, 255, 255), dp(11), Color.rgb(210, 180, 60), 1)
-            }, LinearLayout.LayoutParams(dp(36), dp(36)))
-            addView(TextView(this@MainActivity).apply {
-                text = if (isServiceApp()) "+ ДОБАВИТЬ АКБ" else "ДОБАВИТЬ БАТАРЕЮ"
-                textSize = 15f
-                gravity = Gravity.CENTER
-                setTextColor(Color.rgb(16, 17, 20))
-                typeface = interFont(780)
-            }, LinearLayout.LayoutParams(0, -1, 1f))
-            addView(Space(this@MainActivity), LinearLayout.LayoutParams(dp(36), 1))
             setOnClickListener {
                 beginAddBatteryFlow()
             }
@@ -1488,6 +1436,8 @@ class MainActivity : ComponentActivity() {
         }, marginLp(-1, -2, 0, 0, 0, 8))
 
         val saved = loadSavedBatteries()
+        batteryCardStatusHosts.clear()
+        batteryCardPresenceByAddress.clear()
         saved.forEach { battery ->
             content.addView(savedBatteryCard(battery), marginLp(-1, -2, 0, 0, 0, 10))
         }
@@ -1523,155 +1473,344 @@ class MainActivity : ComponentActivity() {
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(fixedBottomNav("main"), LinearLayout.LayoutParams(-1, dp(70)))
         setContentView(root)
+        if (saved.isNotEmpty()) {
+            startBatteriesPresenceScan(resetSeen = true)
+        } else {
+            stopBatteriesPresenceScan()
+        }
     }
 
+    private fun normalizeBleAddress(address: String): String {
+        return address.trim().uppercase(Locale.US)
+    }
+
+    private fun isBatteryBleConnected(battery: SavedBattery): Boolean {
+        if (battery.address == TEST_BATTERY_ADDRESS) return false
+        return polling &&
+            selectedAddress != null &&
+            selectedAddress.equals(battery.address, ignoreCase = true) &&
+            bluetoothGatt != null
+    }
+
+    private fun wasBatterySeenInScan(battery: SavedBattery): Boolean {
+        return batteriesSeenInScan.contains(normalizeBleAddress(battery.address))
+    }
+
+    /**
+     * ONLINE = active GATT connection ИЛИ MAC найден в актуальном BLE scan.
+     * SLEEPING только после завершённого scan без MAC и без connection.
+     */
+    private fun resolveBatteryPresence(battery: SavedBattery): BatteryPresenceState {
+        if (battery.address == TEST_BATTERY_ADDRESS) return BatteryPresenceState.ONLINE
+        if (!::bluetoothAdapter.isInitialized || !bluetoothAdapter.isEnabled) {
+            return BatteryPresenceState.UNAVAILABLE
+        }
+        if (!hasBlePermissions()) {
+            return BatteryPresenceState.UNAVAILABLE
+        }
+        if (isBatteryBleConnected(battery) || wasBatterySeenInScan(battery)) {
+            return BatteryPresenceState.ONLINE
+        }
+        if (!batteriesPresenceScanCompleted) {
+            return BatteryPresenceState.CHECKING
+        }
+        return BatteryPresenceState.SLEEPING
+    }
+
+    /**
+     * Presence текущей выбранной BMS (null — батарея не выбрана).
+     */
+    private fun resolveCurrentBmsPresence(): BatteryPresenceState? {
+        val battery = currentSavedBatteryOrNull() ?: return null
+        return resolveBatteryPresence(battery)
+    }
+
+    /**
+     * Живой fault feed: активный GATT + poll. Без него client не показывает cached errors.
+     */
+    private fun hasLiveBmsFaultFeed(): Boolean {
+        return bluetoothGatt != null && polling
+    }
+
+    /**
+     * Единый источник ACTIVE ошибок для Главной и Журнала.
+     * Только ONLINE + живой 0x98; иначе пусто (без stale cache).
+     */
+    private fun currentActiveBmsErrors(): List<String> {
+        if (resolveCurrentBmsPresence() != BatteryPresenceState.ONLINE) return emptyList()
+        if (!hasLiveBmsFaultFeed()) return emptyList()
+        return data.errors
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+    }
+
+    /**
+     * Открывает Журнал только при ONLINE BMS; иначе toast и без смены экрана.
+     */
+    private fun openJournalIfAllowed() {
+        when (resolveCurrentBmsPresence()) {
+            BatteryPresenceState.ONLINE -> showJournalScreen()
+            BatteryPresenceState.CHECKING ->
+                toast("Проверяем состояние батареи…")
+            BatteryPresenceState.SLEEPING,
+            BatteryPresenceState.UNAVAILABLE,
+            null ->
+                toast("Журнал доступен только при активной BMS")
+        }
+    }
+
+    /**
+     * Если Журнал открыт, а BMS больше не ONLINE — убрать список ошибок.
+     */
+    private fun refreshJournalIfPresenceLost() {
+        if (screenState == "journal") {
+            showJournalScreen()
+        }
+    }
+
+    private fun fillBatteryPresenceStatus(
+        host: LinearLayout,
+        battery: SavedBattery,
+        state: BatteryPresenceState
+    ) {
+        host.removeAllViews()
+        host.setPadding(dp(12), dp(10), dp(12), dp(10))
+        when {
+            battery.address == TEST_BATTERY_ADDRESS -> {
+                host.background = round(Color.rgb(255, 248, 218), dp(13), Color.TRANSPARENT, 0)
+                host.addView(TextView(this).apply {
+                    text = "✓  Тестовый режим"
+                    textSize = 13f
+                    setTextColor(redDark)
+                    typeface = interFont(760)
+                })
+            }
+            state == BatteryPresenceState.ONLINE -> {
+                host.background = round(Color.rgb(237, 250, 242), dp(13), Color.TRANSPARENT, 0)
+                host.addView(TextView(this).apply {
+                    text = "Батарея в сети"
+                    textSize = 13f
+                    setTextColor(Color.rgb(31, 179, 90))
+                    typeface = interFont(760)
+                })
+            }
+            state == BatteryPresenceState.CHECKING -> {
+                host.background = round(Color.rgb(241, 243, 245), dp(13), Color.TRANSPARENT, 0)
+                host.addView(TextView(this).apply {
+                    text = "Проверяем состояние батареи…"
+                    textSize = 13f
+                    setTextColor(Color.rgb(111, 119, 129))
+                    typeface = interFont(700)
+                })
+            }
+            state == BatteryPresenceState.UNAVAILABLE -> {
+                host.background = round(Color.rgb(241, 243, 245), dp(13), Color.TRANSPARENT, 0)
+                val title = if (!::bluetoothAdapter.isInitialized || !bluetoothAdapter.isEnabled) {
+                    "Bluetooth выключен"
+                } else {
+                    "Не удалось проверить состояние батареи"
+                }
+                host.addView(TextView(this).apply {
+                    text = title
+                    textSize = 13f
+                    setTextColor(Color.rgb(75, 79, 84))
+                    typeface = interFont(760)
+                })
+            }
+            else -> {
+                host.background = round(Color.rgb(241, 243, 245), dp(13), Color.TRANSPARENT, 0)
+                host.addView(TextView(this).apply {
+                    text = "Батарея находится в спящем режиме"
+                    textSize = 13f
+                    setTextColor(Color.rgb(75, 79, 84))
+                    typeface = interFont(760)
+                })
+                host.addView(TextView(this).apply {
+                    text = "Подключите зарядное устройство или потребителя, чтоб вывести батарею из спящего режима"
+                    textSize = 12f
+                    setTextColor(Color.rgb(111, 119, 129))
+                    typeface = interFont(600)
+                }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+            }
+        }
+    }
+
+    private fun refreshBatteryPresenceCard(address: String) {
+        if (screenState != "batteries") return
+        val battery = loadSavedBatteries().firstOrNull {
+            it.address.equals(address, ignoreCase = true)
+        } ?: return
+        val key = normalizeBleAddress(battery.address)
+        val host = batteryCardStatusHosts[key] ?: return
+        val state = resolveBatteryPresence(battery)
+        val previous = batteryCardPresenceByAddress[key]
+        if (previous == state) return
+        batteryCardPresenceByAddress[key] = state
+        fillBatteryPresenceStatus(host, battery, state)
+    }
+
+    private fun refreshAllBatteryPresenceCards() {
+        if (screenState == "batteries") {
+            for (battery in loadSavedBatteries()) {
+                refreshBatteryPresenceCard(battery.address)
+            }
+        }
+        refreshJournalIfPresenceLost()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startBatteriesPresenceScan(resetSeen: Boolean) {
+        if (screenState != "batteries") return
+        if (targetedScanAddress != null) return
+
+        if (!::bluetoothAdapter.isInitialized || !bluetoothAdapter.isEnabled) {
+            batteriesPresenceScanActive = false
+            batteriesPresenceScanCompleted = true
+            if (resetSeen) batteriesSeenInScan.clear()
+            refreshAllBatteryPresenceCards()
+            return
+        }
+        if (!hasBlePermissions()) {
+            batteriesPresenceScanActive = false
+            batteriesPresenceScanCompleted = true
+            if (resetSeen) batteriesSeenInScan.clear()
+            refreshAllBatteryPresenceCards()
+            requestBlePermissions()
+            return
+        }
+
+        val token = ++batteriesPresenceScanToken
+        batteriesPresenceScanActive = true
+        batteriesPresenceScanCompleted = false
+        if (resetSeen) {
+            batteriesSeenInScan.clear()
+        }
+        // Connected BMS already ONLINE without waiting for advertisements.
+        loadSavedBatteries().forEach { battery ->
+            if (isBatteryBleConnected(battery)) {
+                batteriesSeenInScan.add(normalizeBleAddress(battery.address))
+            }
+        }
+        refreshAllBatteryPresenceCards()
+
+        val scanner = bluetoothAdapter.bluetoothLeScanner
+        if (scanner == null) {
+            batteriesPresenceScanActive = false
+            batteriesPresenceScanCompleted = true
+            refreshAllBatteryPresenceCards()
+            return
+        }
+
+        stopBleScanQuietly()
+        try {
+            scanner.startScan(scanCallback)
+            Log.i(BMS_BLE_TAG, "Batteries presence scan started")
+        } catch (e: Exception) {
+            Log.w(BMS_BLE_TAG, "Presence scan failed: ${e.message}")
+            batteriesPresenceScanActive = false
+            batteriesPresenceScanCompleted = true
+            refreshAllBatteryPresenceCards()
+            return
+        }
+
+        // После окна — SLEEPING для ненайденных; scan оставляем для wake-up, пока экран открыт.
+        mainHandler.postDelayed({
+            if (token != batteriesPresenceScanToken) return@postDelayed
+            if (screenState != "batteries") return@postDelayed
+            batteriesPresenceScanCompleted = true
+            Log.i(BMS_BLE_TAG, "Presence scan window done seen=${batteriesSeenInScan.size}")
+            refreshAllBatteryPresenceCards()
+        }, 8000L)
+    }
+
+    private fun stopBatteriesPresenceScan() {
+        batteriesPresenceScanToken++
+        batteriesPresenceScanActive = false
+        if (targetedScanAddress == null && screenState != "search" && screenState != "loading") {
+            stopBleScanQuietly()
+        }
+    }
+
+    private fun onSavedBatterySeenInPresenceScan(address: String, device: BluetoothDevice, rssi: Int, name: String?) {
+        val key = normalizeBleAddress(address)
+        val isSaved = loadSavedBatteries().any { normalizeBleAddress(it.address) == key }
+        if (!isSaved) return
+        devices[address] = device
+        scanRssi[address] = rssi
+        if (!name.isNullOrBlank()) {
+            scanNames[address] = name
+        }
+        val added = batteriesSeenInScan.add(key)
+        if (added || batteryCardPresenceByAddress[key] != BatteryPresenceState.ONLINE) {
+            Log.i(BMS_BLE_TAG, "Presence: saved BMS visible $address")
+            runOnUiThread { refreshBatteryPresenceCard(address) }
+        }
+    }
+
+    /**
+     * Карточка сохранённой батареи на экране «Мои батареи».
+     * Presence: CONNECTED или FOUND IN SCAN → ONLINE; иначе после scan → SLEEPING.
+     */
     private fun savedBatteryCard(battery: SavedBattery): View {
-        val isTest = battery.address == TEST_BATTERY_ADDRESS
-        val connected = !isTest && polling && selectedAddress == battery.address
-        val nearby = scanNames.containsKey(battery.address)
-        val soc = battery.soc
-        val levelColor = when {
-            soc == null -> Color.rgb(111, 119, 129)
-            soc < 25.0 -> Color.rgb(239, 83, 80)
-            soc < 70.0 -> Color.rgb(140, 106, 0)
-            else -> Color.rgb(31, 179, 90)
-        }
-        val levelBg = when {
-            soc == null -> Color.rgb(246, 247, 249)
-            soc < 25.0 -> Color.rgb(255, 240, 240)
-            soc < 70.0 -> Color.rgb(255, 248, 218)
-            else -> Color.rgb(237, 250, 242)
-        }
         val displayName = battery.customName.ifBlank {
             battery.bluetoothName.ifBlank { battery.address }
         }
+        val capacityText = battery.capacityAh
+            ?.takeIf { it > 0.0 }
+            ?.let { "%.0f Ач".format(it) }
+        val presence = resolveBatteryPresence(battery)
+        val key = normalizeBleAddress(battery.address)
+        batteryCardPresenceByAddress[key] = presence
 
         return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            minimumHeight = dp(88)
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
             background = round(
                 Color.WHITE,
                 dp(18),
-                if (connected) redDark else Color.rgb(223, 229, 235),
+                Color.rgb(223, 229, 235),
                 1
             )
             elevation = dp(2).toFloat()
             isClickable = true
             isFocusable = true
 
-            val socBox = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                background = round(levelBg, dp(16), levelColor, 1)
+            val titleRow = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
                 addView(TextView(this@MainActivity).apply {
-                    text = soc?.let { "${it.toInt()}%" } ?: "--"
+                    text = displayName
                     textSize = 16f
-                    setTextColor(levelColor)
-                    typeface = interFont(800)
-                    gravity = Gravity.CENTER
-                })
-                addView(TextView(this@MainActivity).apply {
-                    text = "SOC"
-                    textSize = 10f
-                    letterSpacing = 0.06f
-                    setTextColor(Color.rgb(111, 119, 129))
-                    typeface = interFont(700)
-                    gravity = Gravity.CENTER
-                })
-            }
-            addView(socBox, LinearLayout.LayoutParams(dp(58), dp(58)))
-
-            val main = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                val titleRow = LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    addView(TextView(this@MainActivity).apply {
-                        text = displayName
-                        textSize = 16f
-                        setTextColor(Color.rgb(16, 17, 20))
-                        typeface = interFont(780)
-                        maxLines = 1
-                        ellipsize = TextUtils.TruncateAt.END
-                    }, LinearLayout.LayoutParams(0, -2, 1f))
-                    addView(TextView(this@MainActivity).apply {
-                        text = battery.capacityAh?.let { "%.0f А·ч".format(it) } ?: "-- А·ч"
-                        textSize = 12f
-                        setTextColor(Color.rgb(111, 119, 129))
-                        typeface = interFont(700)
-                    })
-                }
-                addView(titleRow)
-                addView(TextView(this@MainActivity).apply {
-                    text = when {
-                        isTest -> "12 В · тестовые данные"
-                        connected -> "${battery.bluetoothName} · Bluetooth подключен"
-                        nearby -> "${battery.bluetoothName} · доступна рядом"
-                        else -> "${battery.bluetoothName} · связь потеряна"
-                    }
-                    textSize = 12f
-                    setTextColor(Color.rgb(111, 119, 129))
-                    typeface = interFont(650)
+                    setTextColor(Color.rgb(16, 17, 20))
+                    typeface = interFont(780)
                     maxLines = 1
                     ellipsize = TextUtils.TruncateAt.END
-                }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(3) })
+                }, LinearLayout.LayoutParams(0, -2, 1f).apply {
+                    rightMargin = dp(8)
+                })
                 addView(TextView(this@MainActivity).apply {
-                    text = when {
-                        isTest -> "✓  Тестовый режим"
-                        connected -> "✓  Батарея подключена"
-                        soc != null && soc < 25.0 -> "!  Низкий заряд"
-                        nearby -> "•  Доступна для подключения"
-                        else -> "−  Не в сети"
-                    }
-                    textSize = 11f
-                    setTextColor(
-                        when {
-                            isTest -> redDark
-                            connected -> Color.rgb(31, 179, 90)
-                            soc != null && soc < 25.0 -> Color.rgb(239, 83, 80)
-                            nearby -> redDark
-                            else -> Color.rgb(111, 119, 129)
-                        }
-                    )
-                    typeface = interFont(760)
-                    setPadding(dp(10), dp(6), dp(10), dp(6))
-                    background = round(levelBg, dp(13), Color.TRANSPARENT, 0)
-                }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(8) })
-            }
-            addView(main, LinearLayout.LayoutParams(0, -2, 1f).apply {
-                leftMargin = dp(12)
-            })
-
-            val linkColor = when {
-                isTest -> redDark
-                connected -> Color.rgb(31, 179, 90)
-                else -> Color.rgb(111, 119, 129)
-            }
-            addView(LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                addView(BatteryIconView(this@MainActivity, linkColor, 17f).apply {
-                    background = round(
-                        Color.rgb(246, 247, 249),
-                        dp(10),
-                        Color.rgb(223, 229, 235),
-                        1
-                    )
-                }, LinearLayout.LayoutParams(dp(30), dp(30)))
-                addView(TextView(this@MainActivity).apply {
-                    text = "›"
-                    textSize = 22f
-                    gravity = Gravity.CENTER
+                    text = capacityText ?: "— Ач"
+                    textSize = 14f
                     setTextColor(Color.rgb(111, 119, 129))
-                }, LinearLayout.LayoutParams(dp(30), dp(24)))
-            }, LinearLayout.LayoutParams(dp(34), -1))
+                    typeface = interFont(700)
+                    gravity = Gravity.END
+                    maxLines = 1
+                }, LinearLayout.LayoutParams(-2, -2))
+            }
+            addView(titleRow, LinearLayout.LayoutParams(-1, -2))
+
+            val status = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+            }
+            fillBatteryPresenceStatus(status, battery, presence)
+            batteryCardStatusHosts[key] = status
+            addView(status, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
 
             setOnClickListener {
-                if (isTest) {
+                if (battery.address == TEST_BATTERY_ADDRESS) {
                     openTestBattery(battery, displayName)
-                } else if (connected) {
+                } else if (isBatteryBleConnected(battery)) {
                     selectedDeviceName = displayName
                     showDashboardScreen(asRootHome = true)
                 } else {
@@ -1682,6 +1821,17 @@ class MainActivity : ComponentActivity() {
                 showRenameBatteryDialog(battery)
                 true
             }
+        }
+    }
+
+    /** Перерисовать список, если открыт экран «Мои батареи». */
+    private fun refreshBatteriesScreenIfVisible() {
+        if (screenState != "batteries") return
+        val refresh = { showBatteriesScreen() }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            refresh()
+        } else {
+            runOnUiThread { refresh() }
         }
     }
 
@@ -1739,22 +1889,164 @@ class MainActivity : ComponentActivity() {
             toast("Разрешите доступ к Bluetooth и повторите подключение")
             return
         }
-        val device = try {
-            bluetoothAdapter.getRemoteDevice(battery.address)
-        } catch (_: Exception) {
-            null
-        }
-        if (device == null) {
-            toast("Не удалось открыть сохранённое устройство")
+        // Сохранённый идентификатор — BLE MAC (device.address), без новой схемы ID.
+        val address = battery.address.trim()
+        if (address.isBlank() || address == TEST_BATTERY_ADDRESS) {
+            toast("Некорректный Bluetooth ID батареи")
             return
         }
-        devices[battery.address] = device
-        selectedAddress = battery.address
+        Log.i(BMS_BLE_TAG, "Saved device ID: $address")
+        try {
+            devices[address] = bluetoothAdapter.getRemoteDevice(address)
+        } catch (_: Exception) {
+            // Device object may still appear from targeted scan advertising.
+        }
+        selectedAddress = address
         selectedDeviceName = displayName
         returnToBatteriesAfterConnect = false
         clearUiBackStack()
         showLoadingScreen("Идёт инициализация BMS")
-        connectSelectedDevice()
+        startTargetedScanForSavedBattery(address)
+    }
+
+    /**
+     * Ищет в эфире только сохранённую BMS по MAC.
+     * Если BLE-модуль не рекламируется (глубокий сон) — батарея остаётся в списке как sleeping.
+     */
+    @SuppressLint("MissingPermission")
+    private fun startTargetedScanForSavedBattery(address: String) {
+        stopBatteriesPresenceScan()
+        stopBleScanQuietly()
+        cancelWakeSequence()
+        val token = ++targetedScanToken
+        targetedScanAddress = address
+        Log.i(BMS_BLE_TAG, "Starting targeted scan for $address")
+
+        val scanner = bluetoothAdapter.bluetoothLeScanner
+        if (scanner == null) {
+            Log.w(BMS_BLE_TAG, "BLE scanner unavailable")
+            targetedScanAddress = null
+            runOnUiThread {
+                toast("BLE scanner недоступен. Проверьте Bluetooth.")
+                showBatteriesScreen(asRootHome = true)
+            }
+            return
+        }
+
+        val filter = try {
+            ScanFilter.Builder().setDeviceAddress(address).build()
+        } catch (e: IllegalArgumentException) {
+            Log.w(BMS_BLE_TAG, "Invalid saved MAC for filter: $address (${e.message})")
+            null
+        }
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        try {
+            if (filter != null) {
+                scanner.startScan(listOf(filter), settings, scanCallback)
+            } else {
+                scanner.startScan(scanCallback)
+            }
+        } catch (e: Exception) {
+            Log.w(BMS_BLE_TAG, "targeted scan start failed: ${e.message}")
+            targetedScanAddress = null
+            runOnUiThread {
+                toast("Не удалось начать поиск BMS")
+                showBatteriesScreen(asRootHome = true)
+            }
+            return
+        }
+
+        mainHandler.postDelayed({
+            if (token != targetedScanToken) return@postDelayed
+            if (targetedScanAddress == null) return@postDelayed
+            Log.i(BMS_BLE_TAG, "Saved BMS not found during scan")
+            Log.i(BMS_BLE_TAG, "BMS considered sleeping/offline")
+            stopBleScanQuietly()
+            targetedScanAddress = null
+            runOnUiThread {
+                if (screenState == "loading") {
+                    toast("Батарея находится в спящем режиме")
+                    showBatteriesScreen(asRootHome = true)
+                }
+            }
+        }, TARGETED_SCAN_TIMEOUT_MS)
+    }
+
+    private fun cancelTargetedScan() {
+        targetedScanToken++
+        targetedScanAddress = null
+        stopBleScanQuietly()
+    }
+
+    private fun cancelWakeSequence() {
+        wakeToken++
+        wakeInProgress = false
+        wakeAttempt = 0
+    }
+
+    /**
+     * Пробуждение MCU Daly безопасным чтением 0x90 (напряжение/ток/SOC).
+     * Без записи настроек / MOS / SOC / reset.
+     * Вызывать только после Notifications/CCCD ready.
+     */
+    @SuppressLint("MissingPermission")
+    private fun startBmsWakeSequence() {
+        cancelWakeSequence()
+        wakeInProgress = true
+        val token = ++wakeToken
+        wakeAttempt = 0
+        Log.i(BMS_WAKE_TAG, "Starting wake/read sequence")
+        sendWakeReadAttempt(token)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun sendWakeReadAttempt(token: Int) {
+        if (token != wakeToken || !wakeInProgress) return
+        if (!polling || bluetoothGatt == null || writeCharacteristic == null) {
+            cancelWakeSequence()
+            return
+        }
+        wakeAttempt++
+        if (wakeAttempt > WAKE_MAX_ATTEMPTS) {
+            Log.w(BMS_WAKE_TAG, "No response after $WAKE_MAX_ATTEMPTS attempts — start normal poll")
+            finishWakeSequence(gotResponse = false)
+            return
+        }
+        val frame = buildRequest(0x90)
+        Log.i(
+            BMS_WAKE_TAG,
+            "Sending wake/read request #$wakeAttempt: ${bytesToHex(frame)}"
+        )
+        val ok = writeBleFrame(frame)
+        if (!ok) {
+            Log.w(BMS_WAKE_TAG, "wake write failed attempt=$wakeAttempt")
+        }
+        val delay = WAKE_RETRY_DELAYS_MS.getOrElse(wakeAttempt - 1) { 500L }
+        mainHandler.postDelayed({
+            if (token != wakeToken || !wakeInProgress) return@postDelayed
+            Log.i(BMS_WAKE_TAG, "No response")
+            sendWakeReadAttempt(token)
+        }, delay)
+    }
+
+    private fun onWakeResponseReceived() {
+        if (!wakeInProgress) return
+        Log.i(BMS_WAKE_TAG, "Response received")
+        Log.i(BMS_BLE_TAG, "BMS ONLINE")
+        finishWakeSequence(gotResponse = true)
+    }
+
+    private fun finishWakeSequence(gotResponse: Boolean) {
+        wakeInProgress = false
+        wakeToken++
+        if (!polling) return
+        startRemoteWritePolling()
+        mainHandler.postDelayed({
+            if (polling) pollOnce()
+        }, if (gotResponse) 120L else 300L)
     }
 
     private fun removeTestBatteryIfPresent() {
@@ -2680,9 +2972,10 @@ class MainActivity : ComponentActivity() {
             typeface = interFont(760)
         }
         overallStatusSub = TextView(this).apply {
-            text = "Все параметры в пределах нормы"
+            text = ""
             textSize = 12f
             setTextColor(Color.rgb(111, 119, 129))
+            visibility = View.GONE
         }
         overallStatusBanner?.addView(overallStatusTitle)
         overallStatusBanner?.addView(
@@ -2691,7 +2984,10 @@ class MainActivity : ComponentActivity() {
         )
         overallStatusBanner?.isClickable = true
         overallStatusBanner?.isFocusable = true
-        overallStatusBanner?.setOnClickListener { showConfigCheckScreen() }
+        overallStatusBanner?.setOnClickListener {
+            // Единый экран Диагностики (маршрут Поддержка → Диагностика).
+            showSupportDiagnostics()
+        }
         content.addView(overallStatusBanner, marginLp(-1, -2, 0, 0, 0, 4))
 
         scroll.addView(content)
@@ -2773,6 +3069,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun enterScreen(newState: String, track: Boolean = true) {
+        val previous = screenState
         if (track && !navigatingBack) {
             val prev = screenState
             if (prev != newState && isTrackableScreen(prev)) {
@@ -2783,6 +3080,12 @@ class MainActivity : ComponentActivity() {
             }
         }
         screenState = newState
+        if (previous == "batteries" && newState != "batteries") {
+            stopBatteriesPresenceScan()
+        }
+        if (previous.startsWith("qr") && !newState.startsWith("qr")) {
+            stopQrCamera()
+        }
     }
 
     /** Текущая выбранная АКБ, если она ещё есть в сохранённом списке. */
@@ -2829,7 +3132,13 @@ class MainActivity : ComponentActivity() {
         when (state) {
             "batteries" -> showBatteriesScreen()
             "dashboard" -> showDashboardScreen()
-            "journal" -> showJournalScreen()
+            "journal" -> {
+                if (resolveCurrentBmsPresence() == BatteryPresenceState.ONLINE) {
+                    showJournalScreen()
+                } else {
+                    goHomeFromMenu()
+                }
+            }
             "support" -> showSupportScreen()
             "profile" -> showProfileScreen()
             "manage" -> showManageScreen()
@@ -2863,6 +3172,23 @@ class MainActivity : ComponentActivity() {
             "dashboard" -> {
                 openBatteriesListFromDashboard()
                 return true
+            }
+            "support" -> {
+                // Просмотр/редактирование обращения → Диагностика (не Главная).
+                if (supportMode == "edit") {
+                    editingWarrantyLocalId = null
+                    clearWarrantyFormState()
+                    supportMode = "home"
+                    showSupportDiagnostics()
+                    return true
+                }
+                if (supportMode == "new" || supportMode == "list") {
+                    editingWarrantyLocalId = null
+                    clearWarrantyFormState()
+                    supportMode = "home"
+                    showSupportScreen()
+                    return true
+                }
             }
         }
 
@@ -3002,11 +3328,24 @@ class MainActivity : ComponentActivity() {
                     if (screenState == "qtc") return@setOnClickListener
                     showQtcScreen()
                 } else if (text.contains("Управление") || text.contains("Настройки")) {
+                    // Пункт скрыт из нижнего меню клиента; route/логика Settings сохранена.
                     if (screenState == "manage") return@setOnClickListener
                     showManageScreen()
+                } else if (text.contains("QR")) {
+                    if (screenState == "qr_input" || screenState == "qr_scan" || screenState == "qr_result") {
+                        return@setOnClickListener
+                    }
+                    showQrInputScreen()
                 } else if (text.contains("Журнал")) {
-                    if (screenState == "journal") return@setOnClickListener
-                    showJournalScreen()
+                    if (screenState == "journal") {
+                        if (resolveCurrentBmsPresence() == BatteryPresenceState.ONLINE) {
+                            return@setOnClickListener
+                        }
+                        // Не оставляем «выбранным» журнал, если BMS уже неактивна.
+                        openJournalIfAllowed()
+                        return@setOnClickListener
+                    }
+                    openJournalIfAllowed()
                 } else if (text.contains("Поддержка") || text.contains("Техподдержка")) {
                     if (screenState == "support" && supportMode == "home") return@setOnClickListener
                     supportMode = "home"
@@ -3034,7 +3373,8 @@ class MainActivity : ComponentActivity() {
                 navItem(this, "●\nПрофиль", selectedTab == "profile")
             } else {
                 navItem(this, "≡\nЖурнал", selectedTab == "journal")
-                navItem(this, "⚙\nНастройки", selectedTab == "manage")
+                // Вместо «Настройки»: существующий QR-экран (showQrInputScreen).
+                navItem(this, "▦\nQR-код", selectedTab == "qr")
                 navItem(this, "☎\nПоддержка", selectedTab == "support")
                 navItem(this, "●\nПрофиль", selectedTab == "profile")
             }
@@ -3594,14 +3934,14 @@ class MainActivity : ComponentActivity() {
         return resolvedSeriesCount() ?: if (serviceTemplateKey == "24v") 8 else 4
     }
 
-    /** Клиент: записать только writable-параметры шаблона, которые не совпадают. */
+    /** Клиент: записать только writable MISMATCH параметры шаблона (не READ_FAILED/missing). */
     private fun startClientTemplateApply() {
         if (serviceWriteActive) {
             toast("Запись уже выполняется")
             return
         }
         if (bluetoothGatt == null || writeCharacteristic == null) {
-            toast("Подключите BMS по Bluetooth")
+            toast("Нет подключения к BMS")
             return
         }
         toast("Получаем актуальный шаблон с сервера…")
@@ -3631,29 +3971,20 @@ class MainActivity : ComponentActivity() {
         serviceWriteCapacityAh = null
         serviceWriteRetryRound = 0
         clientTemplateApplyMode = true
-        Log.i(
-            BLE_LOG_TAG,
-            "CONFIG TEMPLATE client apply id=${template.id} version=${template.version} series=$series family=$family"
-        )
+        Log.i(BLE_LOG_TAG, "CONFIG FIX START id=${template.id} version=${template.version} series=$series family=$family")
         for (parameter in orderedTemplateParameters(template.parameters)) {
             if (!parameter.writable) continue
+            if (!parameter.enabled) continue
             if (shouldSkipTemplateParameter(parameter, family)) continue
+            if (parameter.key == "series_cell_count") continue
             val expected = parameter.expected ?: parameter.expectedBySeries[series] ?: continue
-            if (parameter.key == "series_cell_count") {
-                if (data.cellCount == expected.toInt()) {
-                    upsertServiceWriteResult(
-                        ServiceWriteResult(
-                            key = parameter.key,
-                            label = parameter.label,
-                            expected = expected,
-                            actual = data.cellCount?.toDouble(),
-                            unit = parameter.unit,
-                            ok = true
-                        )
-                    )
-                } else {
-                    id = enqueueSeriesCountWrite(queue, expected.toInt(), id)
-                }
+            val actual = templateParameterActual(parameter)
+            // READ_FAILED / missing: actual неизвестен — не пишем.
+            if (!templateParameterHasActual(parameter) || actual == null) {
+                Log.i(
+                    BLE_LOG_TAG,
+                    "CONFIG FIX SKIP ${parameter.key}: no actual (READ_FAILED/missing)"
+                )
                 continue
             }
             if (templateParameterMatches(parameter, expected)) {
@@ -3662,18 +3993,18 @@ class MainActivity : ComponentActivity() {
                         key = parameter.key,
                         label = parameter.label,
                         expected = expected,
-                        actual = templateParameterActual(parameter),
+                        actual = actual,
                         unit = parameter.unit,
                         ok = true
                     )
                 )
                 continue
             }
-            val command = templateParameterWriteCommand(id, parameter, expected) ?: continue
             Log.i(
                 BLE_LOG_TAG,
-                "PARAM ${parameter.key} expected=$expected ${parameter.unit} client enqueue write"
+                "CONFIG FIX parameter=${parameter.key} actual=$actual expected=$expected ${parameter.unit}"
             )
+            val command = templateParameterWriteCommand(id, parameter, expected) ?: continue
             queue.add(command)
             id++
         }
@@ -3687,17 +4018,26 @@ class MainActivity : ComponentActivity() {
                 if (serviceWriteResults.isEmpty()) "Нет параметров для записи"
                 else "Все параметры уже совпадают, запись не нужна"
             )
-            showConfigCheckScreen()
+            refreshDiagnosticsScreenAfterClientFix()
             return
         }
         serviceWriteQueue = queue
         serviceWriteTotal = queue.size
         serviceWriteDone = 0
         serviceWriteActive = true
-        toast("Запись ${queue.size} параметр(ов) по шаблону…")
-        showConfigCheckScreen()
+        toast("Исправляем конфигурацию…")
+        refreshDiagnosticsScreenAfterClientFix()
         val first = serviceWriteQueue.poll()
         if (first != null) startRemoteWrite(first)
+    }
+
+    /** Обновить открытый экран Диагностики после client fix. */
+    private fun refreshDiagnosticsScreenAfterClientFix() {
+        when (screenState) {
+            "support_diagnostics" -> showSupportDiagnostics()
+            "config_check" -> showConfigCheckScreen()
+            else -> showConfigCheckScreen()
+        }
     }
 
     private fun startServiceTemplateWrite() {
@@ -3746,6 +4086,11 @@ class MainActivity : ComponentActivity() {
             serviceWriteProgressBar?.visibility = if (serviceWriteActive) View.VISIBLE else View.GONE
             serviceWriteProgressText?.text = "Запись шаблона $percent%"
             serviceWriteProgressText?.visibility = if (serviceWriteActive) View.VISIBLE else View.GONE
+            if (clientTemplateApplyMode &&
+                (screenState == "config_check" || screenState == "support_diagnostics")
+            ) {
+                refreshDiagnosticsScreenAfterClientFix()
+            }
         }
     }
 
@@ -4162,15 +4507,16 @@ class MainActivity : ComponentActivity() {
         clientTemplateApplyMode = false
         val failed = serviceWriteResults.count { !it.ok }
         if (clientMode) {
+            Log.i(BLE_LOG_TAG, "CONFIG FIX END failed=$failed total=${serviceWriteResults.size}")
             if (serviceWriteResults.isNotEmpty() && failed == 0) {
-                toast("Настройка BMS завершена. Все параметры записаны и проверены.")
+                toast("Конфигурация исправлена")
             } else if (failed > 0) {
-                toast("Настройка BMS не завершена. Не подтверждено: $failed")
+                toast("Не все параметры удалось исправить")
             } else {
                 toast("Запись завершена")
             }
             if (screenState == "dashboard") updateDashboardUi()
-            showConfigCheckScreen()
+            refreshDiagnosticsScreenAfterClientFix()
             return
         }
         uploadServiceReport()
@@ -5682,7 +6028,7 @@ class MainActivity : ComponentActivity() {
         }
         // Тот же presentation-слой, что и Поддержка → Диагностика.
         appendDiagnosticsConfigPresentation(content)
-        appendClientTemplateApplyActions(content)
+        appendDiagnosticsActionButtons(content)
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         root.addView(fixedBottomNav("main"), LinearLayout.LayoutParams(-1, dp(70)))
@@ -5690,61 +6036,88 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Клиентская запись отличающихся параметров шаблона.
-     * Показывается только на экране с Главной (не дублируется в Поддержка → Диагностика).
-     *
-     * @param content контейнер экрана диагностики
-     * Side effects: добавляет UI; по клику запускает startClientTemplateApply().
+     * Кнопки Диагностики: «Исправить» при writable MISMATCH, иначе «ОК» → Главная.
+     * Использует существующий startClientTemplateApply() / WRITE→READBACK→VERIFY.
      */
-    private fun appendClientTemplateApplyActions(content: LinearLayout) {
+    private fun appendDiagnosticsActionButtons(content: LinearLayout) {
         val result = currentTemplateCheck()
+        if (result == null ||
+            result.status == "checking" ||
+            result.status == "unavailable" ||
+            serverTemplateFetchStatus == "fetching"
+        ) {
+            return
+        }
+
+        if (serviceWriteActive && clientTemplateApplyMode) {
+            content.addView(TextView(this).apply {
+                text = "Исправляем конфигурацию…  $serviceWriteDone / $serviceWriteTotal"
+                textSize = 15f
+                typeface = interFont(700)
+                setTextColor(Color.rgb(16, 17, 20))
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(14), dp(12), dp(14))
+                background = round(Color.rgb(241, 243, 245), dp(14), Color.rgb(223, 229, 235), 1)
+            }, marginLp(-1, -2, 0, 14, 0, 8))
+            return
+        }
+
         val writableKeys = activeServerTemplate?.parameters
             ?.filter { it.writable && it.enabled }
             ?.map { it.key }
             ?.toSet()
             .orEmpty()
-        val writableMismatches = (result?.items
-            ?.filter { it.status == "mismatch" || it.status == "missing" }
-            .orEmpty()
-            .ifEmpty { result?.mismatches.orEmpty() + result?.missing.orEmpty() })
-            .filter { writableKeys.isEmpty() || it.key in writableKeys }
-        val canApply = !isServiceApp() &&
-            activeServerTemplate != null &&
-            result?.status in setOf("mismatch", "incomplete") &&
-            writableMismatches.isNotEmpty() &&
-            bluetoothGatt != null &&
-            !serviceWriteActive
+        val mismatchItems = (if (result.items.isNotEmpty()) result.items else result.mismatches)
+            .filter {
+                it.status == "mismatch" &&
+                    !isHiddenDiagnosticsParamKey(it.key) &&
+                    (writableKeys.isEmpty() || it.key in writableKeys)
+            }
+        val hasWritableMismatch = mismatchItems.isNotEmpty()
 
-        if (serviceWriteActive && clientTemplateApplyMode) {
+        if (hasWritableMismatch) {
             content.addView(TextView(this).apply {
-                text = "Идёт запись параметров: $serviceWriteDone / $serviceWriteTotal"
-                textSize = 14f
-                typeface = interFont(700)
-                setTextColor(Color.rgb(16, 17, 20))
-                setPadding(dp(4), dp(8), dp(4), dp(10))
-            })
+                text = "Исправить"
+                textSize = 16f
+                typeface = interFont(780)
+                setTextColor(Color.WHITE)
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(14), dp(12), dp(14))
+                background = round(
+                    if (!serviceWriteActive) red else Color.rgb(160, 160, 160),
+                    dp(14),
+                    Color.TRANSPARENT,
+                    0
+                )
+                isEnabled = !serviceWriteActive
+                isClickable = !serviceWriteActive
+                isFocusable = !serviceWriteActive
+                setOnClickListener {
+                    if (bluetoothGatt == null || writeCharacteristic == null) {
+                        toast("Нет подключения к BMS")
+                        return@setOnClickListener
+                    }
+                    startClientTemplateApply()
+                }
+            }, marginLp(-1, -2, 0, 14, 0, 8))
             return
         }
-        if (!canApply) return
 
+        // Нет writable MISMATCH — кнопка ОК на Главную текущей BMS.
         content.addView(TextView(this).apply {
-            text = "Настроить BMS"
+            text = "ОК"
             textSize = 16f
-            typeface = interFont(760)
-            setTextColor(Color.WHITE)
+            typeface = interFont(780)
+            setTextColor(Color.rgb(16, 17, 20))
             gravity = Gravity.CENTER
             setPadding(dp(12), dp(14), dp(12), dp(14))
             background = round(red, dp(14), Color.TRANSPARENT, 0)
             isClickable = true
             isFocusable = true
-            setOnClickListener { startClientTemplateApply() }
-        }, marginLp(-1, -2, 0, dp(8), 0, 12))
-        content.addView(TextView(this).apply {
-            text = "Будут записаны только отличающиеся параметры шаблона. После каждой записи выполняется повторное чтение."
-            textSize = 12f
-            setTextColor(Color.rgb(111, 119, 129))
-            setPadding(dp(4), 0, dp(4), dp(12))
-        })
+            setOnClickListener {
+                showDashboardScreen(asRootHome = true)
+            }
+        }, marginLp(-1, -2, 0, 14, 0, 8))
     }
 
     private fun String.trimTrailingZeros(): String {
@@ -6395,9 +6768,13 @@ class MainActivity : ComponentActivity() {
                 background = round(if (selected) red else Color.WHITE, dp(14), red, dp(1))
                 setOnClickListener {
                     // Повторный тап по уже выбранному режиму возвращает в базовое состояние.
-                    supportMode = if (supportMode == mode) "home" else mode
+                    val next = if (supportMode == mode) "home" else mode
+                    supportMode = next
                     if (supportMode == "new") {
                         editingWarrantyLocalId = null
+                    }
+                    if (supportMode == "list") {
+                        warrantyListPage = 1
                     }
                     if (supportMode == "home") {
                         editingWarrantyLocalId = null
@@ -6418,6 +6795,12 @@ class MainActivity : ComponentActivity() {
         c.addView(sectionTitle("Ваши обращения", ""))
         warrantyListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         c.addView(warrantyListLayout)
+        warrantyPaginationRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+        }
+        c.addView(warrantyPaginationRow, marginLp(-1, -2, 0, 8, 0, 0))
         content.addView(c, marginLp(-1, -2, 0, 0, 0, 10))
         renderWarrantyListItems()
     }
@@ -6425,43 +6808,129 @@ class MainActivity : ComponentActivity() {
     private fun renderWarrantyListItems() {
         val layout = warrantyListLayout ?: return
         layout.removeAllViews()
-        val arr = warrantyRequestsArray()
         val uid = bmsUid()
+        val arr = warrantyRequestsArray()
 
-        val items = mutableListOf<JSONObject>()
+        if (warrantyListLoading) {
+            layout.addView(TextView(this).apply {
+                text = "Загрузка обращений…"
+                textSize = 14f
+                setTextColor(Color.rgb(100, 100, 100))
+                setPadding(0, dp(8), 0, dp(8))
+            })
+            updateWarrantyPaginationControls()
+            return
+        }
+
+        // Текущая страница с сервера (уже смержена в локальный кэш с пометкой page_item).
+        val pageItems = mutableListOf<JSONObject>()
         for (i in 0 until arr.length()) {
             val item = arr.optJSONObject(i) ?: continue
             val itemUid = item.optString("bms_uid")
-            if (itemUid.isBlank() || itemUid == uid) items.add(item)
+            if (itemUid.isNotBlank() && itemUid != uid) continue
+            if (item.optBoolean("list_page_item", false)) {
+                pageItems.add(item)
+            }
         }
-
-        items.sortWith(compareByDescending<JSONObject> {
+        pageItems.sortWith(compareByDescending<JSONObject> {
             it.optString("server_id").toIntOrNull() ?: 0
         }.thenByDescending {
             it.optString("created_at")
         })
 
-        if (items.isEmpty()) {
+        // Локальные неотправленные черновики — только на первой странице.
+        val drafts = mutableListOf<JSONObject>()
+        if (warrantyListPage <= 1) {
+            for (i in 0 until arr.length()) {
+                val item = arr.optJSONObject(i) ?: continue
+                val itemUid = item.optString("bms_uid")
+                if (itemUid.isNotBlank() && itemUid != uid) continue
+                if (item.optString("server_id").isBlank()) {
+                    drafts.add(item)
+                }
+            }
+            drafts.sortByDescending { it.optString("created_at") }
+        }
+
+        val items = drafts + pageItems
+
+        if (items.isEmpty() && warrantyListTotal <= 0) {
             layout.addView(TextView(this).apply {
                 text = "Обращений пока нет. Выберите «Новое обращение», чтобы создать заявку."
                 textSize = 14f
-                setTextColor(Color.rgb(100,100,100))
+                setTextColor(Color.rgb(100, 100, 100))
                 setPadding(0, dp(8), 0, dp(8))
             })
+            updateWarrantyPaginationControls()
             return
         }
 
         layout.addView(TextView(this).apply {
-            text = "Всего обращений по этой BMS: ${items.size}"
+            text = "Всего обращений по этой BMS: ${max(warrantyListTotal, items.size)}"
             textSize = 13f
             typeface = interFont(700)
-            setTextColor(Color.rgb(90,90,90))
+            setTextColor(Color.rgb(90, 90, 90))
             setPadding(0, 0, 0, dp(8))
         })
 
         for (item in items) {
             layout.addView(warrantyRequestCard(item), marginLp(-1, -2, 0, 0, 0, 10))
         }
+        updateWarrantyPaginationControls()
+    }
+
+    /**
+     * Пагинация списка обращений: ← Назад / N / M / Далее →.
+     * Side effects: меняет warrantyListPage и запускает refreshWarrantyStatuses.
+     */
+    private fun updateWarrantyPaginationControls() {
+        val row = warrantyPaginationRow ?: return
+        row.removeAllViews()
+        if (warrantyListTotalPages <= 1 && warrantyListTotal <= WARRANTY_PAGE_SIZE) {
+            row.visibility = View.GONE
+            return
+        }
+        row.visibility = View.VISIBLE
+        val page = warrantyListPage.coerceIn(1, max(1, warrantyListTotalPages))
+        warrantyListPage = page
+
+        fun pageBtn(label: String, enabled: Boolean, onClick: () -> Unit): TextView {
+            return TextView(this).apply {
+                text = label
+                textSize = 14f
+                typeface = interFont(700)
+                gravity = Gravity.CENTER
+                setTextColor(if (enabled) redDark else Color.rgb(160, 160, 160))
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+                background = round(Color.WHITE, dp(10), if (enabled) red else Color.rgb(220, 220, 220), 1)
+                isEnabled = enabled
+                isClickable = enabled
+                isFocusable = enabled
+                if (enabled) setOnClickListener { onClick() }
+            }
+        }
+
+        row.addView(
+            pageBtn("← Назад", page > 1 && !warrantyListLoading) {
+                warrantyListPage = page - 1
+                refreshWarrantyStatuses(false)
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
+        row.addView(TextView(this).apply {
+            text = "$page / ${max(1, warrantyListTotalPages)}"
+            textSize = 14f
+            typeface = interFont(700)
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(60, 60, 60))
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        row.addView(
+            pageBtn("Далее →", page < warrantyListTotalPages && !warrantyListLoading) {
+                warrantyListPage = page + 1
+                refreshWarrantyStatuses(false)
+            },
+            LinearLayout.LayoutParams(0, -2, 1f)
+        )
     }
 
     private fun warrantyRequestCard(item: JSONObject): LinearLayout {
@@ -6472,18 +6941,36 @@ class MainActivity : ComponentActivity() {
         }
 
         val serverId = item.optString("server_id").ifBlank { "не отправлено" }
-        val status = item.optString("status").ifBlank { "draft" }
-        val title = if (serverId == "не отправлено") "Локальный черновик" else "Обращение №$serverId"
-        c.addView(TextView(this).apply {
+        val status = item.optString("status").ifBlank { "new" }
+        val title = if (serverId == "не отправлено") "Локальный черновик" else "№$serverId"
+        val statusLabel = warrantyStatusRu(status)
+        val statusColor = warrantyStatusColor(status)
+
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        headerRow.addView(TextView(this).apply {
             text = title
             textSize = 16f
             typeface = interFont(700)
-            setTextColor(Color.rgb(35,35,35))
-        })
+            setTextColor(Color.rgb(35, 35, 35))
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        headerRow.addView(TextView(this).apply {
+            text = statusLabel
+            textSize = 14f
+            typeface = interFont(750)
+            setTextColor(statusColor)
+            gravity = Gravity.END
+            setPadding(dp(8), 0, 0, 0)
+        }, LinearLayout.LayoutParams(-2, -2))
+        c.addView(headerRow)
+
         c.addView(TextView(this).apply {
             val comment = item.optString("admin_comment").trim()
             text = buildString {
-                append("Статус: ${warrantyStatusRu(status)}\n")
                 append("Дата: ${item.optString("created_at")}\n")
                 append("BMS: ${item.optString("bms_uid")}\n")
                 append("Модель: ${item.optString("model")}\n")
@@ -6491,7 +6978,7 @@ class MainActivity : ComponentActivity() {
                 if (comment.isNotBlank()) append("\nОтвет: ${comment.take(160)}")
             }
             textSize = 13f
-            setTextColor(Color.rgb(80,80,80))
+            setTextColor(Color.rgb(80, 80, 80))
             setPadding(0, dp(6), 0, dp(8))
         })
 
@@ -6521,11 +7008,12 @@ class MainActivity : ComponentActivity() {
         formCard.addView(sectionTitle(if (existing == null) "Новое гарантийное обращение" else "Обращение №${existing.optString("server_id").ifBlank { "черновик" }}", ""))
 
         if (existing != null) {
+            val status = existing.optString("status")
             formCard.addView(TextView(this).apply {
-                text = "Статус: ${warrantyStatusRu(existing.optString("status"))}"
+                text = warrantyStatusRu(status)
                 textSize = 15f
                 typeface = interFont(700)
-                setTextColor(if (existing.optString("status") == "done") green else red)
+                setTextColor(warrantyStatusColor(status))
                 setPadding(0, 0, 0, dp(8))
             })
         }
@@ -6533,7 +7021,7 @@ class MainActivity : ComponentActivity() {
         formCard.addView(TextView(this).apply {
             text = "При отправке приложение приложит текущие логи, ошибки и параметры АКБ, если BMS подключена."
             textSize = 13f
-            setTextColor(Color.rgb(90,90,90))
+            setTextColor(Color.rgb(90, 90, 90))
             setPadding(0, 0, 0, dp(8))
         })
 
@@ -6559,31 +7047,44 @@ class MainActivity : ComponentActivity() {
         warrantyProblemEdit?.gravity = Gravity.TOP or Gravity.START
         formCard.addView(warrantyProblemEdit, marginLp(-1, dp(120), 0, 8, 0, 0))
 
-        val mediaButton = TextView(this).apply {
-            text = "＋ Прикрепить фото (необязательно)"
-            textSize = 15f
+        val mediaRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        mediaRow.addView(TextView(this).apply {
+            text = "Сделать фото"
+            textSize = 14f
             typeface = interFont(700)
             setTextColor(Color.rgb(16, 17, 20))
             gravity = Gravity.CENTER
-            setPadding(dp(10), dp(12), dp(10), dp(12))
+            setPadding(dp(8), dp(12), dp(8), dp(12))
+            background = round(Color.WHITE, dp(12), Color.rgb(202, 211, 220), 1)
+            setOnClickListener { takeWarrantyPhoto() }
+        }, LinearLayout.LayoutParams(0, -2, 1f))
+        mediaRow.addView(TextView(this).apply {
+            text = "Из галереи"
+            textSize = 14f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(16, 17, 20))
+            gravity = Gravity.CENTER
+            setPadding(dp(8), dp(12), dp(8), dp(12))
             background = round(Color.WHITE, dp(12), Color.rgb(202, 211, 220), 1)
             setOnClickListener { pickWarrantyMedia() }
-        }
-        formCard.addView(mediaButton, marginLp(-1, -2, 0, 10, 0, 0))
+        }, marginLp(0, -2, 8, 0, 0, 0).apply { weight = 1f })
+        formCard.addView(mediaRow, marginLp(-1, -2, 0, 10, 0, 0))
 
-        warrantyMediaText = TextView(this).apply {
-            text = "Файлы не выбраны"
+        formCard.addView(TextView(this).apply {
+            text = "Прикреплённые файлы"
             textSize = 13f
-            setTextColor(Color.rgb(100,100,100))
-            setPadding(0, dp(6), 0, dp(6))
-        }
-        formCard.addView(warrantyMediaText)
+            typeface = interFont(700)
+            setTextColor(Color.rgb(90, 90, 90))
+            setPadding(0, dp(4), 0, dp(4))
+        })
+        warrantyMediaListLayout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        formCard.addView(warrantyMediaListLayout)
 
         val consent = CheckBox(this).apply {
             text = "Согласен на обработку персональных данных"
             textSize = 12f
             setTextColor(Color.rgb(111, 119, 129))
-            buttonTintList = android.content.res.ColorStateList.valueOf(redDark)
+            buttonTintList = ColorStateList.valueOf(redDark)
         }
         formCard.addView(consent, marginLp(-1, -2, 0, 8, 0, 0))
 
@@ -6608,7 +7109,7 @@ class MainActivity : ComponentActivity() {
         warrantyStatusText = TextView(this).apply {
             text = existing?.let { "Текущий статус: ${warrantyStatusRu(it.optString("status"))}" } ?: ""
             textSize = 13f
-            setTextColor(Color.rgb(90,90,90))
+            setTextColor(Color.rgb(90, 90, 90))
         }
         formCard.addView(warrantyStatusText)
 
@@ -6637,6 +7138,7 @@ class MainActivity : ComponentActivity() {
         // Клиентская Диагностика: только результат проверки конфигурации (группированный UI).
         // Механизм ConfigCheck / TemplateCheckResult не меняется.
         appendDiagnosticsConfigPresentation(content)
+        appendDiagnosticsActionButtons(content)
 
         scroll.addView(content)
         root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -6693,7 +7195,7 @@ class MainActivity : ComponentActivity() {
                 } else {
                     result.mismatches.map { it.copy(status = "mismatch") } +
                         result.missing.map { it.copy(status = "missing") }
-                }).filter { it.status != "disabled" }
+                }).filter { it.status != "disabled" && !isHiddenDiagnosticsParamKey(it.key) }
 
                 if (items.isEmpty()) {
                     content.addView(
@@ -6764,7 +7266,7 @@ class MainActivity : ComponentActivity() {
             ),
             DiagnosticsParamGroup(
                 id = "temps",
-                title = "Температуры",
+                title = "Настройки температуры",
                 keys = setOf(
                     "charge_high_temp",
                     "charge_low_temp",
@@ -6774,10 +7276,28 @@ class MainActivity : ComponentActivity() {
             ),
             DiagnosticsParamGroup(
                 id = "balance",
-                title = "Параметры балансировки",
+                title = "Настройки балансировки",
                 keys = setOf("balance_start_voltage", "balance_stop_voltage")
+            ),
+            DiagnosticsParamGroup(
+                id = "sleep",
+                title = "Настройки спящего режима",
+                keys = setOf("sleep_timeout")
             )
         )
+    }
+
+    /** Не показывать в Diagnostics (чтение/Главная не затрагиваются). */
+    private fun isHiddenDiagnosticsParamKey(key: String): Boolean {
+        return key == "series_cell_count"
+    }
+
+    /** Display label для standalone-строк Diagnostics. */
+    private fun diagnosticsDisplayLabel(item: TemplateCheckItem): String {
+        return when (item.key) {
+            "sleep_timeout" -> "Настройки спящего режима"
+            else -> item.label
+        }
     }
 
     private fun diagnosticsGroupStatus(children: List<TemplateCheckItem>): DiagnosticsGroupStatus {
@@ -6910,7 +7430,7 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER_VERTICAL
             }
             headerRow.addView(TextView(this@MainActivity).apply {
-                text = item.label
+                text = diagnosticsDisplayLabel(item)
                 textSize = 15f
                 typeface = interFont(720)
                 setTextColor(Color.rgb(16, 17, 20))
@@ -6977,24 +7497,30 @@ class MainActivity : ComponentActivity() {
 
     private fun clearWarrantyFormState() {
         warrantyMediaUris.clear()
+        warrantyPendingCameraUri = null
         warrantyNameEdit = null
         warrantyPhoneEdit = null
         warrantyModelEdit = null
         warrantyProblemEdit = null
-        warrantyMediaText = null
+        warrantyMediaListLayout = null
         warrantyStatusText = null
     }
 
+    /**
+     * Пользовательский статус обращения: только «Открыто» / «Закрыто».
+     * Backend может отдавать new/sent/in_work/done/draft/failed — маппим в два значения.
+     */
     private fun warrantyStatusRu(status: String): String {
-        return when (status) {
-            "new" -> "Новое"
-            "in_work" -> "В работе"
-            "done" -> "Закрыто"
-            "sent" -> "Отправлено"
-            "draft" -> "Черновик"
-            "failed" -> "Ошибка отправки"
-            else -> status.ifBlank { "Неизвестно" }
-        }
+        return if (isWarrantyClosedStatus(status)) "Закрыто" else "Открыто"
+    }
+
+    private fun isWarrantyClosedStatus(status: String): Boolean {
+        return status.trim().equals("done", ignoreCase = true) ||
+            status.trim().equals("closed", ignoreCase = true)
+    }
+
+    private fun warrantyStatusColor(status: String): Int {
+        return if (isWarrantyClosedStatus(status)) Color.rgb(120, 120, 120) else green
     }
 
     private fun warrantyRequestsArray(): JSONArray {
@@ -7038,17 +7564,23 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        warrantyListLoading = true
+        renderWarrantyListItems()
+
         thread {
             try {
                 val body = JSONObject().apply {
                     putBmsApiKey(this)
                     put("bms_uid", uid)
                     put("all_by_bms", true)
+                    put("page", warrantyListPage)
+                    put("limit", WARRANTY_PAGE_SIZE)
                 }
                 Log.i(
                     BLE_LOG_TAG,
                     "SUPPORT LIST REQUEST url=${adminServerUrl(WARRANTY_LIST_PATH)} " +
-                        "auth=${!BmsApiConfig.API_KEY.isNullOrBlank()} bms_uid=$uid"
+                        "auth=${!BmsApiConfig.API_KEY.isNullOrBlank()} bms_uid=$uid " +
+                        "page=$warrantyListPage limit=$WARRANTY_PAGE_SIZE"
                 )
                 val conn = (URL(adminServerUrl(WARRANTY_LIST_PATH)).openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
@@ -7080,7 +7612,15 @@ class MainActivity : ComponentActivity() {
                 }
                 if (code in 200..299 && obj?.optBoolean("ok") == true) {
                     val remoteList = obj.optJSONArray("requests") ?: JSONArray()
+                    warrantyListTotal = obj.optInt("total", remoteList.length())
+                    warrantyListTotalPages = max(1, obj.optInt("total_pages", 1))
+                    warrantyListPage = obj.optInt("page", warrantyListPage).coerceIn(1, warrantyListTotalPages)
+
                     val local = warrantyRequestsArray()
+                    // Сбрасываем пометки текущей страницы, сохраняя остальные локальные записи.
+                    for (j in 0 until local.length()) {
+                        local.optJSONObject(j)?.put("list_page_item", false)
+                    }
 
                     for (i in 0 until remoteList.length()) {
                         val remote = remoteList.optJSONObject(i) ?: continue
@@ -7115,12 +7655,14 @@ class MainActivity : ComponentActivity() {
                         item.put("problem", remote.optString("problem_text", item.optString("problem")))
                         item.put("fio", remote.optString("client_fio", item.optString("fio")))
                         item.put("phone", remote.optString("client_phone", item.optString("phone")))
+                        item.put("list_page_item", true)
 
                         if (foundIndex >= 0) local.put(foundIndex, item) else local.put(item)
                     }
 
                     saveWarrantyRequestsArray(local)
                     runOnUiThread {
+                        warrantyListLoading = false
                         renderWarrantyListItems()
                         if (showToast) toast("Список обращений обновлён")
                     }
@@ -7128,6 +7670,8 @@ class MainActivity : ComponentActivity() {
                     val err = obj?.optString("error").orEmpty()
                     Log.w(BLE_LOG_TAG, "SUPPORT LIST FAILED http=$code error=$err")
                     runOnUiThread {
+                        warrantyListLoading = false
+                        renderWarrantyListItems()
                         if (showToast) {
                             toast(
                                 when {
@@ -7145,6 +7689,8 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 Log.w(BLE_LOG_TAG, "SUPPORT LIST EXCEPTION: ${e.message}")
                 runOnUiThread {
+                    warrantyListLoading = false
+                    renderWarrantyListItems()
                     if (showToast) {
                         toast("Не удалось связаться с сервером. Проверьте подключение к интернету.")
                     }
@@ -7178,11 +7724,67 @@ class MainActivity : ComponentActivity() {
     private fun pickWarrantyMedia() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"
+            type = "image/*"
             putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
             putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         }
         startActivityForResult(intent, WARRANTY_MEDIA_REQUEST_CODE)
+    }
+
+    /**
+     * Съёмка фото через системную камеру (FileProvider + ACTION_IMAGE_CAPTURE).
+     * Side effects: запрос CAMERA permission; запись во временный файл cache/warranty_photos.
+     */
+    private fun takeWarrantyPhoto() {
+        if (warrantyMediaUris.size >= 5) {
+            toast("Можно прикрепить не более 5 файлов")
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                arrayOf(Manifest.permission.CAMERA),
+                WARRANTY_CAMERA_PERMISSION_REQUEST_CODE
+            )
+            return
+        }
+        launchWarrantyCamera()
+    }
+
+    private fun launchWarrantyCamera() {
+        try {
+            val dir = File(cacheDir, "warranty_photos").apply { mkdirs() }
+            val fileName = "Фото_${SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())}.jpg"
+            val photoFile = File(dir, fileName)
+            val uri = FileProvider.getUriForFile(
+                this,
+                "${packageName}.fileprovider",
+                photoFile
+            )
+            warrantyPendingCameraUri = uri
+            val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+                putExtra(MediaStore.EXTRA_OUTPUT, uri)
+                addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val resInfoList = packageManager.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)
+            for (resolveInfo in resInfoList) {
+                grantUriPermission(
+                    resolveInfo.activityInfo.packageName,
+                    uri,
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            if (intent.resolveActivity(packageManager) == null && resInfoList.isEmpty()) {
+                warrantyPendingCameraUri = null
+                toast("Камера недоступна на этом устройстве")
+                return
+            }
+            startActivityForResult(intent, WARRANTY_CAMERA_REQUEST_CODE)
+        } catch (e: Exception) {
+            warrantyPendingCameraUri = null
+            Log.w(BLE_LOG_TAG, "WARRANTY CAMERA launch failed: ${e.message}")
+            toast("Не удалось открыть камеру")
+        }
     }
 
     private fun pickProfileAvatar() {
@@ -7193,20 +7795,64 @@ class MainActivity : ComponentActivity() {
         startActivityForResult(intent, PROFILE_AVATAR_REQUEST_CODE)
     }
 
+    /**
+     * Обновляет список прикреплённых файлов: display name + кнопка удаления.
+     * Side effects: перерисовка warrantyMediaListLayout.
+     */
     private fun updateWarrantyMediaText() {
-        warrantyMediaText?.text = if (warrantyMediaUris.isEmpty()) {
-            "Файлы не выбраны"
-        } else {
-            "Выбрано файлов: ${warrantyMediaUris.size}"
+        val layout = warrantyMediaListLayout ?: return
+        layout.removeAllViews()
+        if (warrantyMediaUris.isEmpty()) {
+            layout.addView(TextView(this).apply {
+                text = "Файлы не выбраны"
+                textSize = 13f
+                setTextColor(Color.rgb(100, 100, 100))
+                setPadding(0, dp(4), 0, dp(4))
+            })
+            return
+        }
+        warrantyMediaUris.forEachIndexed { idx, uri ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(4), 0, dp(4))
+            }
+            row.addView(TextView(this).apply {
+                text = "📎 ${warrantyDisplayName(uri, idx)}"
+                textSize = 13f
+                setTextColor(Color.rgb(35, 35, 35))
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.MIDDLE
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(TextView(this).apply {
+                text = "✕"
+                textSize = 16f
+                typeface = interFont(700)
+                setTextColor(Color.rgb(140, 140, 140))
+                setPadding(dp(10), dp(4), dp(4), dp(4))
+                contentDescription = "Удалить файл"
+                setOnClickListener {
+                    if (idx in warrantyMediaUris.indices) {
+                        warrantyMediaUris.removeAt(idx)
+                        updateWarrantyMediaText()
+                    }
+                }
+            })
+            layout.addView(row)
         }
     }
 
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, resultData: Intent?) {
         super.onActivityResult(requestCode, resultCode, resultData)
-        if (resultCode != RESULT_OK || resultData == null) return
+        if (resultCode != RESULT_OK) {
+            if (requestCode == WARRANTY_CAMERA_REQUEST_CODE) {
+                warrantyPendingCameraUri = null
+            }
+            return
+        }
         if (requestCode == PROFILE_AVATAR_REQUEST_CODE) {
-            val uri = resultData.data ?: return
+            val uri = resultData?.data ?: return
             try {
                 contentResolver.takePersistableUriPermission(
                     uri,
@@ -7219,19 +7865,44 @@ class MainActivity : ComponentActivity() {
             showProfileScreen()
             return
         }
+        if (requestCode == WARRANTY_CAMERA_REQUEST_CODE) {
+            val uri = warrantyPendingCameraUri
+            warrantyPendingCameraUri = null
+            if (uri != null && warrantyMediaUris.size < 5) {
+                warrantyMediaUris.add(uri)
+                updateWarrantyMediaText()
+                toast("Фото добавлено")
+            }
+            return
+        }
         if (requestCode != WARRANTY_MEDIA_REQUEST_CODE) return
+        if (resultData == null) return
 
         val clip = resultData.clipData
         if (clip != null) {
             for (i in 0 until clip.itemCount) {
                 val uri = clip.getItemAt(i).uri
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Exception) {}
                 if (warrantyMediaUris.size < 5) warrantyMediaUris.add(uri)
             }
         } else {
-            resultData.data?.let { if (warrantyMediaUris.size < 5) warrantyMediaUris.add(it) }
+            resultData.data?.let { uri ->
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: Exception) {}
+                if (warrantyMediaUris.size < 5) warrantyMediaUris.add(uri)
+            }
         }
         updateWarrantyMediaText()
-        toast("Файлы добавлены: ${warrantyMediaUris.size}")
+        toast("Файлы добавлены")
     }
 
     private fun submitWarrantyRequest() {
@@ -7247,68 +7918,86 @@ class MainActivity : ComponentActivity() {
 
         val localId = editingWarrantyLocalId ?: "local_${System.currentTimeMillis()}"
         val existing = warrantyRequestByLocalId(localId)
-
-        val payload = JSONObject()
-        putBmsApiKey(payload)
-        payload.put("client_fio", fio)
-        payload.put("client_phone", phone)
-        payload.put("battery_model", model)
-        payload.put("problem_text", problem)
-        payload.put("bms_uid", bmsUid())
-        payload.put("bluetooth_name", dalyBluetoothDeviceId())
-        payload.put("bluetooth_address", selectedAddress ?: "")
-        val sn = bmsSn()
-        if (sn.isNotBlank()) payload.put("bms_sn", sn)
-        payload.put("app_version", APP_VERSION)
-        payload.put("battery_snapshot", buildUploadJson())
-        if (configRegisters.isNotEmpty()) payload.put("config_snapshot", buildConfigUploadJson())
-        if (warrantyMediaUris.isNotEmpty()) {
-            val media = JSONArray()
-            warrantyMediaUris.take(5).forEachIndexed { idx, uri ->
-                media.put(
-                    JSONObject().apply {
-                        put("filename", warrantyFileName(uri, idx))
-                        put("mime", contentResolver.getType(uri) ?: "application/octet-stream")
-                    }
-                )
-            }
-            payload.put("media", media)
-        }
-
-        existing?.optString("server_id")?.takeIf { it.isNotBlank() }?.let {
-            payload.put("request_id", it)
-        }
-
-        val localItem = JSONObject().apply {
-            put("local_id", localId)
-            put("server_id", existing?.optString("server_id") ?: "")
-            put("status", existing?.optString("status")?.ifBlank { "draft" } ?: "draft")
-            put("created_at", existing?.optString("created_at")?.ifBlank { nowText() } ?: nowText())
-            put("updated_at", nowText())
-            put("fio", fio)
-            put("phone", phone)
-            put("model", model)
-            put("problem", problem)
-            put("bms_uid", bmsUid())
-        }
-        upsertWarrantyLocal(localItem)
-        editingWarrantyLocalId = localId
+        val mediaUrisSnapshot = warrantyMediaUris.toList()
 
         warrantyStatusText?.text = "Отправка обращения..."
         thread {
-            val result = sendWarrantyMultipart(payload, warrantyMediaUris.toList())
+            val mediaArray = JSONArray()
+            var mediaEncodeFailed = false
+            mediaUrisSnapshot.take(5).forEachIndexed { idx, uri ->
+                val fileName = warrantyDisplayName(uri, idx)
+                val encoded = encodeWarrantyMediaForUpload(uri)
+                if (encoded == null) {
+                    mediaEncodeFailed = true
+                    return@forEachIndexed
+                }
+                mediaArray.put(
+                    JSONObject().apply {
+                        put("filename", fileName)
+                        put("mime", encoded.second)
+                        put("data_base64", encoded.first)
+                    }
+                )
+            }
+            if (mediaEncodeFailed && mediaUrisSnapshot.isNotEmpty()) {
+                runOnUiThread {
+                    warrantyStatusText?.text = "Не удалось прочитать вложение. Проверьте выбранные файлы."
+                    toast("Не удалось прочитать вложение")
+                }
+                return@thread
+            }
+
+            val payload = JSONObject()
+            putBmsApiKey(payload)
+            payload.put("client_fio", fio)
+            payload.put("client_phone", phone)
+            payload.put("battery_model", model)
+            payload.put("problem_text", problem)
+            payload.put("bms_uid", bmsUid())
+            payload.put("bluetooth_name", dalyBluetoothDeviceId())
+            payload.put("bluetooth_address", selectedAddress ?: "")
+            val sn = bmsSn()
+            if (sn.isNotBlank()) payload.put("bms_sn", sn)
+            payload.put("app_version", APP_VERSION)
+            payload.put("status", "new")
+            payload.put("battery_snapshot", buildUploadJson())
+            if (configRegisters.isNotEmpty()) payload.put("config_snapshot", buildConfigUploadJson())
+            if (mediaArray.length() > 0) payload.put("media", mediaArray)
+
+            existing?.optString("server_id")?.takeIf { it.isNotBlank() }?.let {
+                payload.put("request_id", it)
+            }
+
+            val localItem = JSONObject().apply {
+                put("local_id", localId)
+                put("server_id", existing?.optString("server_id") ?: "")
+                put("status", "new")
+                put("created_at", existing?.optString("created_at")?.ifBlank { nowText() } ?: nowText())
+                put("updated_at", nowText())
+                put("fio", fio)
+                put("phone", phone)
+                put("model", model)
+                put("problem", problem)
+                put("bms_uid", bmsUid())
+            }
+            upsertWarrantyLocal(localItem)
+            editingWarrantyLocalId = localId
+
+            val result = sendWarrantyMultipart(payload, mediaUrisSnapshot)
             runOnUiThread {
                 val id = Regex("№(\\d+)").find(result)?.groupValues?.getOrNull(1)
                 val updated = warrantyRequestByLocalId(localId) ?: localItem
                 if (result.startsWith("Обращение отправлено")) {
                     if (!id.isNullOrBlank()) updated.put("server_id", id)
-                    updated.put("status", "sent")
+                    updated.put("status", "new")
                     updated.put("updated_at", nowText())
                     upsertWarrantyLocal(updated)
-                    warrantyStatusText?.text = "Обращение отправлено. Статус: ${warrantyStatusRu(updated.optString("status"))}"
-                    // Без toast «Успешно…» — статус виден на экране.
+                    warrantyMediaUris.clear()
+                    warrantyStatusText?.text =
+                        "Обращение отправлено. Статус: ${warrantyStatusRu(updated.optString("status"))}"
                     supportMode = "list"
                     editingWarrantyLocalId = null
+                    warrantyListPage = 1
                     showSupportScreen()
                 } else {
                     updated.put("status", "failed")
@@ -7335,7 +8024,7 @@ class MainActivity : ComponentActivity() {
 
     private fun sendWarrantyMultipart(payload: JSONObject, files: List<Uri>): String {
         // Единый auth с телеметрией: x-api-key + api_key из BmsApiConfig.
-        // JSON вместо старого multipart — новый backend принимает application/json.
+        // JSON + media[].data_base64 — backend принимает application/json (лимит 12mb).
         return try {
             putBmsApiKey(payload)
             val url = adminServerUrl(WARRANTY_SUBMIT_PATH)
@@ -7393,17 +8082,105 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Display name для UI: OpenableColumns.DISPLAY_NAME или понятный fallback.
+     * Не показывает content:// URI пользователю.
+     */
+    private fun warrantyDisplayName(uri: Uri, idx: Int): String {
+        try {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val name = cursor.getString(0)
+                    if (!name.isNullOrBlank()) return name
+                }
+            }
+        } catch (_: Exception) {
+        }
+        val last = uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() && !it.contains(':') }
+        if (last != null) return last
+        return warrantyFileName(uri, idx)
+    }
+
     private fun warrantyFileName(uri: Uri, idx: Int): String {
         val mime = contentResolver.getType(uri) ?: ""
         val ext = when {
-            mime.contains("jpeg") -> "jpg"
+            mime.contains("jpeg") || mime.contains("jpg") -> "jpg"
             mime.contains("png") -> "png"
             mime.contains("webp") -> "webp"
             mime.contains("mp4") -> "mp4"
             mime.contains("quicktime") -> "mov"
-            else -> "bin"
+            else -> "jpg"
         }
-        return "warranty_${System.currentTimeMillis()}_${idx + 1}.$ext"
+        return "Фото_${SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())}_${idx + 1}.$ext"
+    }
+
+    /**
+     * Читает вложение, сжимает изображения до разумного JPEG и возвращает base64 + mime.
+     * @return Pair(base64, mime) или null при ошибке чтения.
+     */
+    private fun encodeWarrantyMediaForUpload(uri: Uri): Pair<String, String>? {
+        return try {
+            val mime = contentResolver.getType(uri) ?: "application/octet-stream"
+            if (mime.startsWith("image/")) {
+                val original = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+                val compressed = compressWarrantyImage(original)
+                val bytes = compressed ?: original.take(4 * 1024 * 1024).toByteArray()
+                val outMime = if (compressed != null) "image/jpeg" else mime
+                Base64.encodeToString(bytes, Base64.NO_WRAP) to outMime
+            } else {
+                val bytes = contentResolver.openInputStream(uri)?.use { stream ->
+                    val buf = ByteArrayOutputStream()
+                    val tmp = ByteArray(16 * 1024)
+                    var total = 0
+                    while (true) {
+                        val n = stream.read(tmp)
+                        if (n <= 0) break
+                        total += n
+                        if (total > 6 * 1024 * 1024) return null
+                        buf.write(tmp, 0, n)
+                    }
+                    buf.toByteArray()
+                } ?: return null
+                Base64.encodeToString(bytes, Base64.NO_WRAP) to mime
+            }
+        } catch (e: Exception) {
+            Log.w(BLE_LOG_TAG, "WARRANTY MEDIA encode failed: ${e.message}")
+            null
+        }
+    }
+
+    /** Сжимает изображение до max 1600px по длинной стороне, JPEG quality 82. */
+    private fun compressWarrantyImage(bytes: ByteArray): ByteArray? {
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            val maxSide = max(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
+            var sample = 1
+            while (maxSide / sample > 1600) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
+            val w = bitmap.width
+            val h = bitmap.height
+            val scale = min(1f, 1600f / max(w, h).toFloat())
+            val scaled = if (scale < 0.999f) {
+                Bitmap.createScaledBitmap(
+                    bitmap,
+                    max(1, (w * scale).toInt()),
+                    max(1, (h * scale).toInt()),
+                    true
+                ).also {
+                    if (it != bitmap) bitmap.recycle()
+                }
+            } else {
+                bitmap
+            }
+            val out = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 82, out)
+            if (scaled != bitmap) scaled.recycle() else bitmap.recycle()
+            out.toByteArray()
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun openChartsScreen() {
@@ -7943,23 +8720,54 @@ class MainActivity : ComponentActivity() {
             setPadding(0, dp(4), 0, dp(14))
         }, LinearLayout.LayoutParams(-1, -2))
 
-        val journalEvents = journalDisplayEvents()
-        if (journalEvents.isEmpty()) {
-            val empty = TextView(this).apply {
-                text = "Ошибок BMS нет"
-                textSize = 17f
-                setTextColor(Color.rgb(100,100,100))
-                gravity = Gravity.CENTER
-                setPadding(dp(16), dp(50), dp(16), dp(50))
-                setBackgroundColor(Color.WHITE)
+        val presence = resolveCurrentBmsPresence()
+        if (presence != BatteryPresenceState.ONLINE) {
+            val inactiveTitle = when (presence) {
+                BatteryPresenceState.SLEEPING -> "BMS неактивна"
+                BatteryPresenceState.CHECKING -> "Проверяем состояние батареи…"
+                else -> "BMS неактивна"
             }
-            content.addView(empty, LinearLayout.LayoutParams(-1, -2))
+            val inactiveSub = when (presence) {
+                BatteryPresenceState.CHECKING -> "Журнал станет доступен после проверки"
+                else -> "Журнал доступен только при активной BMS"
+            }
+            content.addView(TextView(this).apply {
+                text = inactiveTitle
+                textSize = 17f
+                typeface = interFont(700)
+                setTextColor(Color.rgb(100, 100, 100))
+                gravity = Gravity.CENTER
+                setPadding(dp(16), dp(40), dp(16), dp(8))
+                setBackgroundColor(Color.WHITE)
+            }, LinearLayout.LayoutParams(-1, -2))
+            content.addView(TextView(this).apply {
+                text = inactiveSub
+                textSize = 14f
+                setTextColor(Color.rgb(111, 119, 129))
+                gravity = Gravity.CENTER
+                setPadding(dp(16), 0, dp(16), dp(40))
+                setBackgroundColor(Color.WHITE)
+            }, LinearLayout.LayoutParams(-1, -2))
         } else {
-            for ((idx, item) in journalEvents.withIndex()) {
-                content.addView(
-                    journalRow(idx + 1, item.first, item.second),
-                    marginLp(-1, -2, 0, 0, 0, 8)
-                )
+            // Только текущие активные fault/alarm из 0x98 — без истории и без details.
+            val activeErrors = currentActiveBmsErrors()
+            if (activeErrors.isEmpty()) {
+                val empty = TextView(this).apply {
+                    text = "Активных ошибок нет"
+                    textSize = 17f
+                    setTextColor(Color.rgb(100, 100, 100))
+                    gravity = Gravity.CENTER
+                    setPadding(dp(16), dp(50), dp(16), dp(50))
+                    setBackgroundColor(Color.WHITE)
+                }
+                content.addView(empty, LinearLayout.LayoutParams(-1, -2))
+            } else {
+                for (title in activeErrors) {
+                    content.addView(
+                        journalActiveErrorRow(title),
+                        marginLp(-1, -2, 0, 0, 0, 8)
+                    )
+                }
             }
         }
 
@@ -7971,60 +8779,42 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
     }
 
-    private fun journalRow(number: Int, textLine: String, detailText: String = textLine): View {
+    /**
+     * Строка активной ошибки: только название, без перехода в подробности.
+     *
+     * @param title человекочитаемое имя fault/alarm
+     * @return view строки журнала
+     */
+    private fun journalActiveErrorRow(title: String): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(14), dp(14), dp(10), dp(14))
+            setPadding(dp(14), dp(14), dp(14), dp(14))
             background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
             elevation = dp(1).toFloat()
-            setOnClickListener { showEventDetails(number, textLine, detailText) }
+            isClickable = false
+            isFocusable = false
         }
 
         row.addView(TextView(this).apply {
-            text = number.toString()
+            text = "⚠"
             textSize = 18f
-            typeface = interFont(700)
-            setTextColor(Color.rgb(45,45,45))
-            gravity = Gravity.TOP
-        }, LinearLayout.LayoutParams(dp(44), -1))
-
-        val parts = textLine.split(" — ", limit = 2)
-        val time = parts.getOrNull(0) ?: ""
-        val eventText = parts.getOrNull(1) ?: textLine
-
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        col.addView(TextView(this).apply {
-            text = eventText
-            textSize = 17f
-            typeface = interFont(700)
-            setTextColor(Color.rgb(40,40,40))
-        })
-        col.addView(TextView(this).apply {
-            text = time
-            textSize = 14f
-            setTextColor(Color.rgb(105,105,105))
-            setPadding(0, dp(3), 0, 0)
-        })
-        row.addView(col, LinearLayout.LayoutParams(0, -2, 1f))
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(200, 60, 60))
+        }, LinearLayout.LayoutParams(dp(36), -2))
 
         row.addView(TextView(this).apply {
-            text = "›"
-            textSize = 32f
-            setTextColor(Color.rgb(35,35,35))
-            gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(dp(28), -1))
+            text = title
+            textSize = 16f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(40, 40, 40))
+        }, LinearLayout.LayoutParams(0, -2, 1f))
 
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(row, LinearLayout.LayoutParams(-1, -2))
-            addView(View(this@MainActivity).apply { setBackgroundColor(Color.rgb(230,230,230)) }, LinearLayout.LayoutParams(-1, 1))
-        }
+        return row
     }
 
     private fun showEventDetails(number: Int, titleLine: String, detailText: String) {
+        // Оставлен для возможных сервисных экранов; клиентский Журнал больше не вызывает.
         val parts = titleLine.split(" — ", limit = 2)
         val time = parts.getOrNull(0) ?: ""
         val title = parts.getOrNull(1) ?: titleLine
@@ -8116,6 +8906,9 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        cancelTargetedScan()
+        cancelWakeSequence()
+        stopBatteriesPresenceScan()
         devices.clear()
         scanRssi.clear()
         scanNames.clear()
@@ -8154,7 +8947,31 @@ class MainActivity : ComponentActivity() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device ?: return
             val address = device.address ?: return
-            val name = normalBleName(result) ?: return
+            val name = normalBleName(result)
+            val target = targetedScanAddress
+            if (target != null && address.equals(target, ignoreCase = true)) {
+                val token = targetedScanToken
+                Log.i(BMS_BLE_TAG, "Saved BMS found address=$address name=${name.orEmpty()}")
+                targetedScanAddress = null
+                stopBleScanQuietly()
+                devices[address] = device
+                scanRssi[address] = result.rssi
+                if (!name.isNullOrBlank()) {
+                    scanNames[address] = name
+                }
+                selectedAddress = address
+                runOnUiThread {
+                    if (token != targetedScanToken) return@runOnUiThread
+                    Log.i(BMS_BLE_TAG, "Connecting")
+                    connectSelectedDevice()
+                }
+                return
+            }
+            // Presence for «Мои батареи»: MAC match is enough (имя может отсутствовать в adv).
+            if (batteriesPresenceScanActive && screenState == "batteries") {
+                onSavedBatterySeenInPresenceScan(address, device, result.rssi, name)
+            }
+            if (name == null) return
             if (!devices.containsKey(address)) {
                 devices[address] = device
                 scanRssi[address] = result.rssi
@@ -8353,11 +9170,14 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        cancelTargetedScan()
+        cancelWakeSequence()
         polling = false
         bluetoothGatt?.close()
         if (screenState == "search" && ::statusText.isInitialized) {
             statusText.text = "Подключение к $address..."
         }
+        Log.i(BMS_BLE_TAG, "Connecting to $address")
 
         bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
@@ -8368,6 +9188,8 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun disconnectGatt() {
+        cancelTargetedScan()
+        cancelWakeSequence()
         polling = false
         pollLoopToken++
         resetRemoteWriteState()
@@ -8391,6 +9213,7 @@ class MainActivity : ComponentActivity() {
                 "connection address=${gatt.device.address} status=$status state=$newState"
             )
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                Log.i(BMS_BLE_TAG, "GATT connected")
                 pendingFirstTelemetryUpload = true
                 configAutoReadStartedForConnection = false
                 setTemplateCheckChecking()
@@ -8441,11 +9264,15 @@ class MainActivity : ComponentActivity() {
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 pendingFirstTelemetryUpload = false
+                cancelWakeSequence()
                 polling = false
                 pollLoopToken++
                 resetRemoteWriteState()
                 configAutoReadStartedForConnection = false
                 latestTemplateCheck = null
+                // Не держим cached faults как «текущие» после потери связи.
+                data.errors.clear()
+                lastErrorSignature = ""
                 runOnUiThread {
                     selectedAddress?.let { address ->
                         deviceStatusViews[address]?.apply {
@@ -8471,8 +9298,15 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     toast("Отключено от BMS")
+                    if (screenState == "journal") {
+                        showJournalScreen()
+                    } else if (screenState == "dashboard") {
+                        updateDashboardUi()
+                    }
                     if (screenState == "loading") {
                         showBatteriesScreen(asRootHome = true)
+                    } else {
+                        refreshBatteriesScreenIfVisible()
                     }
                 }
             }
@@ -8488,6 +9322,7 @@ class MainActivity : ComponentActivity() {
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             Log.i(BLE_LOG_TAG, "services discovered status=$status count=${gatt.services.size}")
+            Log.i(BMS_BLE_TAG, "Services discovered status=$status count=${gatt.services.size}")
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 runOnUiThread {
                     toast("Не удалось прочитать BLE-сервисы: $status")
@@ -8516,6 +9351,10 @@ class MainActivity : ComponentActivity() {
                 return
             }
 
+            enableNotifications(gatt, notifyCharacteristic!!)
+            Log.i(BMS_BLE_TAG, "Notifications enabled")
+            // polling до UI: карточки «Мои батареи» должны сразу видеть online.
+            polling = true
             runOnUiThread {
                 saveCurrentBattery(force = true)
                 if (returnToBatteriesAfterConnect) {
@@ -8525,14 +9364,13 @@ class MainActivity : ComponentActivity() {
                     showDashboardScreen(asRootHome = true)
                 }
             }
-            enableNotifications(gatt, notifyCharacteristic!!)
-            polling = true
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             Log.i(BLE_LOG_TAG, "CCCD write uuid=${descriptor.uuid} status=$status")
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 polling = false
+                cancelWakeSequence()
                 runOnUiThread { toast("BMS не разрешила получение данных: $status") }
                 return
             }
@@ -8548,8 +9386,8 @@ class MainActivity : ComponentActivity() {
                         }
                     }, if (isServiceApp()) 400L else CONFIG_AUTO_READ_DELAY_MS)
                 }
-                startRemoteWritePolling()
-                mainHandler.postDelayed({ pollOnce() }, 300)
+                // Сначала wake/read (0x90), затем обычный poll — без параллельных write.
+                startBmsWakeSequence()
             }
         }
 
@@ -8935,6 +9773,10 @@ class MainActivity : ComponentActivity() {
         }
         data.lastUpdatedAt = System.currentTimeMillis()
         Log.d(BLE_LOG_TAG, "parsed cmd=0x%02X".format(cmd))
+        if (wakeInProgress) {
+            // Любой валидный ответ Daly после connect = MCU очнулась.
+            onWakeResponseReceived()
+        }
         updateDerived()
         completeRuntimeCommand(cmd, p)
 
@@ -9046,7 +9888,8 @@ class MainActivity : ComponentActivity() {
         cellCountValue?.text = (data.cellCount ?: data.cells.size.takeIf { it > 0 })?.toString() ?: "--"
 
         if (::balanceValue.isInitialized) {
-            if (data.errors.isNotEmpty()) {
+            val activeErrors = currentActiveBmsErrors()
+            if (activeErrors.isNotEmpty()) {
                 balanceValue.text = "Ошибка"
                 balanceValue.setTextColor(Color.rgb(239, 83, 80))
                 balanceIconHost?.let {
@@ -9063,8 +9906,9 @@ class MainActivity : ComponentActivity() {
             }
         }
         stateValue?.let { state ->
+            val activeErrors = currentActiveBmsErrors()
             when {
-                data.errors.isNotEmpty() -> {
+                activeErrors.isNotEmpty() -> {
                     state.text = "Защита"
                     state.setTextColor(Color.rgb(239, 83, 80))
                     applyStatusDot(stateDot, false)
@@ -9106,10 +9950,11 @@ class MainActivity : ComponentActivity() {
         }
         if (::batteryInfoText.isInitialized) {
             val cycles = data.cycles?.let { " · Циклов: $it" }.orEmpty()
-            batteryInfoText.text = if (data.errors.isEmpty()) {
+            val activeErrors = currentActiveBmsErrors()
+            batteryInfoText.text = if (activeErrors.isEmpty()) {
                 "✓  Нормальное состояние · Устройство: $device$cycles"
             } else {
-                "!  Требуется внимание · Устройство: $device$cycles"
+                "Ошибка: ${activeErrors.first()} · Устройство: $device$cycles"
             }
         }
 
@@ -9119,12 +9964,27 @@ class MainActivity : ComponentActivity() {
             val title = overallStatusTitle
             val sub = overallStatusSub
             val check = currentTemplateCheck()
+            val activeErrors = currentActiveBmsErrors()
+
+            fun setBannerSub(text: String) {
+                if (text.isBlank()) {
+                    sub?.text = ""
+                    sub?.visibility = View.GONE
+                } else {
+                    sub?.text = text
+                    sub?.visibility = View.VISIBLE
+                }
+            }
+
             when {
-                data.errors.isNotEmpty() -> {
+                // Реальные BMS fault — отдельная логика, не config mismatch.
+                activeErrors.isNotEmpty() -> {
                     banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
-                    title?.text = "!  Требуется внимание"
+                    title?.text = "Ошибка: ${activeErrors.first()}"
                     title?.setTextColor(Color.rgb(239, 83, 80))
-                    sub?.text = data.errors.joinToString(", ")
+                    setBannerSub(
+                        if (activeErrors.size > 1) "Ещё ошибок: ${activeErrors.size - 1}" else ""
+                    )
                     sub?.setTextColor(Color.rgb(111, 119, 129))
                 }
                 check?.status == "unavailable" ||
@@ -9132,49 +9992,43 @@ class MainActivity : ComponentActivity() {
                     banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
                     title?.text = "⚠  Проверка конфигурации недоступна"
                     title?.setTextColor(Color.rgb(224, 150, 0))
-                    sub?.text = serverTemplateFetchError
-                        ?: "Не удалось получить актуальный шаблон с сервера"
+                    setBannerSub(
+                        serverTemplateFetchError
+                            ?: "Не удалось получить актуальный шаблон с сервера"
+                    )
                     sub?.setTextColor(Color.rgb(111, 119, 129))
                 }
                 check?.status == "checking" || serverTemplateFetchStatus == "fetching" -> {
                     banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
                     title?.text = "…  Идёт инициализация BMS"
                     title?.setTextColor(Color.rgb(111, 119, 129))
-                    sub?.text = ""
-                    sub?.setTextColor(Color.rgb(111, 119, 129))
+                    setBannerSub("")
                 }
                 check?.status == "mismatch" -> {
+                    // ConfigCheckResult.mismatch — без деталей параметров на Главной.
                     banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
-                    title?.text = "⚠  Есть отклонения конфигурации"
-                    title?.setTextColor(Color.rgb(224, 150, 0))
-                    val count = check.mismatches.size
-                    sub?.text = if (count == 1) {
-                        "1 параметр требует проверки"
-                    } else {
-                        "$count параметра требуют проверки"
-                    }
-                    sub?.setTextColor(Color.rgb(111, 119, 129))
+                    title?.text = "✕  Не соответствует"
+                    title?.setTextColor(Color.rgb(211, 47, 47))
+                    setBannerSub("")
                 }
                 check?.status == "incomplete" -> {
                     banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
                     title?.text = "⚠  Проверка конфигурации неполная"
                     title?.setTextColor(Color.rgb(224, 150, 0))
-                    sub?.text = "Не все параметры удалось прочитать или сравнить"
+                    setBannerSub("Не все параметры удалось прочитать или сравнить")
                     sub?.setTextColor(Color.rgb(111, 119, 129))
                 }
                 check?.status == "ok" -> {
                     banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
                     title?.text = "✓  Батарея в норме"
                     title?.setTextColor(Color.rgb(31, 179, 90))
-                    sub?.text = "Все параметры соответствуют"
-                    sub?.setTextColor(Color.rgb(111, 119, 129))
+                    setBannerSub("")
                 }
                 else -> {
                     banner.background = round(Color.WHITE, dp(16), Color.rgb(223, 229, 235), 1)
                     title?.text = "…  Идёт инициализация BMS"
                     title?.setTextColor(Color.rgb(111, 119, 129))
-                    sub?.text = ""
-                    sub?.setTextColor(Color.rgb(111, 119, 129))
+                    setBannerSub("")
                 }
             }
         }
@@ -9852,21 +10706,14 @@ class MainActivity : ComponentActivity() {
 
     private fun detectAndStoreEvents() {
         val errSig = data.errors.joinToString("|")
-        if (errSig != lastErrorSignature) {
-            if (data.errors.isEmpty()) {
-                if (lastErrorSignature.isNotBlank()) {
-                    addLocalEvent(
-                        "Ошибки BMS сброшены",
-                        "BMS больше не отдает активные биты ошибок в команде 0x98."
-                    )
-                }
-            } else {
-                addLocalEvent(
-                    "Ошибки BMS: ${data.errors.joinToString(", ")}",
-                    buildErrorDetails()
-                )
-            }
+        val errorsChanged = errSig != lastErrorSignature
+        if (errorsChanged) {
+            // История инцидентов строится на сервере по snapshot errors[].
+            // Локальный журнал клиента показывает только текущий fault state.
             lastErrorSignature = errSig
+            if (screenState == "journal") {
+                showJournalScreen()
+            }
         }
 
         val chg = data.chargeMos
@@ -9878,14 +10725,6 @@ class MainActivity : ComponentActivity() {
         val dsg = data.dischargeMos
         if (dsg != null && dsg != lastDischargeMos) {
             lastDischargeMos = dsg
-        }
-
-        val diff = data.cellDiffV
-        if (diff != null && diff >= 0.080) {
-            addLocalEvent(
-                "Большой разбег ячеек: ${"%.3f".format(diff)} V",
-                "Разбег напряжения ячеек превышает 0.080 В.\nПерепад: ${"%.3f".format(diff)} В\nMin: ${data.minCellV ?: "--"} В\nMax: ${data.maxCellV ?: "--"} В"
-            )
         }
     }
 
@@ -11481,7 +12320,26 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
-        if (requestCode != 1001 || screenState != "loading") return
+        if (requestCode == WARRANTY_CAMERA_PERMISSION_REQUEST_CODE) {
+            if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                launchWarrantyCamera()
+            } else {
+                toast("Для съёмки фото необходимо разрешение на камеру")
+            }
+            return
+        }
+        if (requestCode != 1001) return
+        if (screenState == "batteries") {
+            if (hasBlePermissions()) {
+                startBatteriesPresenceScan(resetSeen = true)
+            } else {
+                batteriesPresenceScanCompleted = true
+                refreshAllBatteryPresenceCards()
+                toast("Для проверки батарей нужен доступ к Bluetooth")
+            }
+            return
+        }
+        if (screenState != "loading") return
         if (hasBlePermissions()) {
             startScan()
         } else {
