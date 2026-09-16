@@ -38,8 +38,8 @@ android {
             dimension = "role"
             isDefault = true
             applicationId = "ru.liferych.bms"
-            versionCode = 118
-            versionName = "0.2.58"
+            versionCode = 121
+            versionName = "0.2.61"
             resValue("string", "app_name", "ЛИФЕРЫЧ BMS")
             buildConfigField("boolean", "IS_SERVICE", "false")
         }

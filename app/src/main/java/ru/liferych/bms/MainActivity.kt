@@ -77,6 +77,14 @@ private const val BMS_BLE_TAG = "BMS-BLE"
 private const val BMS_WAKE_TAG = "BMS-WAKE"
 /** Targeted scan for a previously saved BMS (Android 10+ friendly). */
 private const val TARGETED_SCAN_TIMEOUT_MS = 10000L
+/**
+ * Окно BLE presence-scan на экране «Мои батареи».
+ * После окна без MAC → UNAVAILABLE («Не в сети»), не «Спящий режим».
+ */
+private const val PRESENCE_SCAN_WINDOW_MS = 15000L
+/** Свежесть телеметрии: ответ Daly в этом окне подтверждает ONLINE при активном GATT. */
+private const val PRESENCE_TELEMETRY_FRESH_MS = 30000L
+private const val BATTERY_AVAILABILITY_TAG = "BatteryAvailability"
 private const val WAKE_MAX_ATTEMPTS = 5
 private val WAKE_RETRY_DELAYS_MS = longArrayOf(400L, 400L, 500L, 500L, 500L)
 
@@ -90,6 +98,8 @@ private const val USER_LOGIN_PATH = "/api/v1/users/login"
 private const val USER_REGISTER_PATH = "/api/v1/users/register"
 private const val USER_PROFILE_PATH = "/api/v1/users/profile"
 private const val USER_LINK_BATTERY_PATH = "/api/v1/users/batteries/link"
+private const val USER_UNLINK_BATTERY_PATH = "/api/v1/users/batteries/unlink"
+private const val USER_AVATAR_PATH = "/api/v1/users/avatar"
 private val APP_VERSION = BuildConfig.VERSION_NAME
 private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
@@ -304,11 +314,11 @@ data class SavedBattery(
     val lastSeenAt: Long
 )
 
-/** Присутствие сохранённой BMS на экране «Мои батареи» (не путать с lastSeen). */
+/** Присутствие сохранённой BMS на экране «Мои батареи» (не путать с lastSeen / sleep_timeout). */
 private enum class BatteryPresenceState {
     CHECKING,
     ONLINE,
-    SLEEPING,
+    /** BLE не рекламируется / нет ответа — «Не в сети». Не означает аппаратный sleep BMS. */
     UNAVAILABLE
 }
 
@@ -505,8 +515,11 @@ class MainActivity : ComponentActivity() {
     private val WARRANTY_CAMERA_PERMISSION_REQUEST_CODE = 1003
     /** Временный URI для камеры аватара. */
     private var profilePendingCameraUri: Uri? = null
+    /** Upload аватара на сервер: Idle / Uploading / Success / Error. */
+    private var avatarUploadState: String = "Idle"
     private var loginLoading: Boolean = false
     private var loginStatusText: TextView? = null
+    private var profileAvatarStatusText: TextView? = null
     /** Отмена устаревших ответов login при logout / повторном входе. */
     private var loginGeneration: Int = 0
     /** Национальная часть номера, переносимая Login → Register. */
@@ -1554,8 +1567,12 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * ONLINE = active GATT connection ИЛИ MAC найден в актуальном BLE scan.
-     * SLEEPING только после завершённого scan без MAC и без connection.
+     * ONLINE:
+     * - активный GATT и свежий/ожидаемый ответ телеметрии, или
+     * - MAC виден в текущем presence-scan (устройство рекламируется → можно подключаться).
+     *
+     * UNAVAILABLE: окно скана завершено, MAC не найден и нет GATT.
+     * Не путать с sleep_timeout / аппаратным sleep — протокол presence этого не отдаёт.
      */
     private fun resolveBatteryPresence(battery: SavedBattery): BatteryPresenceState {
         if (battery.address == TEST_BATTERY_ADDRESS) return BatteryPresenceState.ONLINE
@@ -1565,13 +1582,51 @@ class MainActivity : ComponentActivity() {
         if (!hasBlePermissions()) {
             return BatteryPresenceState.UNAVAILABLE
         }
-        if (isBatteryBleConnected(battery) || wasBatterySeenInScan(battery)) {
+        if (isBatteryBleConnected(battery)) {
+            // GATT: ONLINE только после валидного ответа; иначе CHECKING (wake/poll).
+            return if (hasFreshTelemetryForSelected(battery)) {
+                BatteryPresenceState.ONLINE
+            } else {
+                BatteryPresenceState.CHECKING
+            }
+        }
+        if (wasBatterySeenInScan(battery)) {
             return BatteryPresenceState.ONLINE
         }
         if (!batteriesPresenceScanCompleted) {
             return BatteryPresenceState.CHECKING
         }
-        return BatteryPresenceState.SLEEPING
+        return BatteryPresenceState.UNAVAILABLE
+    }
+
+    /**
+     * Есть свежий ответ Daly по выбранной (подключённой) АКБ.
+     */
+    private fun hasFreshTelemetryForSelected(battery: SavedBattery): Boolean {
+        if (selectedAddress == null ||
+            !selectedAddress.equals(battery.address, ignoreCase = true)
+        ) {
+            return false
+        }
+        val updated = data.lastUpdatedAt ?: return false
+        return System.currentTimeMillis() - updated <= PRESENCE_TELEMETRY_FRESH_MS
+    }
+
+    /**
+     * Фиксирует ONLINE после валидного ответа BMS (не после одной отправки write).
+     */
+    private fun markBatteryOnlineFromValidResponse(address: String?, source: String) {
+        val addr = address?.trim().orEmpty()
+        if (addr.isBlank() || addr == TEST_BATTERY_ADDRESS) return
+        val key = normalizeBleAddress(addr)
+        batteriesSeenInScan.add(key)
+        Log.d(
+            BATTERY_AVAILABILITY_TAG,
+            "battery=$key responseReceived=true source=$source status=ONLINE",
+        )
+        if (screenState == "batteries") {
+            runOnUiThread { refreshBatteryPresenceCard(addr) }
+        }
     }
 
     /**
@@ -1610,10 +1665,9 @@ class MainActivity : ComponentActivity() {
             BatteryPresenceState.ONLINE -> showJournalScreen()
             BatteryPresenceState.CHECKING ->
                 toast("Проверяем состояние батареи…")
-            BatteryPresenceState.SLEEPING,
             BatteryPresenceState.UNAVAILABLE,
             null ->
-                toast("Журнал доступен только при активной BMS")
+                toast("Журнал доступен только когда батарея в сети")
         }
     }
 
@@ -1663,10 +1717,13 @@ class MainActivity : ComponentActivity() {
             }
             state == BatteryPresenceState.UNAVAILABLE -> {
                 host.background = round(Color.rgb(241, 243, 245), dp(13), Color.TRANSPARENT, 0)
-                val title = if (!::bluetoothAdapter.isInitialized || !bluetoothAdapter.isEnabled) {
-                    "Bluetooth выключен"
-                } else {
-                    "Не удалось проверить состояние батареи"
+                val title = when {
+                    !::bluetoothAdapter.isInitialized || !bluetoothAdapter.isEnabled ->
+                        "Bluetooth выключен"
+                    !hasBlePermissions() ->
+                        "Нет доступа к Bluetooth"
+                    else ->
+                        "Не в сети"
                 }
                 host.addView(TextView(this).apply {
                     text = title
@@ -1674,21 +1731,24 @@ class MainActivity : ComponentActivity() {
                     setTextColor(Color.rgb(75, 79, 84))
                     typeface = interFont(760)
                 })
+                if (title == "Не в сети") {
+                    host.addView(TextView(this).apply {
+                        text = "BMS не отвечает в эфире. Подойдите ближе или нажмите на карточку для подключения."
+                        textSize = 12f
+                        setTextColor(Color.rgb(111, 119, 129))
+                        typeface = interFont(600)
+                    }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+                }
             }
             else -> {
+                // Запасной путь (не должен срабатывать после удаления SLEEPING).
                 host.background = round(Color.rgb(241, 243, 245), dp(13), Color.TRANSPARENT, 0)
                 host.addView(TextView(this).apply {
-                    text = "Батарея находится в спящем режиме"
+                    text = "Проверяем состояние батареи…"
                     textSize = 13f
-                    setTextColor(Color.rgb(75, 79, 84))
-                    typeface = interFont(760)
-                })
-                host.addView(TextView(this).apply {
-                    text = "Подключите зарядное устройство или потребителя, чтоб вывести батарею из спящего режима"
-                    textSize = 12f
                     setTextColor(Color.rgb(111, 119, 129))
-                    typeface = interFont(600)
-                }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+                    typeface = interFont(700)
+                })
             }
         }
     }
@@ -1761,8 +1821,15 @@ class MainActivity : ComponentActivity() {
 
         stopBleScanQuietly()
         try {
-            scanner.startScan(scanCallback)
-            Log.i(BMS_BLE_TAG, "Batteries presence scan started")
+            val settings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .build()
+            scanner.startScan(emptyList(), settings, scanCallback)
+            Log.i(BMS_BLE_TAG, "Batteries presence scan started windowMs=$PRESENCE_SCAN_WINDOW_MS")
+            Log.d(
+                BATTERY_AVAILABILITY_TAG,
+                "checkStarted transport=ble_scan windowMs=$PRESENCE_SCAN_WINDOW_MS resetSeen=$resetSeen",
+            )
         } catch (e: Exception) {
             Log.w(BMS_BLE_TAG, "Presence scan failed: ${e.message}")
             batteriesPresenceScanActive = false
@@ -1771,14 +1838,18 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // После окна — SLEEPING для ненайденных; scan оставляем для wake-up, пока экран открыт.
+        // После окна — UNAVAILABLE для ненайденных; scan оставляем, чтобы позже стать ONLINE.
         mainHandler.postDelayed({
             if (token != batteriesPresenceScanToken) return@postDelayed
             if (screenState != "batteries") return@postDelayed
             batteriesPresenceScanCompleted = true
             Log.i(BMS_BLE_TAG, "Presence scan window done seen=${batteriesSeenInScan.size}")
+            Log.d(
+                BATTERY_AVAILABILITY_TAG,
+                "scanWindowDone seen=${batteriesSeenInScan.size} finalUnset=UNAVAILABLE",
+            )
             refreshAllBatteryPresenceCards()
-        }, 8000L)
+        }, PRESENCE_SCAN_WINDOW_MS)
     }
 
     private fun stopBatteriesPresenceScan() {
@@ -1807,7 +1878,7 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Карточка сохранённой батареи на экране «Мои батареи».
-     * Presence: CONNECTED или FOUND IN SCAN → ONLINE; иначе после scan → SLEEPING.
+     * Presence: CONNECTED+telemetry или FOUND IN SCAN → ONLINE; иначе после scan → UNAVAILABLE.
      */
     private fun savedBatteryCard(battery: SavedBattery): View {
         val displayName = battery.customName.ifBlank {
@@ -1919,11 +1990,13 @@ class MainActivity : ComponentActivity() {
                 saveBatteries(loadSavedBatteries().filterNot {
                     it.address == battery.address
                 })
+                // Отвязка от профиля на сервере: иначе после login АКБ вернётся.
+                // Саму запись АКБ в админке не удаляем.
+                unlinkBatteryFromUserAsync(battery)
                 if (wasSelected) {
                     disconnectGatt()
                     selectedAddress = null
                     selectedDeviceName = ""
-                    // Локальное удаление не трогает серверную историю.
                     // Очищаем только volatile-состояние текущей сессии, чтобы SN/конфиг
                     // не ушли на сервер под uid=unknown_bms.
                     configRegisters.clear()
@@ -1968,7 +2041,7 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Ищет в эфире только сохранённую BMS по MAC.
-     * Если BLE-модуль не рекламируется (глубокий сон) — батарея остаётся в списке как sleeping.
+     * Если BLE-модуль не рекламируется — батарея «Не в сети» (не аппаратный sleep).
      */
     @SuppressLint("MissingPermission")
     private fun startTargetedScanForSavedBattery(address: String) {
@@ -2020,12 +2093,16 @@ class MainActivity : ComponentActivity() {
             if (token != targetedScanToken) return@postDelayed
             if (targetedScanAddress == null) return@postDelayed
             Log.i(BMS_BLE_TAG, "Saved BMS not found during scan")
-            Log.i(BMS_BLE_TAG, "BMS considered sleeping/offline")
+            Log.i(BMS_BLE_TAG, "BMS considered offline/unavailable")
+            Log.d(
+                BATTERY_AVAILABILITY_TAG,
+                "battery=$address targetedScan timeout status=UNAVAILABLE",
+            )
             stopBleScanQuietly()
             targetedScanAddress = null
             runOnUiThread {
                 if (screenState == "loading") {
-                    toast("Батарея находится в спящем режиме")
+                    toast("Батарея не в сети")
                     showBatteriesScreen(asRootHome = true)
                 }
             }
@@ -2093,6 +2170,7 @@ class MainActivity : ComponentActivity() {
         if (!wakeInProgress) return
         Log.i(BMS_WAKE_TAG, "Response received")
         Log.i(BMS_BLE_TAG, "BMS ONLINE")
+        markBatteryOnlineFromValidResponse(selectedAddress, source = "wake_0x90")
         finishWakeSequence(gotResponse = true)
     }
 
@@ -7067,14 +7145,23 @@ class MainActivity : ComponentActivity() {
         val user = body.optJSONObject("user")
         val remotePhone = normalizePhoneE164(user?.optString("phone").orEmpty().ifBlank { fallbackPhone })
         val remoteName = user?.optString("name").orEmpty().ifBlank { fallbackName }
+        val avatarUrl = user?.optString("avatar_url").orEmpty().trim()
+        val localAvatar = profileAvatarFile(remotePhone)
         userProfilePrefs().edit()
             .putBoolean("logged_in", true)
             .putString("name", remoteName)
             .putString("phone", remotePhone)
             .putString("email", user?.optString("email").orEmpty())
             .putString("birth", user?.optString("birth").orEmpty())
+            .putString("avatar_url", avatarUrl)
+            .putString(
+                "avatar_uri",
+                if (localAvatar.exists()) localAvatar.absolutePath else "",
+            )
             .apply()
         authPendingNationalPhone = extractRuNationalDigits(remotePhone)
+        // Восстанавливаем аватар с backend (не полагаемся только на локальный URI).
+        restoreProfileAvatarAfterLogin(remotePhone, avatarUrl)
         val batteries = mapServerBatteriesToSaved(body.optJSONArray("batteries"))
         saveBatteries(batteries)
         val pending = pendingAuthAction
@@ -7192,21 +7279,21 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Logout: только локальная сессия. АКБ на сервере НЕ удаляются.
+     * Logout: только локальная сессия.
+     * Не удаляет профиль/аватар/АКБ на backend и не стирает per-user cache аватара.
      */
     private fun logoutUserSession() {
         if (isServiceApp()) return
         loginGeneration += 1
         loginLoading = false
+        avatarUploadState = "Idle"
         disconnectGatt()
         selectedAddress = null
         selectedDeviceName = ""
         saveBatteries(emptyList())
         clearUiBackStack()
         stopBatteriesPresenceScan()
-        // Профиль и аватар очищаем локально; серверные АКБ остаются.
-        val avatarFile = profileAvatarFile()
-        if (avatarFile.exists()) avatarFile.delete()
+        // Очищаем runtime-сессию. Серверный avatar/profile/АКБ не трогаем.
         userProfilePrefs().edit().clear().apply()
         supportPrefs?.edit()?.clear()?.apply()
         loginLoading = false
@@ -7225,9 +7312,15 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
-    private fun profileAvatarFile(): File {
+    /**
+     * Локальный cache-файл аватара, привязанный к телефону пользователя (E.164 digits).
+     * Не использует один глобальный avatar.jpg для всех аккаунтов.
+     */
+    private fun profileAvatarFile(phone: String = normalizePhoneE164()): File {
         val dir = File(filesDir, "profile_avatars").apply { mkdirs() }
-        return File(dir, "avatar.jpg")
+        val digits = phone.filter { it.isDigit() }
+        val name = if (digits.isNotBlank()) "avatar_$digits.jpg" else "avatar_pending.jpg"
+        return File(dir, name)
     }
 
     private fun showProfileAvatarChooser() {
@@ -7271,12 +7364,24 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Копирует выбранное изображение во внутреннее хранилище приложения.
-     * EXIF orientation применяется до JPEG-сохранения, чтобы вертикальные фото
-     * не оказывались «боком» и не поворачивались повторно при отображении.
+     * EXIF → resize/compress → локальный cache по user phone → upload на backend.
+     * При ошибке upload предыдущий аватар не удаляется.
      */
     private fun persistProfileAvatarFromUri(source: Uri) {
+        if (avatarUploadState == "Uploading") {
+            toast("Фото уже загружается…")
+            return
+        }
+        val phone = normalizePhoneE164()
+        if (phone.isBlank() || !isUserSessionActive()) {
+            toast("Сначала войдите в профиль")
+            return
+        }
+        avatarUploadState = "Uploading"
+        updateProfileAvatarStatusUi()
         thread {
+            val outFile = profileAvatarFile(phone)
+            val previousBytes = if (outFile.exists()) outFile.readBytes() else null
             try {
                 val bitmap = OrientedBitmapLoader.loadOrientedBitmap(
                     context = this,
@@ -7284,30 +7389,203 @@ class MainActivity : ComponentActivity() {
                     maxSide = 1024,
                 )
                 if (bitmap == null) {
-                    runOnUiThread { toast("Не удалось прочитать изображение") }
+                    avatarUploadState = "Error"
+                    runOnUiThread {
+                        updateProfileAvatarStatusUi()
+                        toast("Не удалось прочитать изображение")
+                    }
                     return@thread
                 }
-                val outFile = profileAvatarFile()
-                outFile.outputStream().use { output ->
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 88, output)
+                val jpegBytes = ByteArrayOutputStream().use { baos ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 88, baos)
+                    bitmap.recycle()
+                    baos.toByteArray()
                 }
-                bitmap.recycle()
+                // Сначала локальный preview; при ошибке upload откатим к previousBytes.
+                outFile.outputStream().use { it.write(jpegBytes) }
                 userProfilePrefs().edit()
                     .putString("avatar_uri", outFile.absolutePath)
                     .apply()
                 runOnUiThread {
+                    if (screenState == "profile") showProfileScreen()
+                    else updateProfileAvatarStatusUi()
+                }
+
+                val uploaded = uploadProfileAvatarJpeg(phone, jpegBytes)
+                if (uploaded == null) {
+                    if (previousBytes != null) {
+                        outFile.outputStream().use { it.write(previousBytes) }
+                        userProfilePrefs().edit()
+                            .putString("avatar_uri", outFile.absolutePath)
+                            .apply()
+                    } else if (outFile.exists()) {
+                        // Новый файл без успешного upload не считаем подтверждённым сервером.
+                        outFile.delete()
+                        userProfilePrefs().edit().remove("avatar_uri").apply()
+                    }
+                    avatarUploadState = "Error"
+                    runOnUiThread {
+                        updateProfileAvatarStatusUi()
+                        toast("Не удалось загрузить фото. Попробуйте еще раз.")
+                        if (screenState == "profile") showProfileScreen()
+                    }
+                    return@thread
+                }
+                val avatarUrl = uploaded.optString("avatar_url").orEmpty()
+                userProfilePrefs().edit()
+                    .putString("avatar_uri", outFile.absolutePath)
+                    .putString("avatar_url", avatarUrl)
+                    .apply()
+                avatarUploadState = "Success"
+                runOnUiThread {
+                    updateProfileAvatarStatusUi()
                     toast("Фото профиля сохранено")
                     if (screenState == "profile") showProfileScreen()
                 }
             } catch (e: Exception) {
                 Log.w(BLE_LOG_TAG, "PROFILE AVATAR persist failed: ${e.message}")
-                runOnUiThread { toast("Не удалось сохранить фото") }
+                if (previousBytes != null) {
+                    try {
+                        outFile.outputStream().use { it.write(previousBytes) }
+                    } catch (_: Exception) { /* ignore */ }
+                }
+                avatarUploadState = "Error"
+                runOnUiThread {
+                    updateProfileAvatarStatusUi()
+                    toast("Не удалось загрузить фото. Попробуйте еще раз.")
+                    if (screenState == "profile") showProfileScreen()
+                }
+            }
+        }
+    }
+
+    /**
+     * Upload JPEG аватара на backend.
+     * @return user JSONObject при успехе, иначе null.
+     */
+    private fun uploadProfileAvatarJpeg(phone: String, jpegBytes: ByteArray): JSONObject? {
+        return try {
+            val body = JSONObject().apply {
+                putBmsApiKey(this)
+                put("phone", phone)
+                put("image_base64", Base64.encodeToString(jpegBytes, Base64.NO_WRAP))
+            }
+            val conn = (URL(adminServerUrl(USER_AVATAR_PATH)).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 15000
+                readTimeout = 30000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                setRequestProperty("Accept", "application/json")
+                applyBmsApiAuth(this)
+            }
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val raw = try {
+                (if (code in 200..299) conn.inputStream else conn.errorStream)
+                    ?.bufferedReader()?.use { it.readText() }
+                    .orEmpty()
+            } finally {
+                conn.disconnect()
+            }
+            val json = try {
+                JSONObject(raw.ifBlank { "{}" })
+            } catch (_: Exception) {
+                JSONObject()
+            }
+            if (code in 200..299 && json.optBoolean("ok")) {
+                json.optJSONObject("user")
+            } else {
+                Log.w(BLE_LOG_TAG, "PROFILE AVATAR upload failed http=$code error=${json.optString("error")}")
+                null
+            }
+        } catch (e: Exception) {
+            Log.w(BLE_LOG_TAG, "PROFILE AVATAR upload error: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * После login/register: показать локальный cache (если есть), затем скачать с backend.
+     */
+    private fun restoreProfileAvatarAfterLogin(phone: String, avatarUrl: String) {
+        if (phone.isBlank()) return
+        val local = profileAvatarFile(phone)
+        if (local.exists()) {
+            userProfilePrefs().edit()
+                .putString("avatar_uri", local.absolutePath)
+                .apply()
+        }
+        if (avatarUrl.isBlank()) return
+        thread {
+            try {
+                val url = if (avatarUrl.startsWith("http", ignoreCase = true)) {
+                    avatarUrl
+                } else {
+                    adminServerUrl(avatarUrl)
+                }
+                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 12000
+                    readTimeout = 20000
+                    setRequestProperty("Accept", "image/jpeg,image/*")
+                    applyBmsApiAuth(this)
+                }
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    conn.disconnect()
+                    return@thread
+                }
+                val bytes = conn.inputStream.use { it.readBytes() }
+                conn.disconnect()
+                if (bytes.isEmpty() || bytes.size < 2 || bytes[0] != 0xFF.toByte() || bytes[1] != 0xD8.toByte()) {
+                    return@thread
+                }
+                local.outputStream().use { it.write(bytes) }
+                userProfilePrefs().edit()
+                    .putString("avatar_uri", local.absolutePath)
+                    .putString("avatar_url", avatarUrl)
+                    .apply()
+                runOnUiThread {
+                    if (screenState == "profile") showProfileScreen()
+                }
+            } catch (e: Exception) {
+                Log.w(BLE_LOG_TAG, "PROFILE AVATAR restore failed: ${e.message}")
+            }
+        }
+    }
+
+    private fun updateProfileAvatarStatusUi() {
+        val view = profileAvatarStatusText ?: return
+        when (avatarUploadState) {
+            "Uploading" -> {
+                view.visibility = View.VISIBLE
+                view.setTextColor(Color.rgb(90, 90, 90))
+                view.text = "Загрузка фото…"
+            }
+            "Error" -> {
+                view.visibility = View.VISIBLE
+                view.setTextColor(Color.rgb(180, 35, 45))
+                view.text = "Не удалось загрузить фото. Попробуйте еще раз."
+            }
+            "Success" -> {
+                view.visibility = View.GONE
+                view.text = ""
+            }
+            else -> {
+                view.visibility = View.GONE
+                view.text = ""
             }
         }
     }
 
     private fun loadProfileAvatarInto(imageView: ImageView) {
-        val path = userProfilePrefs().getString("avatar_uri", "").orEmpty()
+        val phone = normalizePhoneE164()
+        val preferred = profileAvatarFile(phone)
+        val path = when {
+            preferred.exists() -> preferred.absolutePath
+            else -> userProfilePrefs().getString("avatar_uri", "").orEmpty()
+        }
         if (path.isBlank()) {
             imageView.setImageResource(android.R.drawable.ic_menu_myplaces)
             return
@@ -7317,8 +7595,7 @@ class MainActivity : ComponentActivity() {
             if (file.exists()) {
                 imageView.setImageBitmap(BitmapFactory.decodeFile(file.absolutePath))
             } else {
-                // Совместимость со старым content:// URI.
-                imageView.setImageURI(Uri.parse(path))
+                imageView.setImageResource(android.R.drawable.ic_menu_myplaces)
             }
         } catch (_: Exception) {
             imageView.setImageResource(android.R.drawable.ic_menu_myplaces)
@@ -7372,7 +7649,58 @@ class MainActivity : ComponentActivity() {
                 conn.disconnect()
                 Log.i(BLE_LOG_TAG, "USER LINK BATTERY http=$code body=${response.take(200)}")
             } catch (e: Exception) {
-                Log.w(BLE_LOG_TAG, "USER LINK BATTERY EXCEPTION: ${e.message}")
+                Log.w(BLE_LOG_TAG, "USER LINK BATTERY failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * Отвязка АКБ от профиля пользователя на backend.
+     * Сбрасывает owner_phone у записи батареи; телеметрию и саму АКБ не удаляет.
+     *
+     * @param battery локальная сохранённая батарея (идентификатор — bluetooth address).
+     */
+    private fun unlinkBatteryFromUserAsync(battery: SavedBattery) {
+        if (isServiceApp() || !isUserSessionActive()) return
+        val phone = normalizePhoneE164()
+        val address = battery.address.trim()
+        if (phone.isBlank() || address.isBlank()) return
+        thread {
+            try {
+                val body = JSONObject().apply {
+                    putBmsApiKey(this)
+                    put("phone", phone)
+                    put("bluetooth_address", address)
+                }
+                val conn = (URL(adminServerUrl(USER_UNLINK_BATTERY_PATH)).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 10000
+                    readTimeout = 15000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                    setRequestProperty("Accept", "application/json")
+                    applyBmsApiAuth(this)
+                }
+                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCode
+                val response = try {
+                    val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                    stream?.bufferedReader(Charsets.UTF_8)?.readText().orEmpty()
+                } catch (_: Exception) {
+                    ""
+                }
+                conn.disconnect()
+                Log.i(BLE_LOG_TAG, "USER UNLINK BATTERY http=$code body=${response.take(200)}")
+                if (code !in 200..299) {
+                    runOnUiThread {
+                        toast("АКБ удалена локально. Синхронизация с сервером не удалась.")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(BLE_LOG_TAG, "USER UNLINK BATTERY failed: ${e.message}")
+                runOnUiThread {
+                    toast("АКБ удалена локально. Синхронизация с сервером не удалась.")
+                }
             }
         }
     }
@@ -7477,14 +7805,25 @@ class MainActivity : ComponentActivity() {
         loadProfileAvatarInto(avatar)
         avatarWrap.addView(avatar, LinearLayout.LayoutParams(dp(104), dp(104)))
         avatarWrap.addView(TextView(this).apply {
-            text = "✎  Изменить фото"
+            text = if (avatarUploadState == "Uploading") "Загрузка…" else "✎  Изменить фото"
             textSize = 12f
             typeface = interFont(760)
             gravity = Gravity.CENTER
             setTextColor(Color.rgb(16, 17, 20))
             background = round(Color.WHITE, dp(12), Color.rgb(223, 229, 235), 1)
-            setOnClickListener { showProfileAvatarChooser() }
+            isEnabled = avatarUploadState != "Uploading"
+            setOnClickListener {
+                if (avatarUploadState != "Uploading") showProfileAvatarChooser()
+            }
         }, marginLp(-2, dp(40), 0, 10, 0, 10))
+        val avatarStatus = TextView(this).apply {
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, dp(4))
+        }
+        profileAvatarStatusText = avatarStatus
+        avatarWrap.addView(avatarStatus, LinearLayout.LayoutParams(-1, -2))
+        updateProfileAvatarStatusUi()
         content.addView(avatarWrap)
 
         val profileCard = card()
@@ -9628,13 +9967,13 @@ class MainActivity : ComponentActivity() {
         val presence = resolveCurrentBmsPresence()
         if (presence != BatteryPresenceState.ONLINE) {
             val inactiveTitle = when (presence) {
-                BatteryPresenceState.SLEEPING -> "BMS неактивна"
                 BatteryPresenceState.CHECKING -> "Проверяем состояние батареи…"
-                else -> "BMS неактивна"
+                BatteryPresenceState.UNAVAILABLE -> "Батарея не в сети"
+                BatteryPresenceState.ONLINE, null -> "Батарея не в сети"
             }
             val inactiveSub = when (presence) {
                 BatteryPresenceState.CHECKING -> "Журнал станет доступен после проверки"
-                else -> "Журнал доступен только при активной BMS"
+                else -> "Журнал доступен только когда батарея в сети"
             }
             content.addView(TextView(this).apply {
                 text = inactiveTitle
@@ -10678,6 +11017,8 @@ class MainActivity : ComponentActivity() {
         }
         data.lastUpdatedAt = System.currentTimeMillis()
         Log.d(BLE_LOG_TAG, "parsed cmd=0x%02X".format(cmd))
+        // Валидный ответ Daly подтверждает доступность (не факт одной отправки write).
+        markBatteryOnlineFromValidResponse(selectedAddress, source = "daly_0x%02X".format(cmd))
         if (wakeInProgress) {
             // Любой валидный ответ Daly после connect = MCU очнулась.
             onWakeResponseReceived()
@@ -13362,6 +13703,15 @@ class MainActivity : ComponentActivity() {
                     super.onBackPressed()
                 }
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // При возврате из background presence мог устареть — перепроверяем.
+        if (screenState == "batteries" && loadSavedBatteries().isNotEmpty()) {
+            Log.d(BATTERY_AVAILABILITY_TAG, "onResume restart presence check")
+            startBatteriesPresenceScan(resetSeen = true)
         }
     }
 
