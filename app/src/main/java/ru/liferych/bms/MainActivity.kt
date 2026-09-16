@@ -64,6 +64,7 @@ import org.json.JSONObject
 import ru.liferych.bms.cellcode.CellCodeDecoder
 import ru.liferych.bms.cellcode.CellCodeRecognition
 import ru.liferych.bms.cellcode.CellQrDecodeResult
+import ru.liferych.bms.image.OrientedBitmapLoader
 import kotlin.concurrent.thread
 import kotlin.math.max
 import kotlin.math.min
@@ -510,6 +511,11 @@ class MainActivity : ComponentActivity() {
     private var loginGeneration: Int = 0
     /** Национальная часть номера, переносимая Login → Register. */
     private var authPendingNationalPhone: String = ""
+    /**
+     * Действие после успешного Login/Register.
+     * Сейчас: "add_battery" — продолжить добавление АКБ; null — на «Мои батареи».
+     */
+    private var pendingAuthAction: String? = null
     private val WARRANTY_PAGE_SIZE = 5
     private val warrantyMediaUris: MutableList<Uri> = mutableListOf()
     /** Временный URI для системной камеры (ACTION_IMAGE_CAPTURE). */
@@ -783,11 +789,9 @@ class MainActivity : ComponentActivity() {
         requestBlePermissions()
         if (isServiceApp()) {
             showSplashScreen()
-        } else if (isUserSessionActive()) {
-            // Уже вошли: сразу список АКБ текущего пользователя.
-            showBatteriesScreen(asRootHome = true)
         } else {
-            showLoginScreen()
+            // Авторизация не блокирует старт: всегда «Мои батареи» (гость или сессия).
+            showBatteriesScreen(asRootHome = true)
         }
         val debugAddress = intent.getStringExtra("debug_connect_address")
         val isDebuggable =
@@ -1401,8 +1405,10 @@ class MainActivity : ComponentActivity() {
 
     private fun showBatteriesScreen(asRootHome: Boolean = false) {
         if (!isServiceApp() && !isUserSessionActive()) {
-            showLoginScreen()
-            return
+            // Гостевой режим: чужие/устаревшие локальные АКБ не показываем.
+            if (loadSavedBatteries().isNotEmpty()) {
+                saveBatteries(emptyList())
+            }
         }
         if (asRootHome) clearUiBackStack()
         enterScreen("batteries", track = !asRootHome)
@@ -1495,6 +1501,8 @@ class MainActivity : ComponentActivity() {
             content.addView(TextView(this).apply {
                 text = if (isServiceApp()) {
                     "В этой сессии АКБ ещё не добавлены"
+                } else if (!isUserSessionActive()) {
+                    "У вас пока нет добавленных батарей.\nВойдите, чтобы добавить АКБ и синхронизировать список."
                 } else {
                     "Сохранённых батарей пока нет"
                 }
@@ -2270,16 +2278,17 @@ class MainActivity : ComponentActivity() {
         return row to national
     }
 
+    /**
+     * Старт добавления АКБ. Без авторизации — Login/Register с pending «add_battery».
+     * Гость не может сохранить АКБ локально без профиля.
+     */
     private fun beginAddBatteryFlow() {
-        if (!isProfileComplete()) {
-            AlertDialog.Builder(this)
-                .setTitle("Сначала войдите в профиль")
-                .setMessage("Для добавления АКБ необходимо войти по номеру телефона.")
-                .setPositiveButton("Войти") { _, _ -> showLoginScreen() }
-                .setNegativeButton("Отмена", null)
-                .show()
+        if (!isServiceApp() && !isUserSessionActive()) {
+            pendingAuthAction = "add_battery"
+            showLoginScreen(allowBackToBatteries = true)
             return
         }
+        pendingAuthAction = null
         disconnectGatt()
         showSearchScreen()
         startScan()
@@ -3294,11 +3303,12 @@ class MainActivity : ComponentActivity() {
     private fun navigateBackUi(): Boolean {
         when (screenState) {
             "login" -> {
-                // Экран входа — корень после logout; Back не возвращает в профиль.
-                return false
+                pendingAuthAction = null
+                showBatteriesScreen(asRootHome = true)
+                return true
             }
             "register" -> {
-                showLoginScreen()
+                showLoginScreen(allowBackToBatteries = true)
                 return true
             }
             "qr_scan" -> {
@@ -3462,10 +3472,6 @@ class MainActivity : ComponentActivity() {
             typeface = interFont(if (selected) 700 else 650)
             setOnClickListener {
                 if (text.contains("Главная")) {
-                    if (!isServiceApp() && !isUserSessionActive()) {
-                        showLoginScreen()
-                        return@setOnClickListener
-                    }
                     val onWorkingHome = screenState == "dashboard" && currentSavedBatteryOrNull() != null
                     val onListHome = screenState == "batteries" && currentSavedBatteryOrNull() == null
                     if (onWorkingHome || onListHome) return@setOnClickListener
@@ -3502,10 +3508,6 @@ class MainActivity : ComponentActivity() {
                     clearWarrantyFormState()
                     showSupportScreen()
                 } else if (text.contains("Профиль")) {
-                    if (!isServiceApp() && !isUserSessionActive()) {
-                        showLoginScreen()
-                        return@setOnClickListener
-                    }
                     if (screenState == "profile") return@setOnClickListener
                     showProfileScreen()
                 }
@@ -6708,19 +6710,22 @@ class MainActivity : ComponentActivity() {
      * Экран входа: только поиск пользователя по телефону.
      * Не создаёт профиль — для этого showRegisterScreen.
      */
-    private fun showLoginScreen(prefillPhone: String = authPendingNationalPhone) {
+    private fun showLoginScreen(
+        prefillPhone: String = authPendingNationalPhone,
+        allowBackToBatteries: Boolean = true,
+    ) {
         if (isServiceApp()) {
             showSplashScreen()
             return
         }
-        clearUiBackStack()
+        // Не делаем Login корнем приложения: Back → «Мои батареи».
         enterScreen("login", track = false)
         currentTab = "profile"
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(bg)
         }
-        root.addView(header("Вход", showBack = false, showBrand = true))
+        root.addView(header("Вход", showBack = allowBackToBatteries, showBrand = true))
         val scroll = ScrollView(this)
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -6999,8 +7004,10 @@ class MainActivity : ComponentActivity() {
                 loginLoading = false
                 val (httpCode, body) = result ?: (0 to null)
                 if (body == null) {
-                    loginStatusText?.text = "Не удалось связаться с сервером. Проверьте интернет и повторите."
-                    toast("Ошибка регистрации")
+                    showRegisterFailure(
+                        "Не удалось подключиться к серверу. Проверьте интернет и повторите.",
+                        toastText = "Нет связи с сервером",
+                    )
                     return@runOnUiThread
                 }
                 val error = body.optString("error")
@@ -7016,14 +7023,44 @@ class MainActivity : ComponentActivity() {
                         .show()
                     return@runOnUiThread
                 }
-                if (!body.optBoolean("ok") && httpCode !in 200..299) {
-                    loginStatusText?.text = "Ошибка регистрации."
-                    toast("Ошибка регистрации")
+                if (httpCode in 200..299 && body.optBoolean("ok")) {
+                    applyAuthSuccess(body, fallbackPhone = phone, fallbackName = name)
                     return@runOnUiThread
                 }
-                applyAuthSuccess(body, fallbackPhone = phone, fallbackName = name)
+                val message = registerFailureMessage(httpCode, error)
+                Log.e(
+                    "AuthRegister",
+                    "Registration failed http=$httpCode error=$error message=$message",
+                )
+                showRegisterFailure(message)
             }
         }
+    }
+
+    /** Понятное сообщение по HTTP/error коду регистрации (без stack trace). */
+    private fun registerFailureMessage(httpCode: Int, error: String): String {
+        return when {
+            error == "invalid_phone" || httpCode == 400 && error.contains("phone") ->
+                "Некорректный номер телефона"
+            error == "name_required" ->
+                "Укажите ФИО для регистрации"
+            error == "unauthorized" || httpCode == 401 ->
+                "Ошибка авторизации приложения на сервере"
+            error == "not_found" || httpCode == 404 ->
+                "Сервер не поддерживает регистрацию (endpoint недоступен). Обновите backend."
+            httpCode in 500..599 ->
+                "Ошибка сервера. Попробуйте позже."
+            error.isNotBlank() ->
+                "Не удалось зарегистрироваться ($error)"
+            else ->
+                "Не удалось зарегистрироваться (HTTP $httpCode)"
+        }
+    }
+
+    private fun showRegisterFailure(message: String, toastText: String = "Ошибка регистрации") {
+        loginStatusText?.setTextColor(Color.rgb(180, 35, 45))
+        loginStatusText?.text = message
+        toast(toastText)
     }
 
     private fun applyAuthSuccess(body: JSONObject, fallbackPhone: String, fallbackName: String) {
@@ -7040,7 +7077,16 @@ class MainActivity : ComponentActivity() {
         authPendingNationalPhone = extractRuNationalDigits(remotePhone)
         val batteries = mapServerBatteriesToSaved(body.optJSONArray("batteries"))
         saveBatteries(batteries)
+        val pending = pendingAuthAction
+        pendingAuthAction = null
         clearUiBackStack()
+        if (pending == "add_battery") {
+            if (batteries.isNotEmpty()) {
+                toast("АКБ: ${batteries.size}")
+            }
+            beginAddBatteryFlow()
+            return
+        }
         showBatteriesScreen(asRootHome = true)
         if (batteries.isEmpty()) {
             toast("Готово")
@@ -7068,7 +7114,18 @@ class MainActivity : ComponentActivity() {
                 if (email != null) put("email", email)
                 if (birth != null) put("birth", birth)
             }
-            val conn = (URL(adminServerUrl(path)).openConnection() as HttpURLConnection).apply {
+            val url = adminServerUrl(path)
+            val maskedPhone = maskPhoneForLog(phone)
+            if (BuildConfig.DEBUG) {
+                val safeKeys = body.keys().asSequence().toList().filter { it != "api_key" }
+                Log.i(
+                    "AuthRegister",
+                    "REQUEST method=POST url=$url phone=$maskedPhone " +
+                        "has_name=${name != null} has_email=${!email.isNullOrBlank()} " +
+                        "body_keys=$safeKeys",
+                )
+            }
+            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 connectTimeout = 12000
                 readTimeout = 20000
@@ -7087,11 +7144,22 @@ class MainActivity : ComponentActivity() {
             }
             conn.disconnect()
             Log.i(BLE_LOG_TAG, "USER AUTH $path http=$code body=${response.take(300)}")
+            if (BuildConfig.DEBUG) {
+                Log.i("AuthRegister", "RESPONSE http=$code body=${response.take(400)}")
+            }
             if (response.isBlank()) null else code to JSONObject(response)
         } catch (e: Exception) {
+            Log.e("AuthRegister", "Registration/network exception: ${e.javaClass.simpleName}: ${e.message}", e)
             Log.w(BLE_LOG_TAG, "USER AUTH $path EXCEPTION: ${e.message}")
             null
         }
+    }
+
+    /** Маскирует телефон для логов: +7999***4567. */
+    private fun maskPhoneForLog(phone: String): String {
+        val digits = phone.filter { it.isDigit() }
+        if (digits.length < 6) return "***"
+        return "+${digits.take(4)}***${digits.takeLast(4)}"
     }
 
     private fun mapServerBatteriesToSaved(arr: JSONArray?): List<SavedBattery> {
@@ -7142,7 +7210,9 @@ class MainActivity : ComponentActivity() {
         userProfilePrefs().edit().clear().apply()
         supportPrefs?.edit()?.clear()?.apply()
         loginLoading = false
-        showLoginScreen()
+        pendingAuthAction = null
+        authPendingNationalPhone = ""
+        showBatteriesScreen(asRootHome = true)
         toast("Вы вышли из профиля")
     }
 
@@ -7202,35 +7272,26 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Копирует выбранное изображение во внутреннее хранилище приложения.
-     * Так аватар переживает перезапуск и не зависит от content:// URI галереи.
+     * EXIF orientation применяется до JPEG-сохранения, чтобы вертикальные фото
+     * не оказывались «боком» и не поворачивались повторно при отображении.
      */
     private fun persistProfileAvatarFromUri(source: Uri) {
         thread {
             try {
-                val decoded = contentResolver.openInputStream(source)?.use { input ->
-                    BitmapFactory.decodeStream(input)
-                }
-                if (decoded == null) {
+                val bitmap = OrientedBitmapLoader.loadOrientedBitmap(
+                    context = this,
+                    uri = source,
+                    maxSide = 1024,
+                )
+                if (bitmap == null) {
                     runOnUiThread { toast("Не удалось прочитать изображение") }
                     return@thread
-                }
-                val maxSide = 1024
-                val scale = min(1f, maxSide.toFloat() / max(decoded.width, decoded.height).toFloat())
-                val bitmap = if (scale < 0.999f) {
-                    Bitmap.createScaledBitmap(
-                        decoded,
-                        max(1, (decoded.width * scale).toInt()),
-                        max(1, (decoded.height * scale).toInt()),
-                        true
-                    ).also { if (it != decoded) decoded.recycle() }
-                } else {
-                    decoded
                 }
                 val outFile = profileAvatarFile()
                 outFile.outputStream().use { output ->
                     bitmap.compress(Bitmap.CompressFormat.JPEG, 88, output)
                 }
-                if (bitmap != decoded) bitmap.recycle() else decoded.recycle()
+                bitmap.recycle()
                 userProfilePrefs().edit()
                     .putString("avatar_uri", outFile.absolutePath)
                     .apply()
@@ -7316,13 +7377,71 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Гостевой профиль: Login/Register только по явному действию.
+     */
+    private fun showGuestProfileScreen() {
+        enterScreen("profile")
+        currentTab = "profile"
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(bg)
+        }
+        root.addView(header("Профиль", showBack = true))
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(18), dp(16), dp(18))
+        }
+        content.addView(TextView(this).apply {
+            text = "Профиль"
+            textSize = 22f
+            typeface = interFont(750)
+            setTextColor(Color.rgb(16, 17, 20))
+        }, marginLp(-1, -2, 0, 4, 0, 8))
+        content.addView(TextView(this).apply {
+            text = "Вы не авторизованы.\nВойдите, чтобы добавлять АКБ и синхронизировать список между устройствами."
+            textSize = 14f
+            setTextColor(Color.rgb(90, 90, 90))
+            setPadding(0, 0, 0, dp(16))
+        })
+        content.addView(TextView(this).apply {
+            text = "ВОЙТИ"
+            gravity = Gravity.CENTER
+            textSize = 15f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(red, dp(14), Color.TRANSPARENT, 0)
+            setOnClickListener {
+                pendingAuthAction = null
+                showLoginScreen(allowBackToBatteries = true)
+            }
+        }, marginLp(-1, dp(54), 0, 10, 0, 0))
+        content.addView(TextView(this).apply {
+            text = "ЗАРЕГИСТРИРОВАТЬСЯ"
+            gravity = Gravity.CENTER
+            textSize = 15f
+            typeface = interFont(700)
+            setTextColor(Color.rgb(16, 17, 20))
+            background = round(Color.WHITE, dp(14), Color.rgb(223, 229, 235), 1)
+            setOnClickListener {
+                pendingAuthAction = null
+                showRegisterScreen()
+            }
+        }, marginLp(-1, dp(54), 0, 10, 0, 0))
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(fixedBottomNav("profile"), LinearLayout.LayoutParams(-1, dp(70)))
+        setContentView(root)
+    }
+
     private fun showProfileScreen() {
         if (isServiceApp()) {
             showServiceProfileScreen()
             return
         }
         if (!isUserSessionActive()) {
-            showLoginScreen()
+            showGuestProfileScreen()
             return
         }
         enterScreen("profile")
@@ -8913,13 +9032,26 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Читает вложение, сжимает изображения до разумного JPEG и возвращает base64 + mime.
+     * Читает вложение, сжимает изображения до разумного JPEG (с EXIF orientation)
+     * и возвращает base64 + mime.
      * @return Pair(base64, mime) или null при ошибке чтения.
      */
     private fun encodeWarrantyMediaForUpload(uri: Uri): Pair<String, String>? {
         return try {
             val mime = contentResolver.getType(uri) ?: "application/octet-stream"
             if (mime.startsWith("image/")) {
+                // Предпочтительно: URI → EXIF → upright JPEG (без повторного EXIF rotate).
+                val oriented = OrientedBitmapLoader.loadOrientedBitmap(
+                    context = this,
+                    uri = uri,
+                    maxSide = 1600,
+                )
+                if (oriented != null) {
+                    val out = ByteArrayOutputStream()
+                    oriented.compress(Bitmap.CompressFormat.JPEG, 82, out)
+                    oriented.recycle()
+                    return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP) to "image/jpeg"
+                }
                 val original = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
                 val compressed = compressWarrantyImage(original)
                 val bytes = compressed ?: original.take(4 * 1024 * 1024).toByteArray()
@@ -8947,38 +9079,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Сжимает изображение до max 1600px по длинной стороне, JPEG quality 82. */
+    /** Сжимает изображение с учётом EXIF до max 1600px, JPEG quality 82. */
     private fun compressWarrantyImage(bytes: ByteArray): ByteArray? {
-        return try {
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-            val maxSide = max(bounds.outWidth, bounds.outHeight).coerceAtLeast(1)
-            var sample = 1
-            while (maxSide / sample > 1600) sample *= 2
-            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) ?: return null
-            val w = bitmap.width
-            val h = bitmap.height
-            val scale = min(1f, 1600f / max(w, h).toFloat())
-            val scaled = if (scale < 0.999f) {
-                Bitmap.createScaledBitmap(
-                    bitmap,
-                    max(1, (w * scale).toInt()),
-                    max(1, (h * scale).toInt()),
-                    true
-                ).also {
-                    if (it != bitmap) bitmap.recycle()
-                }
-            } else {
-                bitmap
-            }
-            val out = ByteArrayOutputStream()
-            scaled.compress(Bitmap.CompressFormat.JPEG, 82, out)
-            if (scaled != bitmap) scaled.recycle() else bitmap.recycle()
-            out.toByteArray()
-        } catch (_: Exception) {
-            null
-        }
+        return OrientedBitmapLoader.compressOrientedJpeg(
+            bytes = bytes,
+            maxSide = 1600,
+            quality = 82,
+        )
     }
 
     private fun openChartsScreen() {
