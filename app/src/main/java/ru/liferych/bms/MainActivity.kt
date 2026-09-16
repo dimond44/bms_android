@@ -65,13 +65,21 @@ import ru.liferych.bms.cellcode.CellCodeDecoder
 import ru.liferych.bms.cellcode.CellCodeRecognition
 import ru.liferych.bms.cellcode.CellQrDecodeResult
 import ru.liferych.bms.image.OrientedBitmapLoader
+import ru.liferych.bms.data.bms.DalyData
+import ru.liferych.bms.data.bms.DalyFrameParser
+import ru.liferych.bms.data.bms.DalyProtocol
+import ru.liferych.bms.data.bms.DalyRxBuffer
+import ru.liferych.bms.data.ble.DalyBleCharacteristics
+import ru.liferych.bms.data.ble.DalyBleClient
+import ru.liferych.bms.data.repository.DalyBmsRepository
+import ru.liferych.bms.domain.model.BmsConnectionState
 import kotlin.concurrent.thread
 import kotlin.math.max
 import kotlin.math.min
 
-private const val FRAME_START: Byte = 0xA5.toByte()
-private const val REQUEST_ADDRESS: Byte = 0x40
-private const val DATA_LEN: Byte = 0x08
+private val FRAME_START: Byte = DalyProtocol.FRAME_START
+private val REQUEST_ADDRESS: Byte = DalyProtocol.REQUEST_ADDRESS
+private val DATA_LEN: Byte = DalyProtocol.DATA_LEN
 private const val BLE_LOG_TAG = "LiferychBmsBle"
 private const val BMS_BLE_TAG = "BMS-BLE"
 private const val BMS_WAKE_TAG = "BMS-WAKE"
@@ -116,10 +124,10 @@ private const val HARDWARE_FAMILY_STANDARD = "standard"
 private const val HARDWARE_FAMILY_DL_RED = "dl_red"
 private const val HARDWARE_FAMILY_R10K = "r10k"
 private val BMS_VERSION_TOKENS = listOf("R24TK", "R24TH", "R10K")
-private const val DALY_BATTERY_CODE_CMD = 0x57
-private const val DALY_BATTERY_CODE_FRAMES = 5
-private const val DALY_HW_VERSION_CMD = 0x63
-private const val DALY_HW_VERSION_FRAMES = 5
+private val DALY_BATTERY_CODE_CMD = DalyProtocol.DALY_BATTERY_CODE_CMD
+private val DALY_BATTERY_CODE_FRAMES = DalyProtocol.DALY_BATTERY_CODE_FRAMES
+private val DALY_HW_VERSION_CMD = DalyProtocol.DALY_HW_VERSION_CMD
+private val DALY_HW_VERSION_FRAMES = DalyProtocol.DALY_HW_VERSION_FRAMES
 private const val DALY_SN_CODE_START = 0x0057
 private const val DALY_SN_CODE_END = 0x005D
 private const val DALY_SN_CODE_COUNT = DALY_SN_CODE_END - DALY_SN_CODE_START + 1
@@ -163,45 +171,6 @@ private val R10K_SKIPPED_TEMPLATE_KEYS = setOf(
     "balance_delta"
 )
 private const val TEST_BATTERY_ADDRESS = "TEST_BATTERY_12V_105AH"
-
-private val DALY_CHAR_UUID_CANDIDATES = setOf(
-    UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb"),
-    UUID.fromString("0000fff2-0000-1000-8000-00805f9b34fb"),
-    UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb"),
-    UUID.fromString("0000ff01-0000-1000-8000-00805f9b34fb"),
-    UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
-)
-
-private val CLIENT_CHARACTERISTIC_CONFIG =
-    UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-
-data class DalyData(
-    var voltage: Double? = null,
-    var current: Double? = null,
-    var soc: Double? = null,
-    var remainingAh: Double? = null,
-    var estimatedFullAh: Double? = null,
-    var maxCellV: Double? = null,
-    var maxCellNo: Int? = null,
-    var minCellV: Double? = null,
-    var minCellNo: Int? = null,
-    var cellDiffV: Double? = null,
-    var maxTemp: Int? = null,
-    var minTemp: Int? = null,
-    var chargeMos: Boolean? = null,
-    var dischargeMos: Boolean? = null,
-    var cellCount: Int? = null,
-    var tempCount: Int? = null,
-    var chargerConnected: Boolean? = null,
-    var loadConnected: Boolean? = null,
-    var cycles: Int? = null,
-    var lastUpdatedAt: Long = 0L,
-    val cells: MutableMap<Int, Double> = sortedMapOf(),
-    val temps: MutableMap<Int, Int> = sortedMapOf(),
-    val balancingCells: MutableSet<Int> = sortedSetOf(),
-    val raw: MutableMap<String, String> = linkedMapOf(),
-    val errors: MutableList<String> = mutableListOf()
-)
 
 data class ConfigReadRequest(
     val name: String,
@@ -608,6 +577,11 @@ class MainActivity : ComponentActivity() {
     private var bluetoothGatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
+    private val dalyRxBuffer = DalyRxBuffer()
+    private val dalyBleClient = DalyBleClient(adapterProvider = {
+        if (::bluetoothAdapter.isInitialized) bluetoothAdapter else null
+    })
+    private val bmsRepository = DalyBmsRepository(dalyBleClient)
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val devices = linkedMapOf<String, BluetoothDevice>()
@@ -10656,106 +10630,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun detectCharacteristics(gatt: BluetoothGatt) {
-        var notifyCandidate: BluetoothGattCharacteristic? = null
-        var writeCandidate: BluetoothGattCharacteristic? = null
-
-        val preferredNotify = listOf(
-            UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb"),
-            UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb"),
-            UUID.fromString("0000ff01-0000-1000-8000-00805f9b34fb")
-        )
-        val preferredWrite = listOf(
-            UUID.fromString("0000fff2-0000-1000-8000-00805f9b34fb"),
-            UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb"),
-            UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb"),
-            UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
-        )
-
-        fun canNotify(ch: BluetoothGattCharacteristic): Boolean {
-            val props = ch.properties
-            return (props and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 ||
-                    (props and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
-        }
-
-        fun canWrite(ch: BluetoothGattCharacteristic): Boolean {
-            val props = ch.properties
-            return (props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0 ||
-                    (props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
-        }
-
-        val allChars = mutableListOf<BluetoothGattCharacteristic>()
-        for (service in gatt.services) {
-            for (ch in service.characteristics) {
-                allChars.add(ch)
-            }
-        }
-
-        for (service in gatt.services) {
-            val chars = service.characteristics
-            val sameServiceNotify = preferredNotify.firstNotNullOfOrNull { uuid ->
-                chars.firstOrNull { it.uuid == uuid && canNotify(it) }
-            } ?: chars.firstOrNull { canNotify(it) }
-            val sameServiceWrite = preferredWrite.firstNotNullOfOrNull { uuid ->
-                chars.firstOrNull { it.uuid == uuid && canWrite(it) }
-            } ?: chars.firstOrNull { canWrite(it) }
-            if (sameServiceNotify != null && sameServiceWrite != null) {
-                notifyCandidate = sameServiceNotify
-                writeCandidate = sameServiceWrite
-                break
-            }
-        }
-
-        if (notifyCandidate == null) {
-            for (uuid in preferredNotify) {
-                notifyCandidate = allChars.firstOrNull { it.uuid == uuid && canNotify(it) }
-                if (notifyCandidate != null) break
-            }
-        }
-        if (notifyCandidate == null) notifyCandidate = allChars.firstOrNull { canNotify(it) }
-
-        if (writeCandidate == null) {
-            for (uuid in preferredWrite) {
-                writeCandidate = allChars.firstOrNull { it.uuid == uuid && canWrite(it) }
-                if (writeCandidate != null) break
-            }
-        }
-        if (writeCandidate == null) writeCandidate = allChars.firstOrNull { canWrite(it) }
-
-        notifyCharacteristic = notifyCandidate
-        writeCharacteristic = writeCandidate
-
-        val sb = StringBuilder()
-        sb.appendLine("Selected notify: ${notifyCharacteristic?.uuid}")
-        sb.appendLine("Selected write:  ${writeCharacteristic?.uuid}")
-        sb.appendLine()
-        for (service in gatt.services) {
-            sb.appendLine("Service: ${service.uuid}")
-            for (ch in service.characteristics) {
-                sb.appendLine("  Char: ${ch.uuid} props=${ch.properties}")
-            }
-        }
-        bleDebugText = sb.toString()
+        val selection = DalyBleCharacteristics.detect(gatt)
+        notifyCharacteristic = selection.notify
+        writeCharacteristic = selection.write
+        bleDebugText = selection.debugDump
+        dalyBleClient.attachGatt(gatt)
         Log.i(BLE_LOG_TAG, bleDebugText)
     }
 
+
     @SuppressLint("MissingPermission")
     private fun enableNotifications(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-        val localEnabled = gatt.setCharacteristicNotification(ch, true)
-        Log.i(BLE_LOG_TAG, "enable notifications uuid=${ch.uuid} local=$localEnabled")
-        val descriptor = ch.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG)
-        if (descriptor != null) {
-            descriptor.value = if (
-                (ch.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0 &&
-                (ch.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) == 0
-            ) {
-                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-            } else {
-                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            }
-            gatt.writeDescriptor(descriptor)
-        } else {
-            Log.w(BLE_LOG_TAG, "CCCD descriptor is missing for ${ch.uuid}")
-        }
+        DalyBleCharacteristics.enableNotifications(gatt, ch)
     }
 
     @SuppressLint("MissingPermission")
@@ -10883,177 +10769,68 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleDalyIncoming(bytes: ByteArray) {
-        synchronized(rxBuffer) {
-            for (b in bytes) rxBuffer.add(b)
-            while (rxBuffer.size >= 13) {
-                val start = rxBuffer.indexOf(FRAME_START)
-                if (start < 0) {
-                    rxBuffer.clear()
-                    break
-                }
-                repeat(start) { rxBuffer.removeAt(0) }
-                if (rxBuffer.size < 13) break
-                val frame = ByteArray(13) { index -> rxBuffer[index] }
-                if (isValidFrame(frame)) {
-                    repeat(13) { rxBuffer.removeAt(0) }
-                    parseFrame(frame)
-                } else {
-                    Log.w(BLE_LOG_TAG, "invalid Daly frame: ${bytesToHex(frame)}")
-                    rxBuffer.removeAt(0)
-                }
-            }
+        val frames = dalyRxBuffer.appendAndExtract(bytes)
+        for (frame in frames) {
+            parseFrame(frame)
         }
     }
 
     private fun parseFrame(frame: ByteArray) {
-        val cmd = frame[2].toInt() and 0xFF
-        val p = frame.copyOfRange(4, 12)
-        data.raw["0x%02X".format(cmd)] = hex(frame)
+        val result = DalyFrameParser.applyFrame(frame, data)
+        val cmd = result.command
+        val p = result.payload
 
-        when (cmd) {
-            0x90 -> {
-                data.voltage = u16(p, 0) / 10.0
-                data.current = (u16(p, 4) - 30000) / 10.0
-                data.soc = u16(p, 6) / 10.0
-            }
-            0x91 -> {
-                data.maxCellV = u16(p, 0) / 1000.0
-                data.maxCellNo = p[2].toInt() and 0xFF
-                data.minCellV = u16(p, 3) / 1000.0
-                data.minCellNo = p[5].toInt() and 0xFF
-            }
-            0x92 -> {
-                data.maxTemp = (p[0].toInt() and 0xFF) - 40
-                data.minTemp = (p[2].toInt() and 0xFF) - 40
-            }
-            0x93 -> {
-                data.chargeMos = (p[1].toInt() and 0xFF) != 0
-                data.dischargeMos = (p[2].toInt() and 0xFF) != 0
-                data.remainingAh = u32(p, 4) / 1000.0
-            }
-            0x94 -> {
-                val previousCount = data.cellCount
-                data.cellCount = p[0].toInt() and 0xFF
-                data.tempCount = p[1].toInt() and 0xFF
-                data.chargerConnected = (p[2].toInt() and 0xFF) != 0
-                data.loadConnected = (p[3].toInt() and 0xFF) != 0
-                data.cycles = u16(p, 5)
-                pruneCellsToCount()
-                val check = currentTemplateCheck()
-                if (
-                    previousCount != data.cellCount &&
-                    configRegisters.isNotEmpty() &&
-                    (check?.seriesCount == null ||
-                        check.missing.any {
-                            it.reason == "unsupported_series" || it.key == "series_cell_count"
-                        })
-                ) {
-                    setTemplateCheckResult(evaluateTemplateCheck())
-                    uploadConfigSnapshot(force = true)
-                }
-            }
-            DALY_BATTERY_CODE_CMD -> {
-                if (storeAsciiCmdFrame(batteryCodeFrames, batteryCodeFrameHex, p)) {
-                    rememberBatteryCode()
-                }
-            }
-            DALY_HW_VERSION_CMD -> {
-                if (storeAsciiCmdFrame(hwVersionFrames, hwVersionFrameHex, p)) {
-                    rememberHwVersion()
-                }
-            }
-            0x95 -> {
-                val group = p[0].toInt() and 0xFF
-                for (i in 0 until 3) {
-                    val off = 1 + i * 2
-                    val mv = u16(p, off)
-                    val cellNo = (group - 1) * 3 + i + 1
-                    val count = data.cellCount
-                    if (count != null && cellNo > count) continue
-                    if (mv in 500..5000) data.cells[cellNo] = mv / 1000.0
-                }
-            }
-            0x96 -> {
-                val group = p[0].toInt() and 0xFF
-                for (i in 0 until 7) {
-                    val idx = 1 + i
-                    val raw = p[idx].toInt() and 0xFF
-                    val tempNo = (group - 1) * 7 + i + 1
-                    val count = data.tempCount
-                    if (count != null && tempNo > count) continue
-                    if (raw != 0x00 && raw != 0xFF) data.temps[tempNo] = raw - 40
-                }
-            }
-            0x97 -> {
-                data.balancingCells.clear()
-                for (byteIndex in 0 until 6) {
-                    val mask = p[byteIndex].toInt() and 0xFF
-                    for (bit in 0..7) {
-                        if (((mask shr bit) and 1) != 0) {
-                            val cellNo = byteIndex * 8 + bit + 1
-                            val count = data.cellCount
-                            if (count == null || cellNo <= count) {
-                                data.balancingCells.add(cellNo)
-                            }
-                        }
-                    }
-                }
-            }
-            0x98 -> {
-                data.errors.clear()
-                for (byteIndex in p.indices) {
-                    val byteValue = p[byteIndex].toInt() and 0xFF
-                    for (bitInByte in 0..7) {
-                        if (((byteValue shr bitInByte) and 1) == 1) {
-                            val globalBit = byteIndex * 8 + bitInByte
-                            val description = dalyErrorDescription(globalBit)
-                            if (!description.startsWith("Резерв") && !description.startsWith("Дополнительный fault code")) {
-                                data.errors.add(description)
-                            }
-                        }
-                    }
-                }
+        if (result.isAsciiBatteryCode) {
+            if (storeAsciiCmdFrame(batteryCodeFrames, batteryCodeFrameHex, p)) {
+                rememberBatteryCode()
             }
         }
-        data.lastUpdatedAt = System.currentTimeMillis()
-        Log.d(BLE_LOG_TAG, "parsed cmd=0x%02X".format(cmd))
+        if (result.isAsciiHwVersion) {
+            if (storeAsciiCmdFrame(hwVersionFrames, hwVersionFrameHex, p)) {
+                rememberHwVersion()
+            }
+        }
+        if (result.cellCountChanged && result.command == DalyProtocol.CMD_STATUS) {
+            val check = currentTemplateCheck()
+            if (
+                configRegisters.isNotEmpty() &&
+                (check?.seriesCount == null ||
+                    check.missing.any {
+                        it.reason == "unsupported_series" || it.key == "series_cell_count"
+                    })
+            ) {
+                setTemplateCheckResult(evaluateTemplateCheck())
+                uploadConfigSnapshot(force = true)
+            }
+        }
+
         // Валидный ответ Daly подтверждает доступность (не факт одной отправки write).
         markBatteryOnlineFromValidResponse(selectedAddress, source = "daly_0x%02X".format(cmd))
         if (wakeInProgress) {
             // Любой валидный ответ Daly после connect = MCU очнулась.
             onWakeResponseReceived()
         }
-        updateDerived()
+        bmsRepository.publishData(data)
+        if (bluetoothGatt != null && selectedAddress != null) {
+            bmsRepository.publishConnection(BmsConnectionState.Connected(selectedAddress!!))
+        }
         completeRuntimeCommand(cmd, p)
 
-        if (cmd == 0x98) {
+        if (cmd == DalyProtocol.CMD_ERRORS) {
             onPollCompleted()
         }
     }
 
     private fun pruneCellsToCount() {
-        val count = data.cellCount ?: return
-        val stale = data.cells.keys.filter { it < 1 || it > count }
-        if (stale.isEmpty()) return
-        for (key in stale) data.cells.remove(key)
+        DalyFrameParser.pruneCellsToCount(data)
     }
 
     private fun updateDerived() {
-        pruneCellsToCount()
-        if (hasTemperatureSensorError()) {
-            data.temps.clear()
-            data.minTemp = null
-            data.maxTemp = null
-        }
-        if (data.cells.isNotEmpty()) {
-            val vals = data.cells.values
-            data.cellDiffV = vals.maxOrNull()!! - vals.minOrNull()!!
-        }
-        val soc = data.soc
-        val rem = data.remainingAh
-        if (soc != null && soc > 0.0 && rem != null) {
-            data.estimatedFullAh = rem / (soc / 100.0)
-        }
+        DalyFrameParser.updateDerived(data)
+    }
+
+    private fun hasTemperatureSensorError(): Boolean {
+        return DalyFrameParser.hasTemperatureSensorError(data)
     }
 
     private fun updateDashboardUi() {
@@ -11857,100 +11634,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun dalyErrorDescription(globalBit: Int): String {
-        // Daly UART/RS485 0x98 Battery failure status.
-        // Byte0..Byte6 = битовые ошибки, Byte7 = дополнительный fault code.
-        // Важно:
-        // - bit12 по официальной таблице = температура разрядки высокая, уровень 1.
-        // - bit18 по официальной таблице = ток разрядки превышен, уровень 1.
-        // - ошибка датчика температуры ячеек = bit42.
-        // - состояние MOS зарядки/разрядки читаем отдельно из 0x93, а не из 0x98.
-        return when (globalBit) {
-            0 -> "Напряжение ячейки высокое, уровень 1"
-            1 -> "Напряжение ячейки высокое, уровень 2"
-            2 -> "Напряжение ячейки низкое, уровень 1"
-            3 -> "Напряжение ячейки низкое, уровень 2"
-            4 -> "Общее напряжение высокое, уровень 1"
-            5 -> "Общее напряжение высокое, уровень 2"
-            6 -> "Общее напряжение низкое, уровень 1"
-            7 -> "Общее напряжение низкое, уровень 2"
-
-            8 -> "Температура зарядки высокая, уровень 1"
-            9 -> "Температура зарядки высокая, уровень 2"
-            10 -> "Температура зарядки низкая, уровень 1"
-            11 -> "Температура зарядки низкая, уровень 2"
-            12 -> "Температура разрядки высокая, уровень 1"
-            13 -> "Температура разрядки высокая, уровень 2"
-            14 -> "Температура разрядки низкая, уровень 1"
-            15 -> "Температура разрядки низкая, уровень 2"
-
-            16 -> "Ток зарядки превышен, уровень 1"
-            17 -> "Ток зарядки превышен, уровень 2"
-            18 -> "Ток разрядки превышен, уровень 1"
-            19 -> "Ток разрядки превышен, уровень 2"
-            20 -> "SOC высокий, уровень 1"
-            21 -> "SOC высокий, уровень 2"
-            22 -> "SOC низкий, уровень 1"
-            23 -> "SOC низкий, уровень 2"
-
-            24 -> "Разбег напряжений ячеек, уровень 1"
-            25 -> "Разбег напряжений ячеек, уровень 2"
-            26 -> "Разбег температур, уровень 1"
-            27 -> "Разбег температур, уровень 2"
-            28 -> "Резерв Byte3 Bit4"
-            29 -> "Резерв Byte3 Bit5"
-            30 -> "Резерв Byte3 Bit6"
-            31 -> "Резерв Byte3 Bit7"
-
-            32 -> "Температура MOS зарядки высокая"
-            33 -> "Температура MOS разрядки высокая"
-            34 -> "Ошибка датчика температуры MOS зарядки"
-            35 -> "Ошибка датчика температуры MOS разрядки"
-            36 -> "Залипание MOS зарядки"
-            37 -> "Залипание MOS разрядки"
-            38 -> "Обрыв MOS зарядки"
-            39 -> "Обрыв MOS разрядки"
-
-            40 -> "Ошибка AFE / чипа измерения"
-            41 -> "Отвалился сбор напряжения"
-            42 -> "Ошибка датчика температуры ячеек"
-            43 -> "Ошибка EEPROM"
-            44 -> "Ошибка RTC"
-            45 -> "Ошибка предзаряда"
-            46 -> "Ошибка связи"
-            47 -> "Ошибка внутренней связи"
-
-            48 -> "Ошибка токового модуля"
-            49 -> "Ошибка измерения общего напряжения"
-            50 -> "Защита от короткого замыкания"
-            51 -> "Запрет зарядки из-за низкого напряжения"
-            52 -> "Резерв Byte6 Bit4"
-            53 -> "Резерв Byte6 Bit5"
-            54 -> "Резерв Byte6 Bit6"
-            55 -> "Резерв Byte6 Bit7"
-
-            // Byte7 в протоколе указан как fault code, а не как стандартные битовые аварии.
-            56 -> "Дополнительный fault code Byte7 Bit0"
-            57 -> "Дополнительный fault code Byte7 Bit1"
-            58 -> "Дополнительный fault code Byte7 Bit2"
-            59 -> "Дополнительный fault code Byte7 Bit3"
-            60 -> "Дополнительный fault code Byte7 Bit4"
-            61 -> "Дополнительный fault code Byte7 Bit5"
-            62 -> "Дополнительный fault code Byte7 Bit6"
-            63 -> "Дополнительный fault code Byte7 Bit7"
-
-            else -> "Неизвестная ошибка Daly"
-        }
-    }
-
-    private fun hasTemperatureSensorError(): Boolean {
-        // Официально для 0x98:
-        // bit42 = ошибка датчика температуры ячеек.
-        // Также считаем ошибкой датчики температуры MOS.
-        return data.errors.any {
-            it.contains("Ошибка датчика температуры ячеек", ignoreCase = true) ||
-            it.contains("Ошибка датчика температуры MOS", ignoreCase = true) ||
-            it.contains("temp sensor", ignoreCase = true)
-        }
+        return DalyProtocol.errorDescription(globalBit)
     }
 
     private fun detectAndStoreEvents() {
@@ -13462,28 +13146,12 @@ class MainActivity : ComponentActivity() {
         if (value == null) obj.put(key, JSONObject.NULL) else obj.put(key, value)
     }
 
-    private fun bytesToHex(bytes: ByteArray): String {
-        return bytes.joinToString(" ") { b ->
-            (b.toInt() and 0xFF).toString(16).uppercase().padStart(2, '0')
-        }
-    }
+    private fun bytesToHex(bytes: ByteArray): String = DalyProtocol.bytesToHex(bytes)
 
-    private fun buildRequest(cmd: Int): ByteArray {
-        return buildDalyA5Frame(cmd, ByteArray(8))
-    }
+    private fun buildRequest(cmd: Int): ByteArray = DalyProtocol.buildRequest(cmd)
 
-    private fun buildDalyA5Frame(cmd: Int, payload: ByteArray): ByteArray {
-        val frame = ByteArray(13)
-        frame[0] = FRAME_START
-        frame[1] = REQUEST_ADDRESS
-        frame[2] = cmd.toByte()
-        frame[3] = DATA_LEN
-        for (i in 0 until 8) {
-            frame[4 + i] = if (i < payload.size) payload[i] else 0
-        }
-        frame[12] = checksum(frame, 12)
-        return frame
-    }
+    private fun buildDalyA5Frame(cmd: Int, payload: ByteArray): ByteArray =
+        DalyProtocol.buildA5Frame(cmd, payload)
 
     private fun lastDaly94Payload(): ByteArray? {
         val hex = data.raw["0x94"] ?: return null
@@ -13517,30 +13185,15 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun checksum(bytes: ByteArray, length: Int): Byte {
-        var sum = 0
-        for (i in 0 until length) sum += bytes[i].toInt() and 0xFF
-        return (sum and 0xFF).toByte()
-    }
+    private fun checksum(bytes: ByteArray, length: Int): Byte = DalyProtocol.checksum(bytes, length)
 
-    private fun isValidFrame(frame: ByteArray): Boolean {
-        return frame.size == 13 && frame[0] == FRAME_START && checksum(frame, 12) == frame[12]
-    }
+    private fun isValidFrame(frame: ByteArray): Boolean = DalyProtocol.isValidFrame(frame)
 
-    private fun u16(bytes: ByteArray, off: Int): Int {
-        return ((bytes[off].toInt() and 0xFF) shl 8) or (bytes[off + 1].toInt() and 0xFF)
-    }
+    private fun u16(bytes: ByteArray, off: Int): Int = DalyProtocol.u16(bytes, off)
 
-    private fun u32(bytes: ByteArray, off: Int): Long {
-        return ((bytes[off].toLong() and 0xFF) shl 24) or
-            ((bytes[off + 1].toLong() and 0xFF) shl 16) or
-            ((bytes[off + 2].toLong() and 0xFF) shl 8) or
-            (bytes[off + 3].toLong() and 0xFF)
-    }
+    private fun u32(bytes: ByteArray, off: Int): Long = DalyProtocol.u32(bytes, off)
 
-    private fun hex(bytes: ByteArray): String {
-        return bytes.joinToString(" ") { "%02X".format(it.toInt() and 0xFF) }
-    }
+    private fun hex(bytes: ByteArray): String = DalyProtocol.hex(bytes)
 
     private fun requestBlePermissions() {
         val permissions = mutableListOf<String>()
