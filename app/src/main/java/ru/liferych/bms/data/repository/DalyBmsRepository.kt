@@ -150,8 +150,9 @@ class DalyBmsRepository(
                 // Soft prefer known Daly BLE name pattern (legacy isDalyBluetoothDeviceId).
                 // Do not hide other devices — open scan never hard-filtered by UUID/prefix.
                 _discoveredDevices.value = current.sortedWith(
-                    compareByDescending<BmsDevice> { isLikelyDalyAdvertisedName(it.name) }
-                        .thenByDescending { it.rssi },
+                    compareBy<BmsDevice> { device ->
+                        if (isLikelyDalyAdvertisedName(device.name)) 0 else 1
+                    }.thenByDescending { it.rssi },
                 )
                 legacyHost?.onDeviceFound(device)
             }
