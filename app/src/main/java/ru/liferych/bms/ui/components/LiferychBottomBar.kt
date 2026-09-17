@@ -1,5 +1,6 @@
 package ru.liferych.bms.ui.components
 
+import androidx.annotation.DrawableRes
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -11,23 +12,18 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Home
-import androidx.compose.material.icons.outlined.ListAlt
-import androidx.compose.material.icons.outlined.Person
-import androidx.compose.material.icons.outlined.Phone
-import androidx.compose.material.icons.outlined.QrCode2
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import ru.liferych.bms.R
 import ru.liferych.bms.ui.navigation.FrontendDestination
 import ru.liferych.bms.ui.theme.LiferychColors
 import ru.liferych.bms.ui.theme.LiferychDimens
@@ -35,16 +31,16 @@ import ru.liferych.bms.ui.theme.LiferychDimens
 data class BottomNavItem(
     val destination: FrontendDestination,
     val label: String,
-    val icon: ImageVector,
+    @DrawableRes val iconRes: Int,
 )
 
-/** Legacy CLIENT bottom nav with unified Outlined vector icons (no emoji). */
+/** Legacy CLIENT bottom nav with Liferych outline icons. */
 val BatteryBottomNavItems = listOf(
-    BottomNavItem(FrontendDestination.Dashboard, "Главная", Icons.Outlined.Home),
-    BottomNavItem(FrontendDestination.Journal, "Журнал", Icons.Outlined.ListAlt),
-    BottomNavItem(FrontendDestination.QrCode, "QR-код", Icons.Outlined.QrCode2),
-    BottomNavItem(FrontendDestination.Support, "Поддержка", Icons.Outlined.Phone),
-    BottomNavItem(FrontendDestination.Profile, "Профиль", Icons.Outlined.Person),
+    BottomNavItem(FrontendDestination.Dashboard, "Главная", R.drawable.ic_liferych_home),
+    BottomNavItem(FrontendDestination.Journal, "Журнал", R.drawable.ic_liferych_journal),
+    BottomNavItem(FrontendDestination.QrCode, "QR-код", R.drawable.ic_liferych_qr),
+    BottomNavItem(FrontendDestination.Support, "Поддержка", R.drawable.ic_liferych_support),
+    BottomNavItem(FrontendDestination.Profile, "Профиль", R.drawable.ic_liferych_profile),
 )
 
 @Composable
@@ -82,7 +78,7 @@ fun LiferychBottomBar(
                     verticalArrangement = Arrangement.Center,
                 ) {
                     Icon(
-                        imageVector = item.icon,
+                        painter = painterResource(item.iconRes),
                         contentDescription = item.label,
                         tint = color,
                         modifier = Modifier.size(22.dp),

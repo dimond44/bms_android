@@ -12,17 +12,18 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.BatteryChargingFull
-import androidx.compose.material.icons.rounded.ChevronRight
-import androidx.compose.material3.Icon
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Scaffold
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import ru.liferych.bms.R
+import ru.liferych.bms.domain.model.BmsConnectionState
 import ru.liferych.bms.ui.components.LiferychCard
 import ru.liferych.bms.ui.components.LiferychTopBar
 import ru.liferych.bms.ui.components.StatePlaceholder
@@ -38,39 +39,69 @@ import ru.liferych.bms.ui.viewmodel.FrontendViewModel
 @Composable
 fun BatteriesScreen(
     batteries: List<BatterySummaryUi>,
+    connectionState: BmsConnectionState,
     onBatteryClick: (BatterySummaryUi) -> Unit,
+    onRefreshScan: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val scanning = connectionState is BmsConnectionState.Scanning
     Scaffold(
         modifier = modifier.fillMaxSize(),
         containerColor = LiferychColors.Background,
-        topBar = { LiferychTopBar(title = "Мои батареи") },
+        topBar = { LiferychTopBar(title = "Поиск BMS") },
     ) { padding ->
-        if (batteries.isEmpty()) {
-            StatePlaceholder(
-                icon = Icons.Rounded.BatteryChargingFull,
-                title = "Пока нет батарей",
-                subtitle = "Добавьте BMS после привязки устройства",
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding),
+        ) {
+            Row(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-            )
-        } else {
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-                contentPadding = PaddingValues(
-                    horizontal = LiferychDimens.ScreenPadding,
-                    vertical = 12.dp,
-                ),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                    .fillMaxWidth()
+                    .padding(horizontal = LiferychDimens.ScreenPadding),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                items(batteries, key = { it.id }) { battery ->
-                    BatteryListItem(
-                        battery = battery,
-                        onClick = { onBatteryClick(battery) },
-                    )
+                Text(
+                    text = when {
+                        scanning -> "Сканирование…"
+                        batteries.isEmpty() -> "Устройства не найдены"
+                        else -> "Найдено: ${batteries.size}"
+                    },
+                    style = LiferychTypography.bodyMedium,
+                    color = LiferychColors.TextSecondary,
+                )
+                TextButton(onClick = onRefreshScan) {
+                    Text(text = if (scanning) "Обновить" else "Сканировать")
+                }
+            }
+
+            if (batteries.isEmpty()) {
+                StatePlaceholder(
+                    iconRes = R.drawable.ic_liferych_bluetooth,
+                    title = if (scanning) "Ищем BMS поблизости" else "Нет устройств",
+                    subtitle = if (scanning) {
+                        "Убедитесь, что батарея включена"
+                    } else {
+                        "Нажмите «Сканировать»"
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(
+                        horizontal = LiferychDimens.ScreenPadding,
+                        vertical = 12.dp,
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    items(batteries, key = { it.id }) { battery ->
+                        BatteryListItem(
+                            battery = battery,
+                            onClick = { onBatteryClick(battery) },
+                        )
+                    }
                 }
             }
         }
@@ -89,29 +120,24 @@ private fun BatteryListItem(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_liferych_bluetooth),
+                contentDescription = null,
+                tint = LiferychColors.IconDefault,
+                modifier = Modifier.padding(end = 12.dp),
+            )
             Column(modifier = Modifier.weight(1f)) {
                 Text(text = battery.name, style = LiferychTypography.titleMedium)
                 Spacer(Modifier.height(4.dp))
                 Text(text = battery.subtitle, style = LiferychTypography.bodyMedium)
                 Spacer(Modifier.height(10.dp))
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    StatusBadge(
-                        text = battery.connectionLabel,
-                        tone = if (battery.isOnline) StatusTone.Success else StatusTone.Neutral,
-                    )
-                    val soc = battery.socPercent?.let { "%.0f%%".format(it) } ?: "—%"
-                    val voltage = battery.voltage?.let { "%.1f V".format(it) } ?: "— V"
-                    Text(
-                        text = "$soc · $voltage",
-                        style = LiferychTypography.labelLarge,
-                    )
-                }
+                StatusBadge(
+                    text = battery.connectionLabel,
+                    tone = if (battery.isOnline) StatusTone.Success else StatusTone.Neutral,
+                )
             }
             Icon(
-                imageVector = Icons.Rounded.ChevronRight,
+                painter = painterResource(R.drawable.ic_liferych_ok),
                 contentDescription = null,
                 tint = LiferychColors.IconMuted,
             )
@@ -125,18 +151,9 @@ private fun BatteriesScreenPreview() {
     LiferychTheme {
         BatteriesScreen(
             batteries = FrontendViewModel.demoBatteries(),
+            connectionState = BmsConnectionState.Scanning,
             onBatteryClick = {},
-        )
-    }
-}
-
-@Preview(showBackground = true, name = "BatteriesEmptyPreview")
-@Composable
-private fun BatteriesEmptyPreview() {
-    LiferychTheme {
-        BatteriesScreen(
-            batteries = emptyList(),
-            onBatteryClick = {},
+            onRefreshScan = {},
         )
     }
 }

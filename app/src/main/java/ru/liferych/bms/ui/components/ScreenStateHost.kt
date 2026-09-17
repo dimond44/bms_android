@@ -8,9 +8,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.ErrorOutline
-import androidx.compose.material.icons.rounded.Inbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -69,9 +66,10 @@ fun ScreenStateHost(
                 Box(modifier = modifier.fillMaxSize()) { emptyContent() }
             } else {
                 StatePlaceholder(
-                    icon = Icons.Rounded.Inbox,
+                    iconRes = R.drawable.ic_liferych_journal,
                     title = emptyMessage,
                     subtitle = null,
+                    iconTint = LiferychColors.IconMuted,
                     modifier = modifier,
                 )
             }
@@ -79,7 +77,7 @@ fun ScreenStateHost(
 
         ScreenUiStatus.Error -> {
             StatePlaceholder(
-                icon = Icons.Rounded.ErrorOutline,
+                iconRes = R.drawable.ic_liferych_error,
                 title = errorMessage,
                 subtitle = errorSubtitle,
                 iconTint = LiferychColors.Error,

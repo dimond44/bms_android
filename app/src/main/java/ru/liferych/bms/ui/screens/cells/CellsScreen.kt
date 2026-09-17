@@ -141,24 +141,12 @@ private fun CellsLegacyContent(batteryState: BatteryState) {
         Spacer(Modifier.height(8.dp))
 
         LiferychCard {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "Напряжение по ячейкам",
-                    color = LiferychColors.TextPrimary,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(
-                    text = "Разбег: %.0f мВ".format(deltaMv),
-                    color = LiferychColors.TextSecondary,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
+            Text(
+                text = "Напряжение по ячейкам",
+                color = LiferychColors.TextPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+            )
 
             if (batteryState.balancingCells.isNotEmpty()) {
                 Spacer(Modifier.height(6.dp))

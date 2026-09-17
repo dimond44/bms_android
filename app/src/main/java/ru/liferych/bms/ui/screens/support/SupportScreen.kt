@@ -27,7 +27,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CheckBox
 import androidx.compose.material.icons.outlined.CheckBoxOutlineBlank
-import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -40,6 +39,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -49,6 +49,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import ru.liferych.bms.R
 import ru.liferych.bms.ui.components.LiferychTopBar
 import ru.liferych.bms.ui.theme.LiferychColors
 import ru.liferych.bms.ui.theme.LiferychDimens
@@ -736,7 +737,7 @@ private fun SupportErrorBody(
         verticalArrangement = Arrangement.Center,
     ) {
         Icon(
-            imageVector = Icons.Outlined.WarningAmber,
+            painter = painterResource(R.drawable.ic_liferych_warning),
             contentDescription = null,
             tint = LiferychColors.Warning,
             modifier = Modifier.size(40.dp),

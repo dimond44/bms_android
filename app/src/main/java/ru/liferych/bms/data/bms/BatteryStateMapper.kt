@@ -7,7 +7,15 @@ import ru.liferych.bms.domain.model.CellState
  * Maps mutable [DalyData] to immutable [BatteryState] for UI/repository consumers.
  */
 object BatteryStateMapper {
-    fun fromDalyData(data: DalyData): BatteryState {
+    /**
+     * @param factorySerial optional factory SN (legacy Modbus path); not from 0x90–0x98.
+     * @param bmsHwVersion optional HW version ASCII from Daly cmd 0x63.
+     */
+    fun fromDalyData(
+        data: DalyData,
+        factorySerial: String? = null,
+        bmsHwVersion: String? = null,
+    ): BatteryState {
         val balancing = data.balancingCells.toSet()
         val cells = data.cells.entries
             .sortedBy { it.key }
@@ -41,6 +49,8 @@ object BatteryStateMapper {
             balancingCells = balancing,
             errors = data.errors.toList(),
             lastUpdatedAt = data.lastUpdatedAt.takeIf { it > 0L },
+            factorySerial = factorySerial?.trim()?.takeIf { it.isNotEmpty() },
+            bmsHwVersion = bmsHwVersion?.trim()?.takeIf { it.isNotEmpty() },
         )
     }
 }

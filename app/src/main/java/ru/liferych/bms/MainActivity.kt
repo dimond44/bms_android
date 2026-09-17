@@ -574,14 +574,20 @@ class MainActivity : ComponentActivity() {
     }
 
     private lateinit var bluetoothAdapter: BluetoothAdapter
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var writeCharacteristic: BluetoothGattCharacteristic? = null
-    private var notifyCharacteristic: BluetoothGattCharacteristic? = null
-    private val dalyRxBuffer = DalyRxBuffer()
-    private val dalyBleClient = DalyBleClient(adapterProvider = {
-        if (::bluetoothAdapter.isInitialized) bluetoothAdapter else null
-    })
-    private val bmsRepository = DalyBmsRepository(dalyBleClient)
+    private val appContainer: AppContainer
+        get() = (application as BmsApp).container
+    private val dalyBleClient: DalyBleClient
+        get() = appContainer.bleClient
+    private val bmsRepository: DalyBmsRepository
+        get() = appContainer.bmsRepository
+
+    /** GATT owned by [DalyBleClient] (shared with Compose frontend). */
+    private val bluetoothGatt: BluetoothGatt?
+        get() = dalyBleClient.bluetoothGatt
+    private val writeCharacteristic: BluetoothGattCharacteristic?
+        get() = dalyBleClient.writeCharacteristic
+    private val notifyCharacteristic: BluetoothGattCharacteristic?
+        get() = dalyBleClient.notifyCharacteristic
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val devices = linkedMapOf<String, BluetoothDevice>()
@@ -593,7 +599,8 @@ class MainActivity : ComponentActivity() {
     private var returnToBatteriesAfterConnect = false
     private val rxBuffer = ArrayList<Byte>()
     private val configModbusBuffer = ArrayList<Byte>()
-    private val data = DalyData()
+    private val data: DalyData
+        get() = bmsRepository.dalyData
     private val configRegisters: MutableMap<Int, Int> = sortedMapOf()
     private val configRaw: MutableMap<String, String> = linkedMapOf()
     private val configReadQueue = java.util.ArrayDeque<ConfigReadRequest>()
@@ -640,7 +647,11 @@ class MainActivity : ComponentActivity() {
     private var lastKnownSoc: Double? = null
     private var lastKnownChargeMosTextText: String? = null
     private var lastKnownDischargeMosTextText: String? = null
-    private var polling = false
+    private var polling: Boolean
+        get() = bmsRepository.isPolling
+        set(value) {
+            bmsRepository.setPollingEnabled(value)
+        }
     private var pollLoopToken = 0
     /** Targeted reconnect: scan only for this BLE MAC (SavedBattery.address). */
     private var targetedScanAddress: String? = null
@@ -773,6 +784,105 @@ class MainActivity : ComponentActivity() {
         }
         val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = manager.adapter
+        bmsRepository.legacyHost = object : DalyBmsRepository.LegacyHost {
+            override fun shouldPauseRuntimePoll(): Boolean {
+                return configReadInProgress || remoteWriteInProgress
+            }
+
+            override fun onRawNotification(bytes: ByteArray): Boolean {
+                if (bytes.isEmpty()) return false
+                val startsWithDalyFrame = bytes[0] == FRAME_START
+                val hasPendingConfigFrame =
+                    synchronized(configModbusBuffer) { configModbusBuffer.isNotEmpty() }
+                val startsWithModbusFrame =
+                    bytes.size >= 2 &&
+                        (bytes[1].toInt() and 0xFF) in setOf(0x03, 0x06, 0x10, 0x83, 0x86, 0x90)
+                if (
+                    (configReadInProgress || activeConfigRead != null) &&
+                    !startsWithDalyFrame &&
+                    (startsWithModbusFrame || hasPendingConfigFrame)
+                ) {
+                    handleConfigModbusIncoming(bytes)
+                    return true
+                }
+                return false
+            }
+
+            override fun onConnected(address: String) {
+                selectedAddress = address
+                pendingFirstTelemetryUpload = true
+                configAutoReadStartedForConnection = false
+                runOnUiThread {
+                    if (::statusText.isInitialized) statusText.text = "Подключено"
+                    saveCurrentBattery(force = true)
+                    if (returnToBatteriesAfterConnect) {
+                        returnToBatteriesAfterConnect = false
+                        showBatteriesScreen(asRootHome = true)
+                    } else if (screenState == "search" || screenState == "loading") {
+                        showDashboardScreen(asRootHome = true)
+                    }
+                    mainHandler.postDelayed({
+                        if (polling && !configReadInProgress && !remoteWriteInProgress) {
+                            startConfigReadIfNeeded(force = true)
+                        }
+                    }, if (isServiceApp()) 400L else CONFIG_AUTO_READ_DELAY_MS)
+                }
+            }
+
+            override fun onDisconnected() {
+                pendingFirstTelemetryUpload = false
+                configAutoReadStartedForConnection = false
+                latestTemplateCheck = null
+                lastErrorSignature = ""
+                runOnUiThread {
+                    toast("Отключено от BMS")
+                    if (screenState == "journal") {
+                        showJournalScreen()
+                    } else if (screenState == "dashboard") {
+                        updateDashboardUi()
+                    }
+                    if (screenState == "loading") {
+                        showBatteriesScreen(asRootHome = true)
+                    } else {
+                        refreshBatteriesScreenIfVisible()
+                    }
+                }
+            }
+
+            override fun onTelemetryUpdated() {
+                runOnUiThread { updateDashboardUi() }
+            }
+
+            override fun onDeviceFound(device: ru.liferych.bms.domain.model.BmsDevice) {
+                val bt = dalyBleClient.deviceByAddress(device.address) ?: return
+                devices[device.address] = bt
+                scanRssi[device.address] = device.rssi
+                scanNames[device.address] = device.name.orEmpty()
+                if (screenState == "search") {
+                    runOnUiThread {
+                        addDeviceRow(bt, device.rssi, device.name)
+                    }
+                }
+            }
+
+            override fun onScanFinished(foundCount: Int) {
+                runOnUiThread {
+                    if (screenState == "loading") showBatteriesScreen(asRootHome = true)
+                    if (::statusText.isInitialized) {
+                        statusText.text = "Поиск завершен. Найдено: $foundCount"
+                    }
+                }
+            }
+
+            override fun onBleError(message: String) {
+                runOnUiThread {
+                    toast(message)
+                    if (screenState == "search" || screenState == "loading") {
+                        showBatteriesScreen(asRootHome = true)
+                    }
+                }
+            }
+        }
         requestBlePermissions()
         if (isServiceApp()) {
             showSplashScreen()
@@ -2093,21 +2203,15 @@ class MainActivity : ComponentActivity() {
         wakeToken++
         wakeInProgress = false
         wakeAttempt = 0
+        bmsRepository.cancelWake()
     }
 
     /**
-     * Пробуждение MCU Daly безопасным чтением 0x90 (напряжение/ток/SOC).
-     * Без записи настроек / MOS / SOC / reset.
-     * Вызывать только после Notifications/CCCD ready.
+     * Wake is owned by [DalyBmsRepository]; kept for call-site compatibility.
      */
     @SuppressLint("MissingPermission")
     private fun startBmsWakeSequence() {
-        cancelWakeSequence()
-        wakeInProgress = true
-        val token = ++wakeToken
-        wakeAttempt = 0
-        Log.i(BMS_WAKE_TAG, "Starting wake/read sequence")
-        sendWakeReadAttempt(token)
+        // no-op — repository starts wake after CCCD write
     }
 
     @SuppressLint("MissingPermission")
@@ -3318,6 +3422,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopBleScanQuietly() {
+        try {
+            bmsRepository.stopScan()
+        } catch (_: Exception) {
+        }
         try {
             bluetoothAdapter.bluetoothLeScanner?.stopScan(scanCallback)
         } catch (_: Exception) {
@@ -10118,6 +10226,13 @@ class MainActivity : ComponentActivity() {
     }
 
     @SuppressLint("MissingPermission")
+    // ---------------------------------------------------------------------------
+    // LEGACY BLE UI helpers (search screen / saved-battery presence).
+    // TODO(frontend-launcher): after Compose becomes the launcher default, delete
+    // this block and keep only AppContainer → DalyBmsRepository → DalyBleClient.
+    // Active GATT/scan/wake/poll already live in DalyBleClient / DalyBmsRepository.
+    // Do not use this MainActivity gattCallback for new work — it is fallback-only.
+    // ---------------------------------------------------------------------------
     private fun startScan() {
         if (!hasBlePermissions()) {
             requestBlePermissions()
@@ -10140,8 +10255,7 @@ class MainActivity : ComponentActivity() {
             statusText.text = "Поиск устройств...\nСканирование BLE устройств поблизости"
         }
 
-        val scanner = bluetoothAdapter.bluetoothLeScanner
-        if (scanner == null) {
+        if (bluetoothAdapter.bluetoothLeScanner == null) {
             if (screenState == "loading") showBatteriesScreen(asRootHome = true)
             if (::statusText.isInitialized) {
                 statusText.text = "BLE scanner недоступен. Проверь Bluetooth."
@@ -10149,15 +10263,7 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        scanner.startScan(scanCallback)
-
-        mainHandler.postDelayed({
-            try { scanner.stopScan(scanCallback) } catch (_: Exception) {}
-            if (screenState == "loading") showBatteriesScreen(asRootHome = true)
-            if (::statusText.isInitialized) {
-                statusText.text = "Поиск завершен. Найдено: ${devices.size}"
-            }
-        }, 8000)
+        bmsRepository.startScan()
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -10382,7 +10488,7 @@ class MainActivity : ComponentActivity() {
             toast("Выбери устройство")
             return
         }
-        val device = devices[address]
+        val device = devices[address] ?: dalyBleClient.deviceByAddress(address)
         if (device == null) {
             toast("Устройство не найдено")
             return
@@ -10391,17 +10497,13 @@ class MainActivity : ComponentActivity() {
         cancelTargetedScan()
         cancelWakeSequence()
         polling = false
-        bluetoothGatt?.close()
         if (screenState == "search" && ::statusText.isInitialized) {
             statusText.text = "Подключение к $address..."
         }
         Log.i(BMS_BLE_TAG, "Connecting to $address")
-
-        bluetoothGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(this, false, gattCallback)
-        }
+        devices[address] = device
+        dalyBleClient.rememberDevice(device, scanRssi[address] ?: 0, scanNames[address])
+        bmsRepository.connectNow(address)
     }
 
     @SuppressLint("MissingPermission")
@@ -10416,13 +10518,14 @@ class MainActivity : ComponentActivity() {
             qtcDbStatus = QtcDbStatus.WAITING_BMS
             qtcDbError = ""
         }
-        bluetoothGatt?.disconnect()
-        bluetoothGatt?.close()
-        bluetoothGatt = null
-        writeCharacteristic = null
-        notifyCharacteristic = null
+        bmsRepository.disconnectNow()
     }
 
+    /**
+     * LEGACY: local GATT callback retained as fallback for pre-extraction paths.
+     * TODO(frontend-launcher): remove after launcher switch; production GATT is
+     * [ru.liferych.bms.data.ble.DalyBleClient].
+     */
     private val gattCallback = object : BluetoothGattCallback() {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
@@ -10630,11 +10733,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun detectCharacteristics(gatt: BluetoothGatt) {
-        val selection = DalyBleCharacteristics.detect(gatt)
-        notifyCharacteristic = selection.notify
-        writeCharacteristic = selection.write
-        bleDebugText = selection.debugDump
-        dalyBleClient.attachGatt(gatt)
+        // Characteristics are selected inside DalyBleClient.onServicesReady.
+        bleDebugText = dalyBleClient.bleDebugText
         Log.i(BLE_LOG_TAG, bleDebugText)
     }
 
@@ -10646,28 +10746,12 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun pollOnce() {
-        val token = ++pollLoopToken
-        mainHandler.post { pollOnce(token) }
+        bmsRepository.requestPollSoon(0)
     }
 
     @SuppressLint("MissingPermission")
     private fun pollOnce(token: Int) {
-        if (token != pollLoopToken) return
-        if (!polling) return
-        if (configReadInProgress || remoteWriteInProgress) {
-            mainHandler.postDelayed({ pollOnce(token) }, 1000)
-            return
-        }
-        val gatt = bluetoothGatt ?: return
-        val ch = writeCharacteristic ?: return
-        runtimeCommands = buildList {
-            add(DALY_HW_VERSION_CMD)
-            add(DALY_BATTERY_CODE_CMD)
-            addAll(listOf(0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98))
-        }
-        runtimeCommandIndex = 0
-        pendingRuntimeCommand = null
-        sendCurrentRuntimeCommand(gatt, ch, token)
+        bmsRepository.requestPollSoon(0)
     }
 
     @SuppressLint("MissingPermission")
@@ -10769,7 +10853,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleDalyIncoming(bytes: ByteArray) {
-        val frames = dalyRxBuffer.appendAndExtract(bytes)
+        val frames = dalyBleClient.extractFrames(bytes)
         for (frame in frames) {
             parseFrame(frame)
         }
@@ -12168,12 +12252,8 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun writeBleFrame(frame: ByteArray): Boolean {
-        val gatt = bluetoothGatt ?: return false
-        val ch = writeCharacteristic ?: return false
         return try {
-            ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            ch.value = frame
-            gatt.writeCharacteristic(ch)
+            bmsRepository.writeRaw(frame)
         } catch (e: Exception) {
             configRaw["remote_write_error"] = e.message ?: e.toString()
             false

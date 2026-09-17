@@ -2,7 +2,6 @@ package ru.liferych.bms.ui.components
 
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -28,7 +27,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,11 +57,11 @@ fun InfoOneLineTile(
         verticalArrangement = Arrangement.Center,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Image(
+            Icon(
                 painter = painterResource(iconRes),
                 contentDescription = null,
+                tint = LiferychColors.IconDefault,
                 modifier = Modifier.size(18.dp),
-                contentScale = ContentScale.Fit,
             )
             Spacer(Modifier.width(4.dp))
             Text(
@@ -98,6 +96,7 @@ fun ClassicMetricTile(
     @DrawableRes iconRes: Int?,
     modifier: Modifier = Modifier,
     valueColor: androidx.compose.ui.graphics.Color = LiferychColors.TextPrimary,
+    iconTint: androidx.compose.ui.graphics.Color = LiferychColors.IconDefault,
     glyph: String? = null,
     glyphColor: androidx.compose.ui.graphics.Color = LiferychColors.SuccessAlt,
 ) {
@@ -133,7 +132,7 @@ fun ClassicMetricTile(
                         Icon(
                             painter = painterResource(iconRes),
                             contentDescription = null,
-                            tint = LiferychColors.IconDefault,
+                            tint = iconTint,
                             modifier = Modifier.size(30.dp),
                         )
                     }
@@ -187,11 +186,11 @@ fun CapacityInnerTile(
         Spacer(Modifier.height(6.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (iconRes != null) {
-                Image(
+                Icon(
                     painter = painterResource(iconRes),
                     contentDescription = null,
+                    tint = LiferychColors.IconDefault,
                     modifier = Modifier.size(28.dp),
-                    contentScale = ContentScale.Fit,
                 )
                 Spacer(Modifier.width(8.dp))
             }
@@ -322,11 +321,11 @@ fun ChartLinkRow(
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Image(
-            painter = painterResource(R.drawable.ic_chart_bars),
+        Icon(
+            painter = painterResource(R.drawable.ic_liferych_chart),
             contentDescription = null,
+            tint = LiferychColors.ChartLink,
             modifier = Modifier.size(18.dp),
-            contentScale = ContentScale.Fit,
         )
         Spacer(Modifier.width(6.dp))
         Text(

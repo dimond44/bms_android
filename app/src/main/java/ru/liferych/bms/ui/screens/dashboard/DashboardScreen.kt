@@ -148,13 +148,13 @@ private fun DashboardLegacyContent(
             InfoOneLineTile(
                 label = "Серийный номер",
                 value = serialNumber.ifBlank { "--" },
-                iconRes = R.drawable.icon_serial,
+                iconRes = R.drawable.ic_liferych_serial,
                 modifier = Modifier.weight(1f),
             )
             InfoOneLineTile(
                 label = "Версия BMS",
                 value = bmsVersion.ifBlank { "--" },
-                iconRes = R.drawable.icon_bms_version,
+                iconRes = R.drawable.ic_liferych_chip,
                 modifier = Modifier.weight(1f),
             )
         }
@@ -192,7 +192,7 @@ private fun DashboardLegacyContent(
                     CapacityInnerTile(
                         label = "Полная ёмкость",
                         value = batteryState.fullCapacityAh?.let { "%.0f А·ч".format(it) } ?: "-- А·ч",
-                        iconRes = R.drawable.icon_capacity,
+                        iconRes = R.drawable.ic_liferych_capacity,
                     )
                     CapacityInnerTile(
                         label = "Осталось",
@@ -268,9 +268,12 @@ private fun DashboardLegacyContent(
                 ClassicMetricTile(
                     label = "Статус BMS",
                     value = statusText,
-                    iconRes = null,
-                    glyph = "✓",
-                    glyphColor = statusColor,
+                    iconRes = if (batteryState.errors.isNotEmpty()) {
+                        R.drawable.ic_liferych_error
+                    } else {
+                        R.drawable.ic_liferych_ok
+                    },
+                    iconTint = statusColor,
                     valueColor = statusColor,
                     modifier = mod,
                 )

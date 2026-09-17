@@ -8,10 +8,12 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import ru.liferych.bms.domain.model.BatteryState
 import ru.liferych.bms.domain.model.BmsConnectionState
+import ru.liferych.bms.domain.model.BmsDevice
 import ru.liferych.bms.domain.repository.BmsRepository
 import ru.liferych.bms.ui.model.BatterySummaryUi
 import ru.liferych.bms.ui.model.ProfileUi
@@ -20,22 +22,17 @@ import ru.liferych.bms.ui.model.toScreenUiStatus
 
 /**
  * ViewModel for the new Compose client frontend.
- * Composables must observe this VM — never touch [BmsRepository] directly.
- *
- * Battery list / profile are UI-layer demo data until product APIs are wired.
- * Active BMS errors for Journal come from [BatteryState.errors] (Daly 0x98).
+ * Composables observe this VM — never touch [BmsRepository] directly.
  */
 class FrontendViewModel(
     private val repository: BmsRepository,
 ) : ViewModel() {
     val batteryState: StateFlow<BatteryState> = repository.batteryState
     val connectionState: StateFlow<BmsConnectionState> = repository.connectionState
+    val discoveredDevices: StateFlow<List<BmsDevice>> = repository.discoveredDevices
 
-    private val _selectedBatteryId = MutableStateFlow<String?>(DEMO_SELECTED_ID)
+    private val _selectedBatteryId = MutableStateFlow<String?>(null)
     val selectedBatteryId: StateFlow<String?> = _selectedBatteryId.asStateFlow()
-
-    private val _batteries = MutableStateFlow(demoBatteries())
-    val batteries: StateFlow<List<BatterySummaryUi>> = _batteries.asStateFlow()
 
     private val _profile = MutableStateFlow(
         ProfileUi(
@@ -43,23 +40,80 @@ class FrontendViewModel(
             email = "demo@liferych.ru",
             phone = "+7 (900) 000-00-00",
             birthDate = "",
-            appVersionLabel = "Frontend preview",
+            appVersionLabel = "Frontend",
             isAuthorized = true,
         ),
     )
     val profile: StateFlow<ProfileUi> = _profile.asStateFlow()
+
+    val batteries: StateFlow<List<BatterySummaryUi>> = combine(
+        discoveredDevices,
+        connectionState,
+        batteryState,
+    ) { devices, connection, battery ->
+        devices.map { device ->
+            val connected = connection is BmsConnectionState.Connected &&
+                connection.deviceAddress.equals(device.address, ignoreCase = true)
+            BatterySummaryUi(
+                id = device.address,
+                name = device.name?.ifBlank { device.address } ?: device.address,
+                subtitle = device.address,
+                address = device.address,
+                socPercent = if (connected) battery.soc else null,
+                voltage = if (connected) battery.voltage else null,
+                isOnline = connected,
+                connectionLabel = when {
+                    connected -> "Подключено"
+                    connection is BmsConnectionState.Connecting &&
+                        connection.deviceAddress.equals(device.address, true) -> "Подключение…"
+                    connection is BmsConnectionState.Scanning -> "Найдено"
+                    else -> "Доступно"
+                },
+                serialNumber = if (connected) {
+                    battery.factorySerial?.takeIf { it.isNotBlank() } ?: "--"
+                } else {
+                    "--"
+                },
+                bmsVersion = if (connected) {
+                    battery.bmsHwVersion?.takeIf { it.isNotBlank() } ?: "--"
+                } else {
+                    "--"
+                },
+            )
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = emptyList(),
+    )
 
     val screenStatus: StateFlow<ScreenUiStatus> = combine(
         connectionState,
         batteryState,
     ) { connection, battery ->
         val hasTelemetry = battery.soc != null || battery.voltage != null
-        connection.toScreenUiStatus(hasTelemetry)
+        when (connection) {
+            is BmsConnectionState.Disconnected -> {
+                // Do not show fake/stale telemetry as Connected.
+                if (hasTelemetry) ScreenUiStatus.Disconnected else ScreenUiStatus.Empty
+            }
+            else -> connection.toScreenUiStatus(hasTelemetry)
+        }
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
         initialValue = ScreenUiStatus.Loading,
     )
+
+    val selectedDeviceName: StateFlow<String> = combine(
+        selectedBatteryId,
+        discoveredDevices,
+        batteryState,
+    ) { id, devices, _ ->
+        devices.firstOrNull { it.address == id }?.name?.ifBlank { null }
+            ?: id
+            ?: "Батарея"
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), "Батарея")
 
     fun selectBattery(id: String) {
         _selectedBatteryId.value = id
@@ -69,8 +123,17 @@ class FrontendViewModel(
         _selectedBatteryId.value = null
     }
 
+    fun startScan() {
+        repository.startScan()
+    }
+
+    fun stopScan() {
+        repository.stopScan()
+    }
+
     fun connect(address: String) {
         viewModelScope.launch {
+            _selectedBatteryId.value = address
             repository.connect(address)
         }
     }
@@ -108,18 +171,6 @@ class FrontendViewModel(
                 connectionLabel = "Подключено",
                 serialNumber = "224LG151200441",
                 bmsVersion = "JHB-R24TK-V2.1",
-            ),
-            BatterySummaryUi(
-                id = "battery-demo-2",
-                name = "DALY-BMS-Garage",
-                subtitle = "DALY-BMS-Garage",
-                address = "AA:BB:CC:DD:EE:02",
-                socPercent = 42.0,
-                voltage = 26.1,
-                isOnline = false,
-                connectionLabel = "Не в сети",
-                serialNumber = "SN-GARAGE-02",
-                bmsVersion = "DALY-V1",
             ),
         )
     }

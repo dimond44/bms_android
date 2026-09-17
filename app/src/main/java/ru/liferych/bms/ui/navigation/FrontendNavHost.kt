@@ -20,7 +20,6 @@ import ru.liferych.bms.ui.screens.journal.JournalScreen
 import ru.liferych.bms.ui.screens.journal.activeErrorsFromBattery
 import ru.liferych.bms.ui.screens.profile.ProfileScreen
 import ru.liferych.bms.ui.screens.qr.QrScreen
-import ru.liferych.bms.ui.screens.shell.PlaceholderScreen
 import ru.liferych.bms.ui.screens.support.SupportScreen
 import ru.liferych.bms.ui.theme.LiferychColors
 import ru.liferych.bms.ui.viewmodel.FrontendViewModel
@@ -30,6 +29,7 @@ fun FrontendNavHost(
     viewModel: FrontendViewModel,
     modifier: Modifier = Modifier,
     startRoute: String? = null,
+    onRequestBlePermissions: () -> Unit = {},
 ) {
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
@@ -41,8 +41,8 @@ fun FrontendNavHost(
     val batteries by viewModel.batteries.collectAsStateWithLifecycle()
     val selectedBatteryId by viewModel.selectedBatteryId.collectAsStateWithLifecycle()
     val profile by viewModel.profile.collectAsStateWithLifecycle()
+    val selectedDeviceName by viewModel.selectedDeviceName.collectAsStateWithLifecycle()
     val selected = batteries.firstOrNull { it.id == selectedBatteryId }
-    val selectedBatteryName = selected?.name ?: selected?.subtitle ?: "Батарея"
 
     val initialRoute = when (startRoute) {
         FrontendDestination.Cells.route -> FrontendDestination.Cells.route
@@ -70,12 +70,14 @@ fun FrontendNavHost(
 
     fun backToBatteries() {
         viewModel.clearSelectedBattery()
+        viewModel.disconnect()
         navController.navigate(FrontendDestination.Batteries.route) {
             popUpTo(navController.graph.findStartDestination().id) {
                 inclusive = true
             }
             launchSingleTop = true
         }
+        onRequestBlePermissions()
     }
 
     Scaffold(
@@ -103,9 +105,12 @@ fun FrontendNavHost(
             composable(FrontendDestination.Batteries.route) {
                 BatteriesScreen(
                     batteries = batteries,
+                    connectionState = connectionState,
+                    onRefreshScan = onRequestBlePermissions,
                     onBatteryClick = { battery ->
+                        val address = battery.address ?: return@BatteriesScreen
                         viewModel.selectBattery(battery.id)
-                        battery.address?.let { viewModel.connect(it) }
+                        viewModel.connect(address)
                         navController.navigate(FrontendDestination.Dashboard.route) {
                             launchSingleTop = true
                         }
@@ -114,9 +119,13 @@ fun FrontendNavHost(
             }
             composable(FrontendDestination.Dashboard.route) {
                 DashboardScreen(
-                    batteryName = selectedBatteryName,
-                    serialNumber = selected?.serialNumber ?: "DEMO-SN-001",
-                    bmsVersion = selected?.bmsVersion ?: "DALY-V1",
+                    batteryName = selectedDeviceName,
+                    serialNumber = batteryState.factorySerial?.takeIf { it.isNotBlank() }
+                        ?: selected?.serialNumber
+                        ?: "--",
+                    bmsVersion = batteryState.bmsHwVersion?.takeIf { it.isNotBlank() }
+                        ?: selected?.bmsVersion
+                        ?: "--",
                     batteryState = batteryState,
                     connectionState = connectionState,
                     screenStatus = screenStatus,

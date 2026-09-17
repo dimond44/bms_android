@@ -20,8 +20,6 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CameraAlt
-import androidx.compose.material.icons.outlined.QrCode2
-import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -34,12 +32,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import ru.liferych.bms.R
 import ru.liferych.bms.cellcode.CellCodeDecoder
 import ru.liferych.bms.cellcode.CellCodeRecognition
 import ru.liferych.bms.cellcode.CellQrDecodeResult
@@ -198,7 +198,7 @@ private fun QrReadyContent(
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(
-                        imageVector = Icons.Outlined.QrCode2,
+                        painter = painterResource(R.drawable.ic_liferych_qr),
                         contentDescription = "Сканировать",
                         tint = LiferychColors.BrandYellowDark,
                         modifier = Modifier.size(28.dp),
@@ -584,7 +584,7 @@ private fun QrErrorContent(
             verticalArrangement = Arrangement.Center,
         ) {
             Icon(
-                imageVector = Icons.Outlined.WarningAmber,
+                painter = painterResource(R.drawable.ic_liferych_error),
                 contentDescription = null,
                 tint = LiferychColors.Error,
                 modifier = Modifier.size(40.dp),

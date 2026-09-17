@@ -58,6 +58,9 @@ class FakeBmsRepository : BmsRepository {
         balancingCells = setOf(1, 4, 9),
         errors = emptyList(),
         lastUpdatedAt = 1_725_000_000_000L,
+        // Preview-only identity; production serial needs Modbus config path.
+        factorySerial = "224LG151200441",
+        bmsHwVersion = "JHB-R24TK-V2.1",
     )
 
     private val _batteryState = MutableStateFlow(demoBattery)
