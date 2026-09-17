@@ -71,6 +71,7 @@ import ru.liferych.bms.data.bms.DalyProtocol
 import ru.liferych.bms.data.bms.DalyRxBuffer
 import ru.liferych.bms.data.ble.DalyBleCharacteristics
 import ru.liferych.bms.data.ble.DalyBleClient
+import ru.liferych.bms.data.local.SavedBattery
 import ru.liferych.bms.data.repository.DalyBmsRepository
 import ru.liferych.bms.domain.model.BmsConnectionState
 import kotlin.concurrent.thread
@@ -273,15 +274,6 @@ private enum class QtcDbStatus {
     ADDED,
     ERROR
 }
-
-data class SavedBattery(
-    val address: String,
-    val bluetoothName: String,
-    val customName: String,
-    val soc: Double?,
-    val capacityAh: Double?,
-    val lastSeenAt: Long
-)
 
 /** Присутствие сохранённой BMS на экране «Мои батареи» (не путать с lastSeen / sleep_timeout). */
 private enum class BatteryPresenceState {
@@ -2492,30 +2484,7 @@ class MainActivity : ComponentActivity() {
         if (isServiceApp()) {
             return sessionBatteries.sortedByDescending { it.lastSeenAt }
         }
-        val result = mutableListOf<SavedBattery>()
-        val array = try {
-            JSONArray(batteryPrefs.getString("items", "[]") ?: "[]")
-        } catch (_: Exception) {
-            JSONArray()
-        }
-        for (i in 0 until array.length()) {
-            val item = array.optJSONObject(i) ?: continue
-            val address = item.optString("address").trim()
-            if (address.isBlank()) continue
-            result += SavedBattery(
-                address = address,
-                bluetoothName = sanitizeBleText(item.optString("bluetooth_name")).ifBlank {
-                    item.optString("bluetooth_name")
-                },
-                customName = item.optString("custom_name"),
-                soc = if (item.has("soc") && !item.isNull("soc")) item.optDouble("soc") else null,
-                capacityAh = if (item.has("capacity_ah") && !item.isNull("capacity_ah")) {
-                    item.optDouble("capacity_ah")
-                } else null,
-                lastSeenAt = item.optLong("last_seen_at")
-            )
-        }
-        return result.sortedByDescending { it.lastSeenAt }
+        return (application as BmsApp).container.savedBatteriesStore.load()
     }
 
     private fun saveBatteries(items: List<SavedBattery>) {
@@ -2524,18 +2493,7 @@ class MainActivity : ComponentActivity() {
             sessionBatteries.addAll(items)
             return
         }
-        val array = JSONArray()
-        items.forEach { battery ->
-            array.put(JSONObject().apply {
-                put("address", battery.address)
-                put("bluetooth_name", battery.bluetoothName)
-                put("custom_name", battery.customName)
-                put("soc", battery.soc ?: JSONObject.NULL)
-                put("capacity_ah", battery.capacityAh ?: JSONObject.NULL)
-                put("last_seen_at", battery.lastSeenAt)
-            })
-        }
-        batteryPrefs.edit().putString("items", array.toString()).apply()
+        (application as BmsApp).container.savedBatteriesStore.save(items)
     }
 
     private fun removeCurrentSessionBattery() {
@@ -11921,12 +11879,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startRemoteWritePolling() {
-        if (isServiceApp()) return
-        mainHandler.removeCallbacks(remoteWritePollRunnable)
-        mainHandler.postDelayed(remoteWritePollRunnable, 1500)
+        appContainer.remoteWriteCoordinator.requestImmediatePoll(1500L)
     }
 
     private fun stopRemoteWritePolling() {
+        // Runtime-owned coordinator stops from DalyBmsRepository disconnect.
         mainHandler.removeCallbacks(remoteWritePollRunnable)
     }
 
@@ -11992,6 +11949,7 @@ class MainActivity : ComponentActivity() {
             startServiceLocalWrite(command)
             return
         }
+        if (bmsRepository.isConfigIoBusy) return
         if (remoteWriteInProgress || configReadInProgress) {
             if (command.localOnly) {
                 mainHandler.postDelayed({ startRemoteWrite(command) }, 350)
@@ -12072,6 +12030,10 @@ class MainActivity : ComponentActivity() {
 
     @SuppressLint("MissingPermission")
     private fun startServiceLocalWrite(command: RemoteWriteCommand) {
+        if (bmsRepository.isConfigIoBusy) {
+            mainHandler.postDelayed({ startServiceLocalWrite(command) }, 350)
+            return
+        }
         if (remoteWriteInProgress || configReadInProgress) {
             mainHandler.postDelayed({ startServiceLocalWrite(command) }, 150)
             return
@@ -12459,6 +12421,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startConfigReadIfNeeded(force: Boolean) {
+        if (bmsRepository.isConfigIoBusy) return
         if (configReadInProgress) return
         if (configUploading && !remoteWriteAwaitingVerify) return
         if (remoteWriteInProgress && !remoteWriteAwaitingVerify) return
@@ -12656,7 +12619,7 @@ class MainActivity : ComponentActivity() {
                 rememberCurrentBmsState()
                 uploadConfigSnapshot(force = true)
                 scheduleExactSocWriteTest()
-                fetchAndApplyRemoteWrites()
+                appContainer.remoteWriteCoordinator.requestImmediatePoll()
             }, 1200)
 
             mainHandler.postDelayed({ pollOnce() }, 800)

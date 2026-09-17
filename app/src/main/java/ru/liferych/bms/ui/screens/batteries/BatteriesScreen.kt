@@ -29,6 +29,7 @@ import ru.liferych.bms.ui.components.LiferychTopBar
 import ru.liferych.bms.ui.components.StatePlaceholder
 import ru.liferych.bms.ui.components.StatusBadge
 import ru.liferych.bms.ui.components.StatusTone
+import ru.liferych.bms.ui.devicesearch.sanitizeBleDisplayName
 import ru.liferych.bms.ui.model.BatterySummaryUi
 import ru.liferych.bms.ui.theme.LiferychColors
 import ru.liferych.bms.ui.theme.LiferychDimens
@@ -43,12 +44,18 @@ fun BatteriesScreen(
     onBatteryClick: (BatterySummaryUi) -> Unit,
     onRefreshScan: () -> Unit,
     modifier: Modifier = Modifier,
+    onBack: (() -> Unit)? = null,
 ) {
     val scanning = connectionState is BmsConnectionState.Scanning
     Scaffold(
         modifier = modifier.fillMaxSize(),
         containerColor = LiferychColors.Background,
-        topBar = { LiferychTopBar(title = "Поиск BMS") },
+        topBar = {
+            LiferychTopBar(
+                title = "Поиск BMS",
+                onBack = onBack,
+            )
+        },
     ) { padding ->
         Column(
             modifier = Modifier
@@ -127,7 +134,11 @@ private fun BatteryListItem(
                 modifier = Modifier.padding(end = 12.dp),
             )
             Column(modifier = Modifier.weight(1f)) {
-                Text(text = battery.name, style = LiferychTypography.titleMedium)
+                Text(
+                    text = sanitizeBleDisplayName(battery.name)
+                        .ifBlank { battery.address ?: battery.id },
+                    style = LiferychTypography.titleMedium,
+                )
                 Spacer(Modifier.height(4.dp))
                 Text(text = battery.subtitle, style = LiferychTypography.bodyMedium)
                 Spacer(Modifier.height(10.dp))

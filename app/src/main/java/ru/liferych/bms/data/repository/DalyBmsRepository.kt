@@ -17,6 +17,7 @@ import ru.liferych.bms.domain.model.BatteryState
 import ru.liferych.bms.domain.model.BmsConnectionState
 import ru.liferych.bms.domain.model.BmsDevice
 import ru.liferych.bms.domain.repository.BmsRepository
+import java.util.concurrent.CopyOnWriteArraySet
 
 /**
  * Real BMS repository: owns scan/connect/wake/poll/parse and publishes [BatteryState].
@@ -27,6 +28,7 @@ class DalyBmsRepository(
     @Suppress("unused") private val appContext: Context,
     private val bleClient: DalyBleClient,
     private val mainHandler: Handler,
+    private val telemetryUploader: ru.liferych.bms.telemetry.RuntimeTelemetryUploader? = null,
 ) : BmsRepository {
     interface LegacyHost {
         /** True while Modbus config / remote write must pause runtime poll. */
@@ -43,6 +45,23 @@ class DalyBmsRepository(
         fun onBleError(message: String) {}
     }
 
+    /**
+     * Application-level lifecycle observer for components that require a fully
+     * awake BMS runtime, such as remote admin command polling.
+     */
+    interface RuntimeListener {
+        fun onRuntimeReady(address: String, bluetoothName: String) {}
+        fun onRuntimeStopped() {}
+    }
+
+    /**
+     * Exclusive receiver for Modbus config traffic.
+     */
+    interface ConfigIoHost {
+        fun onRawNotification(bytes: ByteArray): Boolean
+        fun onDisconnected() {}
+    }
+
     private val _batteryState = MutableStateFlow(BatteryState())
     private val _connectionState =
         MutableStateFlow<BmsConnectionState>(BmsConnectionState.Disconnected)
@@ -56,6 +75,15 @@ class DalyBmsRepository(
     val dalyData: DalyData = DalyData()
 
     var legacyHost: LegacyHost? = null
+
+    private val runtimeListeners = CopyOnWriteArraySet<RuntimeListener>()
+    private val configIoLock = Any()
+
+    @Volatile
+    private var configIoHost: ConfigIoHost? = null
+
+    @Volatile
+    private var runtimeReady = false
 
     private var selectedAddress: String? = null
     private var selectedDeviceName: String = ""
@@ -83,6 +111,7 @@ class DalyBmsRepository(
     val isPolling: Boolean get() = polling
     val connectedAddress: String? get() = selectedAddress
     val connectedName: String get() = selectedDeviceName
+    val isConfigIoBusy: Boolean get() = configIoHost != null
 
     init {
         bleClient.setHost(object : DalyBleClient.Host {
@@ -105,14 +134,27 @@ class DalyBmsRepository(
             }
 
             override fun onGattDisconnected() {
+                notifyRuntimeStopped()
+                notifyConfigIoDisconnected()
                 cancelWakeSequence()
                 stopPolling()
                 dalyData.errors.clear()
+                // Drop advertising presence for this MAC so MyBatteries goes Offline
+                // immediately on GATT loss (section 7), without inventing a new timeout.
+                val lost = selectedAddress
+                if (!lost.isNullOrBlank()) {
+                    _discoveredDevices.value = _discoveredDevices.value.filterNot {
+                        it.address.equals(lost, true)
+                    }
+                }
                 publishData(dalyData)
+                telemetryUploader?.onDisconnected()
                 legacyHost?.onDisconnected()
             }
 
             override fun onServicesFailed(reason: String) {
+                notifyRuntimeStopped()
+                notifyConfigIoDisconnected()
                 Log.w(TAG, reason)
                 stopPolling()
                 publishConnection(BmsConnectionState.Error(reason))
@@ -126,6 +168,7 @@ class DalyBmsRepository(
                 polling = true
                 val address = selectedAddress ?: gatt.device.address
                 selectedAddress = address
+                telemetryUploader?.markFirstUploadPending()
                 publishConnection(BmsConnectionState.Connected(address))
                 legacyHost?.onConnected(address)
             }
@@ -202,25 +245,38 @@ class DalyBmsRepository(
         _discoveredDevices.value = devices
     }
 
-    override fun startScan() {
-        _discoveredDevices.value = emptyList()
+    override fun startScan(clearResults: Boolean) {
+        if (clearResults) {
+            _discoveredDevices.value = emptyList()
+        }
         bleClient.startScan()
+    }
+
+    override fun startPresenceScan(clearResults: Boolean) {
+        if (clearResults) {
+            _discoveredDevices.value = emptyList()
+        }
+        // durationMs=0: until stopScan() — MyBatteries passive presence only.
+        bleClient.startScan(durationMs = 0L)
     }
 
     override fun stopScan() {
         bleClient.stopScan()
     }
 
-    override suspend fun connect(address: String) {
-        connectNow(address)
+    override suspend fun connect(address: String, bluetoothName: String) {
+        connectNow(address, bluetoothName)
     }
 
-    fun connectNow(address: String) {
+    fun connectNow(address: String, bluetoothName: String = "") {
+        notifyRuntimeStopped()
         selectedAddress = address
         val known = _discoveredDevices.value.firstOrNull {
             it.address.equals(address, true)
         }
         selectedDeviceName = known?.name.orEmpty()
+            .ifBlank { bluetoothName.trim() }
+            .ifBlank { address }
         cancelWakeSequence()
         stopPolling()
         if (!bleClient.connect(address)) {
@@ -233,17 +289,68 @@ class DalyBmsRepository(
     }
 
     fun disconnectNow() {
+        notifyRuntimeStopped()
+        notifyConfigIoDisconnected()
         cancelWakeSequence()
         stopPolling()
+        val lost = selectedAddress
         bleClient.disconnect()
+        if (!lost.isNullOrBlank()) {
+            _discoveredDevices.value = _discoveredDevices.value.filterNot {
+                it.address.equals(lost, true)
+            }
+        }
         selectedAddress = null
         selectedDeviceName = ""
+        telemetryUploader?.onDisconnected()
         publishConnection(BmsConnectionState.Disconnected)
     }
 
     fun writeRaw(frame: ByteArray): Boolean = bleClient.writeRaw(frame)
 
     fun writeCommand(cmd: Int): Boolean = bleClient.writeCommand(cmd)
+
+    /**
+     * Registers a runtime-ready observer. A currently ready session is replayed.
+     */
+    fun addRuntimeListener(listener: RuntimeListener) {
+        runtimeListeners += listener
+        val address = selectedAddress
+        if (runtimeReady && !address.isNullOrBlank()) {
+            listener.onRuntimeReady(address, selectedDeviceName)
+        }
+    }
+
+    /**
+     * Removes a previously registered runtime observer.
+     */
+    fun removeRuntimeListener(listener: RuntimeListener) {
+        runtimeListeners -= listener
+    }
+
+    /**
+     * Attempts to reserve Modbus config notifications for [host].
+     *
+     * Legacy MainActivity config I/O is respected to prevent concurrent writes.
+     */
+    fun beginConfigIo(host: ConfigIoHost): Boolean {
+        synchronized(configIoLock) {
+            if (configIoHost != null) return false
+            if (legacyHost?.shouldPauseRuntimePoll() == true) return false
+            if (_connectionState.value !is BmsConnectionState.Connected) return false
+            configIoHost = host
+            return true
+        }
+    }
+
+    /**
+     * Releases config-I/O ownership only when [host] is the current owner.
+     */
+    fun endConfigIo(host: ConfigIoHost) {
+        synchronized(configIoLock) {
+            if (configIoHost === host) configIoHost = null
+        }
+    }
 
     private fun stopPolling() {
         polling = false
@@ -313,6 +420,7 @@ class DalyBmsRepository(
         wakeInProgress = false
         wakeToken++
         if (!polling) return
+        notifyRuntimeReady()
         mainHandler.postDelayed({
             if (polling) pollOnce()
         }, if (gotResponse) 120L else 300L)
@@ -328,7 +436,7 @@ class DalyBmsRepository(
     private fun pollOnce(token: Int) {
         if (token != pollLoopToken) return
         if (!polling) return
-        if (legacyHost?.shouldPauseRuntimePoll() == true) {
+        if (isConfigIoBusy || legacyHost?.shouldPauseRuntimePoll() == true) {
             mainHandler.postDelayed({ pollOnce(token) }, 1000)
             return
         }
@@ -352,7 +460,7 @@ class DalyBmsRepository(
     ) {
         if (token != pollLoopToken) return
         if (!polling) return
-        if (legacyHost?.shouldPauseRuntimePoll() == true) {
+        if (isConfigIoBusy || legacyHost?.shouldPauseRuntimePoll() == true) {
             mainHandler.postDelayed({ pollOnce(token) }, 1000)
             return
         }
@@ -423,6 +531,7 @@ class DalyBmsRepository(
 
     private fun handleIncoming(bytes: ByteArray) {
         if (bytes.isEmpty()) return
+        if (configIoHost?.onRawNotification(bytes) == true) return
         if (legacyHost?.onRawNotification(bytes) == true) {
             legacyHost?.onTelemetryUpdated()
             return
@@ -459,7 +568,44 @@ class DalyBmsRepository(
                 publishConnection(BmsConnectionState.Connected(address))
             }
         }
+        // Legacy MainActivity.parseFrame: CMD_ERRORS (0x98) → onPollCompleted → upload.
+        if (cmd == DalyProtocol.CMD_ERRORS) {
+            telemetryUploader?.onPollCycleCompleted(
+                data = dalyData,
+                bluetoothAddress = selectedAddress,
+                bluetoothName = selectedDeviceName,
+                liveHwVersion = hwVersionAscii,
+            )
+        }
         completeRuntimeCommand(cmd, p)
+    }
+
+    /**
+     * Publishes exactly one ready transition for the current wake session.
+     */
+    private fun notifyRuntimeReady() {
+        val address = selectedAddress ?: return
+        if (runtimeReady) return
+        runtimeReady = true
+        runtimeListeners.forEach { listener ->
+            listener.onRuntimeReady(address, selectedDeviceName)
+        }
+    }
+
+    /**
+     * Stops runtime-bound components once for the active session.
+     */
+    private fun notifyRuntimeStopped() {
+        if (!runtimeReady) return
+        runtimeReady = false
+        runtimeListeners.forEach { listener -> listener.onRuntimeStopped() }
+    }
+
+    /**
+     * Unblocks an active config read immediately after GATT loss.
+     */
+    private fun notifyConfigIoDisconnected() {
+        configIoHost?.onDisconnected()
     }
 
     private fun storeAsciiCmdFrame(

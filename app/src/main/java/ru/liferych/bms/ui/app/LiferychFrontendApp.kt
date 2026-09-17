@@ -4,7 +4,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import ru.liferych.bms.ui.navigation.FrontendNavHost
 import ru.liferych.bms.ui.theme.LiferychTheme
+import ru.liferych.bms.ui.viewmodel.ChartsViewModel
 import ru.liferych.bms.ui.viewmodel.FrontendViewModel
+import ru.liferych.bms.ui.viewmodel.QrViewModel
+import ru.liferych.bms.ui.viewmodel.SupportViewModel
 
 /**
  * Root composable for the new client frontend.
@@ -15,6 +18,9 @@ import ru.liferych.bms.ui.viewmodel.FrontendViewModel
 @Composable
 fun LiferychFrontendApp(
     viewModel: FrontendViewModel,
+    supportViewModel: SupportViewModel,
+    qrViewModel: QrViewModel,
+    chartsViewModel: ChartsViewModel,
     modifier: Modifier = Modifier,
     startRoute: String? = null,
     onRequestBlePermissions: () -> Unit = {},
@@ -22,6 +28,9 @@ fun LiferychFrontendApp(
     LiferychTheme {
         FrontendNavHost(
             viewModel = viewModel,
+            supportViewModel = supportViewModel,
+            qrViewModel = qrViewModel,
+            chartsViewModel = chartsViewModel,
             modifier = modifier,
             startRoute = startRoute,
             onRequestBlePermissions = onRequestBlePermissions,

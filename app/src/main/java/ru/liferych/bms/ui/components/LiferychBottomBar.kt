@@ -36,7 +36,7 @@ data class BottomNavItem(
 
 /** Legacy CLIENT bottom nav with Liferych outline icons. */
 val BatteryBottomNavItems = listOf(
-    BottomNavItem(FrontendDestination.Dashboard, "Главная", R.drawable.ic_liferych_home),
+    BottomNavItem(FrontendDestination.MyBatteries, "Главная", R.drawable.ic_liferych_home),
     BottomNavItem(FrontendDestination.Journal, "Журнал", R.drawable.ic_liferych_journal),
     BottomNavItem(FrontendDestination.QrCode, "QR-код", R.drawable.ic_liferych_qr),
     BottomNavItem(FrontendDestination.Support, "Поддержка", R.drawable.ic_liferych_support),

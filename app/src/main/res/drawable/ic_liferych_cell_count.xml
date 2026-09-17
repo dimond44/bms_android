@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- Neutral 2x2 cell grid for «Количество ячеек» -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M4.5,4.5 H10.5 V10.5 H4.5 Z"
+        android:strokeColor="#526074"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M13.5,4.5 H19.5 V10.5 H13.5 Z"
+        android:strokeColor="#526074"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M4.5,13.5 H10.5 V19.5 H4.5 Z"
+        android:strokeColor="#526074"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+    <path
+        android:fillColor="@android:color/transparent"
+        android:pathData="M13.5,13.5 H19.5 V19.5 H13.5 Z"
+        android:strokeColor="#526074"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+</vector>

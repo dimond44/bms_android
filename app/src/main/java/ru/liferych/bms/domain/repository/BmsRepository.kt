@@ -13,11 +13,20 @@ interface BmsRepository {
     val connectionState: StateFlow<BmsConnectionState>
     val discoveredDevices: StateFlow<List<BmsDevice>>
 
-    suspend fun connect(address: String)
+    suspend fun connect(address: String, bluetoothName: String = "")
 
     suspend fun disconnect()
 
-    fun startScan()
+    /**
+     * @param clearResults when false, keep previous discovery list (soft presence refresh)
+     */
+    fun startScan(clearResults: Boolean = true)
+
+    /**
+     * Continuous BLE presence scan until [stopScan] (no timed auto-stop).
+     * Ads only — does not connect GATT.
+     */
+    fun startPresenceScan(clearResults: Boolean = false)
 
     fun stopScan()
 }

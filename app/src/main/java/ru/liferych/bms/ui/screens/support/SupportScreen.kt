@@ -55,6 +55,14 @@ import ru.liferych.bms.ui.theme.LiferychColors
 import ru.liferych.bms.ui.theme.LiferychDimens
 import ru.liferych.bms.ui.theme.LiferychTheme
 
+/**
+ * Attachment reference for Support form (URI + display name). No Bitmap in state.
+ */
+data class SupportAttachmentUi(
+    val uri: android.net.Uri,
+    val displayName: String,
+)
+
 /** Client-facing warranty status labels (legacy: Открыто / Закрыто). */
 enum class SupportRequestStatus {
     Open,
@@ -62,8 +70,7 @@ enum class SupportRequestStatus {
 }
 
 /**
- * Fake UI model for a warranty support request card / details.
- * Not persisted / not sent to API in this visual stage.
+ * UI model for a warranty support request card / details.
  */
 data class SupportRequestUi(
     val localId: String,
@@ -96,6 +103,10 @@ sealed class SupportUiPhase {
 
     data class RequestList(
         val requests: List<SupportRequestUi>,
+        val loading: Boolean = false,
+        val total: Int = 0,
+        val page: Int = 1,
+        val totalPages: Int = 1,
     ) : SupportUiPhase()
 
     data class RequestDetails(
@@ -113,100 +124,274 @@ sealed class SupportUiPhase {
 }
 
 /**
- * CLIENT Support screen — visual port of legacy [showSupportScreen]
- * (contacts home, warranty form, request list). No network / API in this stage.
+ * CLIENT Support screen — contacts / warranty form / request list.
  *
+ * @param phase current UI phase from SupportViewModel
+ * @param attachments real URI attachments (display names mirrored in phase)
+ * @param submitting true while create/update request runs
  * @param onBack leave support tab
- * @param initialPhase phase for screenshots / previews
- * @param defaultFio prefill for new form (profile)
- * @param defaultPhone prefill for new form (profile)
+ * @param onOpenHome segment → home
+ * @param onOpenNew segment → new form
+ * @param onOpenList segment → list + refresh
+ * @param onOpenDetails open ticket details
+ * @param onNewFormChange edit new form
+ * @param onDetailsFormChange edit details form
+ * @param onSubmit send current form
+ * @param onAddAttachment add URI from camera/gallery
+ * @param onRemoveAttachment remove by index
+ * @param onDiagnostics diagnostics action
  * @param modifier layout modifier
  */
 @Composable
 fun SupportScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
-    initialPhase: SupportUiPhase = SupportUiPhase.Home,
-    defaultFio: String = "Демо пользователь",
-    defaultPhone: String = "+7 (900) 000-00-00",
+    phase: SupportUiPhase = SupportUiPhase.Home,
+    attachments: List<SupportAttachmentUi> = emptyList(),
+    submitting: Boolean = false,
+    onOpenHome: () -> Unit = {},
+    onOpenNew: () -> Unit = {},
+    onOpenList: () -> Unit = {},
+    onOpenDetails: (SupportRequestUi) -> Unit = {},
+    onNewFormChange: (SupportUiPhase.NewRequest) -> Unit = {},
+    onDetailsFormChange: (SupportUiPhase.RequestDetails) -> Unit = {},
+    onSubmit: () -> Unit = {},
+    onAddAttachment: (android.net.Uri) -> Unit = {},
+    onRemoveAttachment: (Int) -> Unit = {},
+    onDiagnostics: () -> Unit = {},
+    onPreviousPage: () -> Unit = {},
+    onNextPage: () -> Unit = {},
+    /** Preview-only seed; ignored when [phase] provided by VM. */
+    initialPhase: SupportUiPhase? = null,
+    defaultFio: String = "",
+    defaultPhone: String = "",
 ) {
-    var phase by remember { mutableStateOf(initialPhase) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var previewPhase by remember { mutableStateOf(initialPhase ?: phase) }
+    val currentPhase = if (initialPhase != null) previewPhase else phase
+    var pendingCameraUri by remember { mutableStateOf<android.net.Uri?>(null) }
+
+    val takePictureLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.TakePicture(),
+    ) { ok ->
+        val pending = pendingCameraUri
+        pendingCameraUri = null
+        if (ok && pending != null) onAddAttachment(pending)
+    }
+
+    val galleryLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments(),
+    ) { uris ->
+        uris.take(ru.liferych.bms.data.support.SupportMediaEncoder.MAX_ATTACHMENTS).forEach { uri ->
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            } catch (_: Exception) {
+            }
+            onAddAttachment(uri)
+        }
+    }
+
+    val cameraPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            launchSupportCamera(context) { uri ->
+                pendingCameraUri = uri
+                takePictureLauncher.launch(uri)
+            }
+        }
+    }
+
+    fun onTakePhoto() {
+        if (attachments.size >= ru.liferych.bms.data.support.SupportMediaEncoder.MAX_ATTACHMENTS) return
+        val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            android.Manifest.permission.CAMERA,
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            launchSupportCamera(context) { uri ->
+                pendingCameraUri = uri
+                takePictureLauncher.launch(uri)
+            }
+        } else {
+            cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+        }
+    }
+
+    fun onPickGallery() {
+        galleryLauncher.launch(arrayOf("image/*", "video/*"))
+    }
+
+    fun onSegment(segment: SupportSegment) {
+        if (initialPhase != null) {
+            previewPhase = segmentToPhase(segment, defaultFio, defaultPhone)
+            return
+        }
+        when (segment) {
+            SupportSegment.None -> onOpenHome()
+            SupportSegment.New -> onOpenNew()
+            SupportSegment.List -> onOpenList()
+        }
+    }
 
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(LiferychColors.Background),
     ) {
-        LiferychTopBar(title = "Поддержка", onBack = onBack)
+        LiferychTopBar(
+            title = "Поддержка",
+            onBack = {
+                when (currentPhase) {
+                    is SupportUiPhase.RequestDetails -> onOpenList()
+                    is SupportUiPhase.NewRequest,
+                    is SupportUiPhase.RequestList,
+                    is SupportUiPhase.Error,
+                    -> onOpenHome()
+                    SupportUiPhase.Home -> onBack()
+                }
+            },
+        )
 
-        when (val current = phase) {
+        when (val current = currentPhase) {
             SupportUiPhase.Home -> SupportHomeBody(
                 segment = SupportSegment.None,
-                onSegment = { phase = segmentToPhase(it, defaultFio, defaultPhone) },
+                onSegment = { onSegment(it) },
                 onDiagnostics = {
-                    phase = SupportUiPhase.Error(
-                        "Диагностика BMS будет перенесена на следующем этапе",
-                    )
+                    if (initialPhase != null) {
+                        previewPhase = SupportUiPhase.Error(
+                            "Диагностика BMS будет перенесена на следующем этапе",
+                        )
+                    } else {
+                        onDiagnostics()
+                    }
                 },
+                onDial = { dialPhone(context, "+79320781011") },
+                onOpenUrl = { openUrl(context, it) },
             )
 
             is SupportUiPhase.NewRequest -> SupportNewBody(
                 form = current,
-                onSegment = { phase = segmentToPhase(it, defaultFio, defaultPhone) },
-                onFormChange = { phase = it },
+                submitting = submitting,
+                attachmentRows = attachments,
+                onSegment = { onSegment(it) },
+                onFormChange = { form ->
+                    if (initialPhase != null) previewPhase = form else onNewFormChange(form)
+                },
                 onSubmit = {
-                    if (!current.consent) {
-                        phase = current.copy(statusMessage = "Подтвердите согласие на обработку данных")
-                    } else if (current.problem.isBlank()) {
-                        phase = current.copy(statusMessage = "Опишите проблему")
+                    if (initialPhase != null) {
+                        previewPhase = current.copy(statusMessage = "Preview: API не вызван")
                     } else {
-                        phase = current.copy(
-                            statusMessage = "Отправка недоступна в UI-preview (API не подключён)",
-                        )
+                        onSubmit()
                     }
                 },
+                onTakePhoto = { onTakePhoto() },
+                onPickGallery = { onPickGallery() },
+                onRemoveAttachment = onRemoveAttachment,
             )
 
             is SupportUiPhase.RequestList -> {
-                if (current.requests.isEmpty()) {
-                    SupportEmptyBody(
-                        onSegment = { phase = segmentToPhase(it, defaultFio, defaultPhone) },
+                when {
+                    current.loading && current.requests.isEmpty() -> SupportLoadingBody(
+                        onSegment = { onSegment(it) },
                     )
-                } else {
-                    SupportListBody(
+                    !current.loading && current.requests.isEmpty() -> SupportEmptyBody(
+                        onSegment = { onSegment(it) },
+                    )
+                    else -> SupportListBody(
                         requests = current.requests,
-                        onSegment = { phase = segmentToPhase(it, defaultFio, defaultPhone) },
+                        total = current.total,
+                        page = current.page,
+                        totalPages = current.totalPages,
+                        loading = current.loading,
+                        onSegment = { onSegment(it) },
                         onOpen = { req ->
-                            phase = SupportUiPhase.RequestDetails(
-                                request = req,
-                                fio = req.fio,
-                                phone = req.phone,
-                                model = req.model,
-                                problem = req.problem,
-                                attachments = req.attachmentNames,
-                                statusMessage = "Текущий статус: ${statusRu(req.status)}",
-                            )
+                            if (initialPhase != null) {
+                                previewPhase = SupportUiPhase.RequestDetails(
+                                    request = req,
+                                    fio = req.fio,
+                                    phone = req.phone,
+                                    model = req.model,
+                                    problem = req.problem,
+                                    attachments = req.attachmentNames,
+                                    statusMessage = "Текущий статус: ${statusRu(req.status)}",
+                                )
+                            } else {
+                                onOpenDetails(req)
+                            }
                         },
+                        onPreviousPage = onPreviousPage,
+                        onNextPage = onNextPage,
                     )
                 }
             }
 
             is SupportUiPhase.RequestDetails -> SupportDetailsBody(
                 phase = current,
-                onSegment = { phase = segmentToPhase(it, defaultFio, defaultPhone) },
-                onFormChange = { phase = it },
-                onSubmit = {
-                    phase = current.copy(
-                        statusMessage = "Отправка недоступна в UI-preview (API не подключён)",
-                    )
+                submitting = submitting,
+                attachmentRows = attachments,
+                onSegment = { onSegment(it) },
+                onFormChange = { form ->
+                    if (initialPhase != null) previewPhase = form else onDetailsFormChange(form)
                 },
+                onSubmit = {
+                    if (initialPhase != null) {
+                        previewPhase = current.copy(statusMessage = "Preview: API не вызван")
+                    } else {
+                        onSubmit()
+                    }
+                },
+                onTakePhoto = { onTakePhoto() },
+                onPickGallery = { onPickGallery() },
+                onRemoveAttachment = onRemoveAttachment,
             )
 
             is SupportUiPhase.Error -> SupportErrorBody(
                 message = current.message,
-                onBackHome = { phase = SupportUiPhase.Home },
+                onBackHome = {
+                    if (initialPhase != null) previewPhase = SupportUiPhase.Home else onOpenHome()
+                },
             )
         }
+    }
+}
+
+private fun launchSupportCamera(
+    context: android.content.Context,
+    onUriReady: (android.net.Uri) -> Unit,
+) {
+    try {
+        val dir = java.io.File(context.cacheDir, "warranty_photos").apply { mkdirs() }
+        val fileName = "Фото_${java.text.SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", java.util.Locale.US).format(java.util.Date())}.jpg"
+        val photoFile = java.io.File(dir, fileName)
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            photoFile,
+        )
+        onUriReady(uri)
+    } catch (_: Exception) {
+    }
+}
+
+private fun dialPhone(context: android.content.Context, e164: String) {
+    try {
+        context.startActivity(
+            android.content.Intent(android.content.Intent.ACTION_DIAL, android.net.Uri.parse("tel:$e164")),
+        )
+    } catch (_: Exception) {
+    }
+}
+
+private fun openUrl(context: android.content.Context, url: String) {
+    try {
+        context.startActivity(
+            android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url)),
+        )
+    } catch (_: Exception) {
     }
 }
 
@@ -339,6 +524,8 @@ private fun SupportHomeBody(
     segment: SupportSegment,
     onSegment: (SupportSegment) -> Unit,
     onDiagnostics: () -> Unit,
+    onDial: () -> Unit = {},
+    onOpenUrl: (String) -> Unit = {},
 ) {
     SupportChrome(segment = segment, onSegment = onSegment) {
         SupportBorderedCard {
@@ -360,15 +547,23 @@ private fun SupportHomeBody(
                 color = LiferychColors.BrandYellowDark,
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(top = 8.dp, bottom = 4.dp),
+                modifier = Modifier
+                    .padding(top = 8.dp, bottom = 4.dp)
+                    .clickable(onClick = onDial),
             )
-            listOf("Telegram", "MAX", "ВКонтакте").forEach { link ->
+            listOf(
+                "Telegram" to "https://t.me/liferych",
+                "MAX" to "https://max.ru/u/f9LHodD0cOIwPdSddb5TLuiLTMRCIkIpTzgUzr_f2iEj89DXpt_Mh2zXvcc",
+                "ВКонтакте" to "https://vk.ru/liferych",
+            ).forEach { (title, url) ->
                 Text(
-                    text = link,
+                    text = title,
                     color = Color(0xFF1976D2),
                     fontSize = 15.sp,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(top = 6.dp),
+                    modifier = Modifier
+                        .padding(top = 6.dp)
+                        .clickable { onOpenUrl(url) },
                 )
             }
             Text(
@@ -399,6 +594,27 @@ private fun SupportHomeBody(
 }
 
 @Composable
+private fun SupportLoadingBody(onSegment: (SupportSegment) -> Unit) {
+    SupportChrome(segment = SupportSegment.List, onSegment = onSegment) {
+        SupportBorderedCard {
+            Text(
+                text = "Ваши обращения",
+                color = Color(0xFF323232),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = "Загрузка обращений…",
+                color = Color(0xFF646464),
+                fontSize = 14.sp,
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+    }
+}
+
+@Composable
 private fun SupportEmptyBody(onSegment: (SupportSegment) -> Unit) {
     SupportChrome(segment = SupportSegment.List, onSegment = onSegment) {
         SupportBorderedCard {
@@ -422,8 +638,14 @@ private fun SupportEmptyBody(onSegment: (SupportSegment) -> Unit) {
 @Composable
 private fun SupportListBody(
     requests: List<SupportRequestUi>,
+    total: Int = 0,
+    page: Int = 1,
+    totalPages: Int = 1,
+    loading: Boolean = false,
     onSegment: (SupportSegment) -> Unit,
     onOpen: (SupportRequestUi) -> Unit,
+    onPreviousPage: () -> Unit = {},
+    onNextPage: () -> Unit = {},
 ) {
     SupportChrome(segment = SupportSegment.List, onSegment = onSegment) {
         SupportBorderedCard {
@@ -434,12 +656,100 @@ private fun SupportListBody(
                 fontWeight = FontWeight.Bold,
             )
             Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Всего обращений по этой BMS: ${maxOf(total, requests.size)}",
+                color = Color(0xFF5A5A5A),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(8.dp))
             requests.forEach { req ->
                 SupportRequestCard(request = req, onOpen = { onOpen(req) })
                 Spacer(Modifier.height(10.dp))
             }
+            if (totalPages > 1 || total > 5) {
+                Spacer(Modifier.height(4.dp))
+                SupportPaginationRow(
+                    page = page,
+                    totalPages = totalPages,
+                    enabled = !loading,
+                    onPrevious = onPreviousPage,
+                    onNext = onNextPage,
+                )
+            }
         }
         Spacer(Modifier.height(10.dp))
+    }
+}
+
+/**
+ * Legacy-style list pagination: ← Назад / N / M / Далее →.
+ */
+@Composable
+private fun SupportPaginationRow(
+    page: Int,
+    totalPages: Int,
+    enabled: Boolean,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+) {
+    val safePages = maxOf(1, totalPages)
+    val safePage = page.coerceIn(1, safePages)
+    val prevEnabled = enabled && safePage > 1
+    val nextEnabled = enabled && safePage < safePages
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SupportPaginationButton(
+            label = "← Назад",
+            enabled = prevEnabled,
+            onClick = onPrevious,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = "$safePage / $safePages",
+            color = Color(0xFF3C3C3C),
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.weight(1f),
+        )
+        SupportPaginationButton(
+            label = "Далее →",
+            enabled = nextEnabled,
+            onClick = onNext,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun SupportPaginationButton(
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val shape = RoundedCornerShape(10.dp)
+    val border = if (enabled) LiferychColors.BrandYellowDark else Color(0xFFDCDCDC)
+    val textColor = if (enabled) LiferychColors.BrandYellowDark else Color(0xFFA0A0A0)
+    Box(
+        modifier = modifier
+            .clip(shape)
+            .background(LiferychColors.Surface)
+            .border(1.dp, border, shape)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = label,
+            color = textColor,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            textAlign = TextAlign.Center,
+        )
     }
 }
 
@@ -511,9 +821,14 @@ private fun SupportRequestCard(
 @Composable
 private fun SupportNewBody(
     form: SupportUiPhase.NewRequest,
+    submitting: Boolean,
+    attachmentRows: List<SupportAttachmentUi>,
     onSegment: (SupportSegment) -> Unit,
     onFormChange: (SupportUiPhase.NewRequest) -> Unit,
     onSubmit: () -> Unit,
+    onTakePhoto: () -> Unit,
+    onPickGallery: () -> Unit,
+    onRemoveAttachment: (Int) -> Unit,
 ) {
     val canSubmit = isSupportFormReady(
         fio = form.fio,
@@ -521,7 +836,7 @@ private fun SupportNewBody(
         model = form.model,
         problem = form.problem,
         consent = form.consent,
-    )
+    ) && !submitting
     SupportChrome(segment = SupportSegment.New, onSegment = onSegment) {
         SupportBorderedCard {
             Text(
@@ -565,8 +880,11 @@ private fun SupportNewBody(
                 singleLine = false,
             )
             Spacer(Modifier.height(LiferychDimens.Space8))
-            // File pickers stay visual-only for now (no gallery/camera backend).
-            AttachmentButtons(onPhoto = {}, onGallery = {})
+            AttachmentButtons(
+                onPhoto = onTakePhoto,
+                onGallery = onPickGallery,
+                enabled = !submitting,
+            )
             Spacer(Modifier.height(LiferychDimens.Space8))
             Text(
                 text = "Прикреплённые файлы",
@@ -575,22 +893,10 @@ private fun SupportNewBody(
                 fontWeight = FontWeight.Bold,
             )
             Spacer(Modifier.height(LiferychDimens.Space4))
-            if (form.attachments.isEmpty()) {
-                Text(
-                    text = "Файлы не выбраны",
-                    color = LiferychColors.TextSecondary,
-                    fontSize = 13.sp,
-                )
-            } else {
-                form.attachments.forEach { name ->
-                    Text(
-                        text = name,
-                        color = LiferychColors.TextPrimary,
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(vertical = LiferychDimens.Space4),
-                    )
-                }
-            }
+            AttachmentList(
+                items = attachmentRows,
+                onRemove = onRemoveAttachment,
+            )
             Spacer(Modifier.height(LiferychDimens.Space8))
             ConsentRow(
                 checked = form.consent,
@@ -618,9 +924,14 @@ private fun SupportNewBody(
 @Composable
 private fun SupportDetailsBody(
     phase: SupportUiPhase.RequestDetails,
+    submitting: Boolean,
+    attachmentRows: List<SupportAttachmentUi>,
     onSegment: (SupportSegment) -> Unit,
     onFormChange: (SupportUiPhase.RequestDetails) -> Unit,
     onSubmit: () -> Unit,
+    onTakePhoto: () -> Unit,
+    onPickGallery: () -> Unit,
+    onRemoveAttachment: (Int) -> Unit,
 ) {
     val titleId = phase.request.serverId?.takeIf { it.isNotBlank() } ?: "черновик"
     val canSubmit = isSupportFormReady(
@@ -629,7 +940,7 @@ private fun SupportDetailsBody(
         model = phase.model,
         problem = phase.problem,
         consent = phase.consent,
-    )
+    ) && !submitting
     SupportChrome(segment = SupportSegment.List, onSegment = onSegment) {
         SupportBorderedCard {
             Text(
@@ -680,7 +991,11 @@ private fun SupportDetailsBody(
                 singleLine = false,
             )
             Spacer(Modifier.height(LiferychDimens.Space8))
-            AttachmentButtons(onPhoto = {}, onGallery = {})
+            AttachmentButtons(
+                onPhoto = onTakePhoto,
+                onGallery = onPickGallery,
+                enabled = !submitting,
+            )
             Spacer(Modifier.height(LiferychDimens.Space8))
             Text(
                 text = "Прикреплённые файлы",
@@ -689,17 +1004,7 @@ private fun SupportDetailsBody(
                 fontWeight = FontWeight.Bold,
             )
             Spacer(Modifier.height(LiferychDimens.Space4))
-            if (phase.attachments.isEmpty()) {
-                Text(
-                    text = "Файлы не выбраны",
-                    color = LiferychColors.TextSecondary,
-                    fontSize = 13.sp,
-                )
-            } else {
-                phase.attachments.forEach { name ->
-                    Text(text = name, color = LiferychColors.TextPrimary, fontSize = 13.sp)
-                }
-            }
+            AttachmentList(items = attachmentRows, onRemove = onRemoveAttachment)
             Spacer(Modifier.height(LiferychDimens.Space8))
             ConsentRow(
                 checked = phase.consent,
@@ -815,19 +1120,63 @@ private fun SupportField(
 private fun AttachmentButtons(
     onPhoto: () -> Unit,
     onGallery: () -> Unit,
+    enabled: Boolean = true,
 ) {
     Row(modifier = Modifier.fillMaxWidth()) {
         OutlineActionButton(
             text = "Сделать фото",
             onClick = onPhoto,
+            enabled = enabled,
             modifier = Modifier.weight(1f),
         )
         Spacer(Modifier.width(8.dp))
         OutlineActionButton(
             text = "Из галереи",
             onClick = onGallery,
+            enabled = enabled,
             modifier = Modifier.weight(1f),
         )
+    }
+}
+
+@Composable
+private fun AttachmentList(
+    items: List<SupportAttachmentUi>,
+    onRemove: (Int) -> Unit,
+) {
+    if (items.isEmpty()) {
+        Text(
+            text = "Файлы не выбраны",
+            color = LiferychColors.TextSecondary,
+            fontSize = 13.sp,
+        )
+        return
+    }
+    items.forEachIndexed { index, item ->
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = LiferychDimens.Space4),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "📎 ${item.displayName}",
+                color = LiferychColors.TextPrimary,
+                fontSize = 13.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = "✕",
+                color = Color(0xFF8C8C8C),
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .clickable { onRemove(index) }
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+        }
     }
 }
 
@@ -836,11 +1185,12 @@ private fun OutlineActionButton(
     text: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     val shape = RoundedCornerShape(12.dp)
     Text(
         text = text,
-        color = LiferychColors.TextPrimary,
+        color = if (enabled) LiferychColors.TextPrimary else Color(0xFF9A9A9A),
         fontSize = 14.sp,
         fontWeight = FontWeight.Bold,
         textAlign = TextAlign.Center,
@@ -848,7 +1198,7 @@ private fun OutlineActionButton(
             .clip(shape)
             .background(LiferychColors.Surface)
             .border(1.dp, Color(0xFFCAD3DC), shape)
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(vertical = 12.dp, horizontal = 8.dp),
     )
 }

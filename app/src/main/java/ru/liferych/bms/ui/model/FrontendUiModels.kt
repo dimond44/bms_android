@@ -32,6 +32,8 @@ data class BatterySummaryUi(
     val connectionLabel: String,
     val serialNumber: String = "--",
     val bmsVersion: String = "--",
+    /** BLE RSSI from scan; 0 when unknown / not from discovery. */
+    val rssi: Int = 0,
 )
 
 /**
@@ -44,8 +46,9 @@ data class ActiveBmsErrorUi(
 )
 
 /**
- * Client profile UI model for Compose Profile screen (fake / local presentation).
- * Not an auth token container — no secrets.
+ * Client profile UI model for Compose Profile screen.
+ * Mapped from [ru.liferych.bms.domain.auth.UserProfile] / AuthState.
+ * Not an auth token container — no secrets / passwords / API keys.
  */
 data class ProfileUi(
     val displayName: String,
@@ -53,7 +56,31 @@ data class ProfileUi(
     val phone: String,
     val birthDate: String = "",
     val appVersionLabel: String,
-    val isAuthorized: Boolean = true,
+    val isAuthorized: Boolean = false,
+)
+
+/**
+ * Transient auth form feedback for Profile login/register/save.
+ * No secrets.
+ */
+data class ProfileAuthFeedback(
+    val message: String = "",
+    val isSubmitting: Boolean = false,
+    val suggestRegister: Boolean = false,
+    val suggestLogin: Boolean = false,
+)
+
+/**
+ * Avatar change UI state for Compose Profile (does not hold Bitmap).
+ *
+ * @property localPreviewPath absolute path for immediate preview after encode
+ * @property isUploading true while POST /users/avatar runs
+ * @property message status / error text under avatar
+ */
+data class ProfileAvatarUi(
+    val localPreviewPath: String = "",
+    val isUploading: Boolean = false,
+    val message: String = "",
 )
 
 fun BmsConnectionState.toScreenUiStatus(hasTelemetry: Boolean): ScreenUiStatus {
@@ -67,7 +94,8 @@ fun BmsConnectionState.toScreenUiStatus(hasTelemetry: Boolean): ScreenUiStatus {
         }
 
         is BmsConnectionState.Connected -> {
-            if (hasTelemetry) ScreenUiStatus.Connected else ScreenUiStatus.Empty
+            // First connect: wait for telemetry — Loading, not Empty («Нет данных»).
+            if (hasTelemetry) ScreenUiStatus.Connected else ScreenUiStatus.Loading
         }
 
         is BmsConnectionState.Error -> ScreenUiStatus.Error

@@ -52,6 +52,17 @@ object TelemetryLocalRepository {
             syncState = "PENDING",
         )
         val rowId = dao(context).insert(entity)
+        // Compact chart history: same sample/timestamp, independent of SYNCED purge.
+        val voltage = payload.optDoubleOrNull("voltage")
+        val current = payload.optDoubleOrNull("current")
+        if (voltage != null || current != null) {
+            TelemetryHistoryRepository(context).record(
+                bmsUid = bmsUid,
+                recordedAt = recordedAt,
+                voltage = voltage,
+                current = current,
+            )
+        }
         Log.i(
             TAG,
             "TELEMETRY LOCAL SAVE battery=$bmsUid event=$eventId ts=$recordedAt row=$rowId",
@@ -190,4 +201,13 @@ object TelemetryLocalRepository {
             null
         }
     }
+}
+
+/**
+ * Reads a finite JSON number, or null when missing / non-finite.
+ */
+private fun JSONObject.optDoubleOrNull(key: String): Double? {
+    if (!has(key) || isNull(key)) return null
+    val value = optDouble(key, Double.NaN)
+    return value.takeIf { it.isFinite() }
 }

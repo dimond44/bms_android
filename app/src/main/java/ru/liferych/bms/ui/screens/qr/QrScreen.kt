@@ -1,5 +1,12 @@
 package ru.liferych.bms.ui.screens.qr
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -32,6 +39,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -39,6 +47,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ru.liferych.bms.R
 import ru.liferych.bms.cellcode.CellCodeDecoder
 import ru.liferych.bms.cellcode.CellCodeRecognition
@@ -47,10 +57,10 @@ import ru.liferych.bms.ui.components.LiferychTopBar
 import ru.liferych.bms.ui.theme.LiferychColors
 import ru.liferych.bms.ui.theme.LiferychDimens
 import ru.liferych.bms.ui.theme.LiferychTheme
+import ru.liferych.bms.ui.viewmodel.QrViewModel
 
 /**
  * UI phase for CLIENT QR flow (legacy showQrInput / showQrScanner / showQrResult).
- * Camera/ML Kit backend is not wired in this visual stage — Scanning is a shell.
  */
 sealed class QrUiPhase {
     data class Ready(val codeInput: String = "", val inlineError: String? = null) : QrUiPhase()
@@ -61,69 +71,151 @@ sealed class QrUiPhase {
 }
 
 /**
- * CLIENT QR screen — visual port of legacy «Проверка QR-кода».
- * Purpose: decode factory cell/element QR / Data Matrix via [CellCodeDecoder]
- * (not BMS pairing). Camera scan uses UI shell until CameraX is wired later.
+ * CLIENT QR screen — cell/element code check via CameraX + ML Kit + [CellCodeDecoder].
  *
- * @param onBack leave QR tab / go back
- * @param initialPhase optional phase for screenshots / previews
+ * @param viewModel QR state / decode (null only for Compose Preview)
+ * @param onBack leave QR tab
+ * @param initialPhase Preview-only override when [viewModel] is null
  * @param modifier layout modifier
  */
 @Composable
 fun QrScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    viewModel: QrViewModel? = null,
     initialPhase: QrUiPhase = QrUiPhase.Ready(),
 ) {
-    var phase by remember { mutableStateOf(initialPhase) }
+    if (viewModel == null) {
+        QrScreenPreviewHost(onBack = onBack, initialPhase = initialPhase, modifier = modifier)
+        return
+    }
+
+    val phase by viewModel.phase.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) {
+            viewModel.openScanning()
+        } else {
+            viewModel.openPermissionRequired()
+        }
+    }
+
+    fun requestOrOpenScanner() {
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CAMERA,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            viewModel.openScanning()
+        } else {
+            permissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
 
     when (val current = phase) {
         is QrUiPhase.Ready -> QrReadyContent(
             codeInput = current.codeInput,
             inlineError = current.inlineError,
             onBack = onBack,
-            onCodeChange = { phase = QrUiPhase.Ready(codeInput = it, inlineError = null) },
-            onOpenScanner = { phase = QrUiPhase.Scanning },
-            onCheck = {
-                val raw = current.codeInput
-                if (raw.isBlank()) {
-                    phase = QrUiPhase.Ready(
-                        codeInput = raw,
-                        inlineError = "Введите или отсканируйте код",
-                    )
-                } else {
-                    phase = QrUiPhase.Result(CellCodeDecoder.decode(raw))
-                }
-            },
+            onCodeChange = { viewModel.onCodeChange(it) },
+            onOpenScanner = { requestOrOpenScanner() },
+            onCheck = { viewModel.checkManual() },
             modifier = modifier,
         )
 
         QrUiPhase.Scanning -> QrScanningShell(
-            onBack = { phase = QrUiPhase.Ready() },
-            onManualEntry = { phase = QrUiPhase.Ready() },
+            onBack = { viewModel.openReady() },
+            onManualEntry = { viewModel.openReady() },
+            onRawCode = { viewModel.onRawScanned(it) },
+            onBindError = { viewModel.openCameraError(it) },
+            enableCamera = true,
             modifier = modifier,
         )
 
         is QrUiPhase.Result -> QrResultContent(
             decoded = current.decoded,
-            onBack = { phase = QrUiPhase.Ready(codeInput = current.decoded.normalizedCode) },
-            onScanAgain = { phase = QrUiPhase.Scanning },
-            onManualEntry = {
-                phase = QrUiPhase.Ready(codeInput = current.decoded.normalizedCode)
-            },
+            onBack = { viewModel.backFromResult() },
+            onScanAgain = { requestOrOpenScanner() },
+            onManualEntry = { viewModel.manualFromResult() },
             modifier = modifier,
         )
 
         is QrUiPhase.Error -> QrErrorContent(
             message = current.message,
             onBack = onBack,
-            onRetry = { phase = QrUiPhase.Ready() },
+            onRetry = { viewModel.retryFromError() },
             modifier = modifier,
         )
 
         QrUiPhase.PermissionRequired -> QrPermissionContent(
+            onBack = { viewModel.openReady() },
+            onRetry = { requestOrOpenScanner() },
+            onOpenSettings = {
+                val intent = Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", context.packageName, null),
+                )
+                context.startActivity(intent)
+            },
+            modifier = modifier,
+        )
+    }
+}
+
+/**
+ * Preview / screenshot host without CameraX or ViewModel.
+ */
+@Composable
+private fun QrScreenPreviewHost(
+    onBack: () -> Unit,
+    initialPhase: QrUiPhase,
+    modifier: Modifier = Modifier,
+) {
+    var phase by remember {
+        mutableStateOf(initialPhase)
+    }
+    when (val current = phase) {
+        is QrUiPhase.Ready -> QrReadyContent(
+            codeInput = current.codeInput,
+            inlineError = current.inlineError,
+            onBack = onBack,
+            onCodeChange = { phase = QrUiPhase.Ready(codeInput = it) },
+            onOpenScanner = { phase = QrUiPhase.Scanning },
+            onCheck = {
+                if (current.codeInput.isBlank()) {
+                    phase = current.copy(inlineError = "Введите или отсканируйте код")
+                } else {
+                    phase = QrUiPhase.Result(CellCodeDecoder.decode(current.codeInput))
+                }
+            },
+            modifier = modifier,
+        )
+        QrUiPhase.Scanning -> QrScanningShell(
+            onBack = { phase = QrUiPhase.Ready() },
+            onManualEntry = { phase = QrUiPhase.Ready() },
+            enableCamera = false,
+            modifier = modifier,
+        )
+        is QrUiPhase.Result -> QrResultContent(
+            decoded = current.decoded,
+            onBack = { phase = QrUiPhase.Ready(current.decoded.normalizedCode) },
+            onScanAgain = { phase = QrUiPhase.Scanning },
+            onManualEntry = { phase = QrUiPhase.Ready(current.decoded.normalizedCode) },
+            modifier = modifier,
+        )
+        is QrUiPhase.Error -> QrErrorContent(
+            message = current.message,
+            onBack = onBack,
+            onRetry = { phase = QrUiPhase.Ready() },
+            modifier = modifier,
+        )
+        QrUiPhase.PermissionRequired -> QrPermissionContent(
             onBack = { phase = QrUiPhase.Ready() },
             onRetry = { phase = QrUiPhase.Scanning },
+            onOpenSettings = {},
             modifier = modifier,
         )
     }
@@ -290,14 +382,16 @@ private fun QrReadyContent(
 }
 
 /**
- * Camera scanner UI shell — no CameraX / ML Kit in this stage.
- * Matches legacy layout: title, framed preview area, corner marks, tip, manual link.
+ * Camera scanner UI — live CameraX preview when [enableCamera], shell otherwise (Preview).
  */
 @Composable
 private fun QrScanningShell(
     onBack: () -> Unit,
     onManualEntry: () -> Unit,
     modifier: Modifier = Modifier,
+    enableCamera: Boolean = false,
+    onRawCode: (String) -> Unit = {},
+    onBindError: (String) -> Unit = {},
 ) {
     Column(
         modifier = modifier
@@ -329,23 +423,31 @@ private fun QrScanningShell(
                     .background(Color(0xFFF6F7F9))
                     .border(1.dp, LiferychColors.Border, frameShape),
             ) {
-                Column(
-                    modifier = Modifier.align(Alignment.Center),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.CameraAlt,
-                        contentDescription = null,
-                        tint = LiferychColors.IconMuted,
-                        modifier = Modifier.size(40.dp),
+                if (enableCamera) {
+                    QrCameraPreview(
+                        onRawCode = onRawCode,
+                        onBindError = onBindError,
+                        modifier = Modifier.fillMaxSize(),
                     )
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        text = "Камера будет подключена позже",
-                        color = LiferychColors.TextSecondary,
-                        fontSize = 13.sp,
-                        textAlign = TextAlign.Center,
-                    )
+                } else {
+                    Column(
+                        modifier = Modifier.align(Alignment.Center),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.CameraAlt,
+                            contentDescription = null,
+                            tint = LiferychColors.IconMuted,
+                            modifier = Modifier.size(40.dp),
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            text = "Камера (preview)",
+                            color = LiferychColors.TextSecondary,
+                            fontSize = 13.sp,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                 }
                 // Corner frame marks (legacy yellow corners)
                 Text(
@@ -613,6 +715,7 @@ private fun QrErrorContent(
 private fun QrPermissionContent(
     onBack: () -> Unit,
     onRetry: () -> Unit,
+    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -657,6 +760,14 @@ private fun QrPermissionContent(
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Bold,
                 modifier = Modifier.clickable(onClick = onRetry),
+            )
+            Spacer(Modifier.height(14.dp))
+            Text(
+                text = "Открыть настройки",
+                color = LiferychColors.TextPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.clickable(onClick = onOpenSettings),
             )
         }
     }

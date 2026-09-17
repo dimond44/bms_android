@@ -90,9 +90,11 @@ class FakeBmsRepository : BmsRepository {
         }
     }
 
-    override suspend fun connect(address: String) {
+    override suspend fun connect(address: String, bluetoothName: String) {
         _connectionState.value = BmsConnectionState.Connected(address)
-        _batteryState.value = demoBattery
+        _batteryState.value = demoBattery.copy(
+            lastUpdatedAt = System.currentTimeMillis(),
+        )
     }
 
     override suspend fun disconnect() {
@@ -100,7 +102,11 @@ class FakeBmsRepository : BmsRepository {
         _batteryState.value = BatteryState()
     }
 
-    override fun startScan() {
+    override fun startScan(clearResults: Boolean) {
+        _connectionState.value = BmsConnectionState.Scanning
+    }
+
+    override fun startPresenceScan(clearResults: Boolean) {
         _connectionState.value = BmsConnectionState.Scanning
     }
 

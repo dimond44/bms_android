@@ -2,6 +2,7 @@ package ru.liferych.bms.ui.screens.dashboard
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,6 +22,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -59,6 +61,12 @@ fun DashboardScreen(
     serialNumber: String = "--",
     bmsVersion: String = "--",
     onOpenCharts: () -> Unit = {},
+    overallStatus: ru.liferych.bms.ui.model.DashboardOverallStatusUi =
+        ru.liferych.bms.ui.model.DashboardOverallStatusUi(
+            title = "✓  Батарея в норме",
+            titleColor = LiferychColors.SuccessAlt,
+        ),
+    onOpenDiagnostics: () -> Unit = {},
 ) {
     Column(
         modifier = modifier
@@ -75,7 +83,10 @@ fun DashboardScreen(
             disconnectedSubtitle = "Подключите батарею, чтобы увидеть данные",
             errorMessage = "Ошибка связи с BMS",
             errorSubtitle = "Проверьте Bluetooth и попробуйте снова",
-            loadingMessage = "Подключение к BMS…",
+            loadingMessage = when (connectionState) {
+                is BmsConnectionState.Connecting -> "Подключение к BMS…"
+                else -> "Получение данных BMS…"
+            },
             connectedContent = {
                 DashboardLegacyContent(
                     batteryName = batteryName,
@@ -83,6 +94,8 @@ fun DashboardScreen(
                     bmsVersion = bmsVersion,
                     batteryState = batteryState,
                     onOpenCharts = onOpenCharts,
+                    overallStatus = overallStatus,
+                    onOpenDiagnostics = onOpenDiagnostics,
                 )
             },
         )
@@ -96,6 +109,8 @@ private fun DashboardLegacyContent(
     bmsVersion: String,
     batteryState: BatteryState,
     onOpenCharts: () -> Unit,
+    overallStatus: ru.liferych.bms.ui.model.DashboardOverallStatusUi,
+    onOpenDiagnostics: () -> Unit,
 ) {
     val (socLabel, socColor) = socStatusLabel(batteryState.soc)
     val statusText = when {
@@ -114,14 +129,6 @@ private fun DashboardLegacyContent(
     }
     val stateColor = when {
         batteryState.errors.isNotEmpty() -> LiferychColors.Error
-        else -> LiferychColors.SuccessAlt
-    }
-    val overallTitle = when {
-        batteryState.errors.isNotEmpty() -> "⚠  Есть предупреждения"
-        else -> "✓  Батарея в норме"
-    }
-    val overallColor = when {
-        batteryState.errors.isNotEmpty() -> LiferychColors.Warning
         else -> LiferychColors.SuccessAlt
     }
     val cellDiffMv = batteryState.cellDiffV?.let { abs(it * 1000.0) }
@@ -240,7 +247,7 @@ private fun DashboardLegacyContent(
                     value = batteryState.cellCount?.toString()
                         ?: batteryState.cells.size.takeIf { it > 0 }?.toString()
                         ?: "--",
-                    iconRes = R.drawable.ic_liferych_cells,
+                    iconRes = R.drawable.ic_liferych_cell_count,
                     modifier = mod,
                 )
             },
@@ -340,13 +347,25 @@ private fun DashboardLegacyContent(
 
         Spacer(Modifier.height(8.dp))
 
-        LiferychCard {
+        LiferychCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onOpenDiagnostics),
+        ) {
             Text(
-                text = overallTitle,
-                color = overallColor,
+                text = overallStatus.title,
+                color = overallStatus.titleColor,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Bold,
             )
+            if (overallStatus.subtitle.isNotBlank()) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = overallStatus.subtitle,
+                    color = Color(0xFF6F7781),
+                    fontSize = 12.sp,
+                )
+            }
         }
     }
 }

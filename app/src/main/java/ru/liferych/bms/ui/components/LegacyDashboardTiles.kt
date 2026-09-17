@@ -67,11 +67,12 @@ fun InfoOneLineTile(
             Text(
                 text = label,
                 color = LiferychColors.TextSecondary,
-                fontSize = 10.sp,
+                fontSize = 9.sp,
                 fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                softWrap = false,
+                maxLines = 2,
+                softWrap = true,
                 overflow = TextOverflow.Clip,
+                lineHeight = 11.sp,
             )
         }
         Spacer(Modifier.height(4.dp))

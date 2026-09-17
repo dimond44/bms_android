@@ -109,14 +109,17 @@ class DalyBleClient(
         publishConnectionState(BmsConnectionState.Scanning)
         return try {
             scanner.startScan(scanCallback)
-            mainHandler.postDelayed({
-                if (token != scanStopToken) return@postDelayed
-                stopScanInternal()
-                if (connectionState.get() is BmsConnectionState.Scanning) {
-                    publishConnectionState(BmsConnectionState.Disconnected)
-                }
-                host?.onScanFinished(devices.size)
-            }, durationMs)
+            // durationMs <= 0: run until stopScan() (MyBatteries passive presence).
+            if (durationMs > 0L) {
+                mainHandler.postDelayed({
+                    if (token != scanStopToken) return@postDelayed
+                    stopScanInternal()
+                    if (connectionState.get() is BmsConnectionState.Scanning) {
+                        publishConnectionState(BmsConnectionState.Disconnected)
+                    }
+                    host?.onScanFinished(devices.size)
+                }, durationMs)
+            }
             true
         } catch (e: Exception) {
             Log.w(TAG, "startScan failed: ${e.message}")
