@@ -28,24 +28,25 @@
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
 
+        <!-- Legacy View UI — kept for adb/debug; not a launcher. -->
         <activity
             android:name=".MainActivity"
             android:screenOrientation="portrait"
-            android:exported="true">
+            android:exported="false" />
+
+        <!-- Compose frontend — default app entry (USER and SERVICE). -->
+        <activity
+            android:name=".ui.FrontendActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.Liferych.Splash">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <!-- New Compose frontend (fake BMS data). Not a launcher — open via adb/IDE. -->
-        <activity
-            android:name=".ui.FrontendActivity"
-            android:exported="true"
-            android:label="ЛИФЕРЫЧ Frontend"
-            android:screenOrientation="portrait"
-            android:windowSoftInputMode="adjustResize"
-            android:theme="@style/Theme.Liferych.Splash" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

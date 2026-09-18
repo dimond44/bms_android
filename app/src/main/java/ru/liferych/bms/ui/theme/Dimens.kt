@@ -38,7 +38,10 @@ object LiferychDimens {
     val BatteryRingSize = SocRingSize
 
     val MetricCardMinHeight = 90.dp
-    val InfoTileMinHeight = 78.dp
+    /** Fixed height for Dashboard top info tiles (device / SN / BMS version). */
+    val InfoTileHeight = 96.dp
+    /** @deprecated use [InfoTileHeight]; kept for any leftover references. */
+    val InfoTileMinHeight = InfoTileHeight
     val CellBarHeight = Space8
     val ListItemMinHeight = 72.dp
 

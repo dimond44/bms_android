@@ -10,6 +10,7 @@ import ru.liferych.bms.domain.auth.UserProfile
  *
  * Keys: logged_in, name, phone, email, birth, avatar_url, avatar_uri.
  * No token/JWT — phone + logged_in flag is the session.
+ * Prefs are MODE_PRIVATE but not encrypted; allowBackup=true can expose them.
  */
 interface AuthSessionStorage {
     /**

@@ -69,4 +69,32 @@ class UserAuthMappingTest {
             registerFailureMessage(401, "unauthorized"),
         )
     }
+
+    @Test
+    fun registerFailureMessage_forbiddenAndConflictAndServer() {
+        assertEquals(
+            "Ошибка авторизации приложения на сервере",
+            registerFailureMessage(403, "forbidden"),
+        )
+        assertEquals(
+            "Пользователь с таким номером уже зарегистрирован",
+            registerFailureMessage(409, "phone_already_exists"),
+        )
+        assertEquals(
+            "Ошибка сервера. Повторите позже.",
+            registerFailureMessage(500, ""),
+        )
+        assertEquals(
+            "Некорректный номер телефона",
+            registerFailureMessage(400, "invalid_phone"),
+        )
+    }
+
+    @Test
+    fun ruPhone_masksUiInputToE164() {
+        // UI shows "+7" prefix separately and national mask "963 081-85-26"
+        assertEquals("+79630818526", RuPhone.toE164("963 081-85-26"))
+        assertEquals("+79630818526", RuPhone.toE164("+7 963 081-85-26"))
+        assertEquals("+79630818526", RuPhone.toE164("89630818526"))
+    }
 }

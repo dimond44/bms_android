@@ -12,14 +12,14 @@ import java.net.URLEncoder
 /**
  * Client for the existing server write-command queue.
  *
- * It preserves legacy endpoints, headers, payloads, and timeouts.
+ * Uses EXECUTOR credential only (GET pending + ACK). Never ADMIN, never enqueue.
  */
 class RemoteWriteApi(
     private val baseUrl: String = BmsApiConfig.BASE_URL,
-    private val apiKeyProvider: () -> String = { BmsApiConfig.API_KEY },
+    private val apiKeyProvider: () -> String = { BmsApiConfig.EXECUTOR_API_KEY },
 ) {
     /**
-     * Fetches only the first pending command, matching legacy commands[0].
+     * Claims the next pending command (server atomic lease) and returns it.
      *
      * @throws RemoteWriteApiException for transport or non-2xx failures.
      */
@@ -27,7 +27,7 @@ class RemoteWriteApi(
         val encodedUid = encodePathSegment(bmsUid)
         val response = request(
             method = "GET",
-            path = "/api/v1/batteries/$encodedUid/write-commands?status=pending&limit=20",
+            path = "/api/v1/batteries/$encodedUid/write-commands?status=pending&limit=1",
         )
         val commands = response.optJSONArray("commands") ?: return@withContext null
         if (commands.length() == 0) return@withContext null
@@ -49,6 +49,7 @@ class RemoteWriteApi(
             // Kept for exact legacy compatibility; the header is authoritative.
             put("api_key", apiKeyProvider())
             put("status", ack.status)
+            put("lease_token", ack.leaseToken)
             ack.actual?.takeIf { it.isFinite() }?.let { put("actual", it) }
             ack.error?.takeIf { it.isNotBlank() }?.let { put("error", it) }
         }

@@ -13,7 +13,17 @@ val localProperties = Properties().apply {
         file.inputStream().use { load(it) }
     }
 }
-val bmsApiKey = localProperties.getProperty("BMS_API_KEY", "").orEmpty()
+val bmsApiKey = localProperties.getProperty("BMS_API_KEY", "")
+    .orEmpty()
+    .ifBlank { localProperties.getProperty("DEVICE_API_KEY", "").orEmpty() }
+val bmsExecutorApiKey = sequenceOf(
+    "BMS_EXECUTOR_API_KEY",
+    "EXECUTOR_API_KEY",
+    "BMS_SERVICE_API_KEY",
+    "SERVICE_API_KEY",
+).map { localProperties.getProperty(it, "").orEmpty() }
+    .firstOrNull { it.isNotBlank() }
+    .orEmpty()
 
 android {
     namespace = "ru.liferych.bms"
@@ -26,7 +36,14 @@ android {
         // Базовые значения; фактические версии задаются в productFlavors отдельно.
         versionCode = 1
         versionName = "0.0.0"
+        // DEVICE ingest (APK-extractable). Never ADMIN.
         buildConfigField("String", "BMS_API_KEY", "\"${bmsApiKey.replace("\\", "\\\\").replace("\"", "\\\"")}\"")
+        // EXECUTOR: GET pending + ACK only. Never ADMIN. Required for remote-write poll.
+        buildConfigField(
+            "String",
+            "BMS_EXECUTOR_API_KEY",
+            "\"${bmsExecutorApiKey.replace("\\", "\\\\").replace("\"", "\\\"")}\"",
+        )
     }
 
     buildFeatures {
@@ -40,16 +57,16 @@ android {
             dimension = "role"
             isDefault = true
             applicationId = "ru.liferych.bms"
-            versionCode = 121
-            versionName = "0.2.61"
+            versionCode = 126
+            versionName = "0.2.66"
             resValue("string", "app_name", "ЛИФЕРЫЧ BMS")
             buildConfigField("boolean", "IS_SERVICE", "false")
         }
         create("service") {
             dimension = "role"
             applicationId = "ru.liferych.bms.service"
-            versionCode = 105
-            versionName = "0.2.45"
+            versionCode = 107
+            versionName = "0.2.47"
             resValue("string", "app_name", "ЛИФЕРЫЧ Сервис")
             buildConfigField("boolean", "IS_SERVICE", "true")
         }

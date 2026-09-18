@@ -44,6 +44,7 @@ class ConfigDiagnosticsRepository(
         val series = resolvedSeriesCount(battery)
 
         if (fetch.status == "error" && fetch.template == null) {
+            Log.w(TAG, "CONFIG_CHECK_FAILED reason=${fetch.error ?: "server_template_unavailable"}")
             return DiagnosticsSnapshot(
                 result = TemplateCheckResult(
                     templateId = "",
@@ -75,6 +76,11 @@ class ConfigDiagnosticsRepository(
 
         val template = fetch.template
         if (template == null || registers.isEmpty()) {
+            Log.i(
+                TAG,
+                "CONFIG_CHECK_START status=checking registers=${registers.size} " +
+                    "template=${template != null}",
+            )
             return DiagnosticsSnapshot(
                 result = TemplateCheckResult(
                     templateId = template?.id.orEmpty(),
@@ -99,7 +105,13 @@ class ConfigDiagnosticsRepository(
                 registers = registers,
                 series = series,
                 hardwareFamily = hardwareFamily,
-            ),
+            ).also { result ->
+                Log.i(
+                    TAG,
+                    "CONFIG_CHECK_DONE status=${result.status} registers=${registers.size} " +
+                        "mismatches=${result.mismatches.size} missing=${result.missing.size}",
+                )
+            },
             fetchStatus = fetch.status,
             fetchError = fetch.error,
             template = template,
@@ -428,6 +440,7 @@ class ConfigDiagnosticsRepository(
         return try {
             val base = BmsApiConfig.BASE_URL.trimEnd('/')
             val url = if (path.startsWith("/")) "$base$path" else "$base/$path"
+            Log.i(TAG, "CONFIG_TEMPLATE_FETCH_START path=$path")
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = 8000
@@ -443,8 +456,20 @@ class ConfigDiagnosticsRepository(
                 ""
             }
             conn.disconnect()
-            if (text.isBlank()) null else JSONObject(text)
-        } catch (_: Exception) {
+            if (text.isBlank()) {
+                Log.w(TAG, "CONFIG_TEMPLATE_FETCH_FAILED http=$code body_empty=true")
+                return null
+            }
+            val json = JSONObject(text)
+            if (code in 200..299 && json.optBoolean("ok")) {
+                Log.i(TAG, "CONFIG_TEMPLATE_FETCH_OK http=$code")
+            } else {
+                val err = json.optString("error").ifBlank { "http_$code" }
+                Log.w(TAG, "CONFIG_TEMPLATE_FETCH_FAILED http=$code error=$err")
+            }
+            json
+        } catch (e: Exception) {
+            Log.w(TAG, "CONFIG_TEMPLATE_FETCH_FAILED error=${e.javaClass.simpleName}")
             null
         }
     }

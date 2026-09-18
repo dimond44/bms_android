@@ -7,6 +7,8 @@ import org.json.JSONObject
  *
  * Register and raw value are authoritative server values and must not be
  * recalculated from a local template.
+ *
+ * [leaseToken] is issued by EXECUTOR claim (GET status=pending) and required for ACK.
  */
 data class RemoteWriteCommand(
     val id: Long,
@@ -25,6 +27,8 @@ data class RemoteWriteCommand(
     val error: String?,
     val createdAt: Long,
     val updatedAt: Long,
+    val leaseToken: String,
+    val expiresAt: Long?,
 ) {
     companion object {
         /**
@@ -42,6 +46,7 @@ data class RemoteWriteCommand(
             val value = json.optDouble("value", Double.NaN)
             val scale = json.optDouble("scale", Double.NaN)
             val offset = json.optDouble("offset", 0.0)
+            val leaseToken = json.optString("lease_token").trim()
             val register = registerText
                 .removePrefix("0x")
                 .removePrefix("0X")
@@ -52,6 +57,7 @@ data class RemoteWriteCommand(
             if (rawValue !in 0..0xFFFF) return null
             if (!value.isFinite() || !scale.isFinite() || scale == 0.0) return null
             if (!offset.isFinite()) return null
+            if (leaseToken.isBlank()) return null
 
             return RemoteWriteCommand(
                 id = id,
@@ -70,6 +76,8 @@ data class RemoteWriteCommand(
                 error = json.optString("error").takeIf { it.isNotBlank() },
                 createdAt = json.optLong("created_at", 0L),
                 updatedAt = json.optLong("updated_at", 0L),
+                leaseToken = leaseToken,
+                expiresAt = json.optLongOrNull("expires_at"),
             )
         }
     }
@@ -84,10 +92,19 @@ private fun JSONObject.optFiniteDouble(key: String): Double? {
 }
 
 /**
+ * Reads an optional long without treating missing keys as zero.
+ */
+private fun JSONObject.optLongOrNull(key: String): Long? {
+    if (!has(key) || isNull(key)) return null
+    return optLong(key)
+}
+
+/**
  * Result sent to the existing write-command ACK endpoint.
  */
 data class RemoteWriteAck(
     val status: String,
+    val leaseToken: String,
     val actual: Double? = null,
     val error: String? = null,
 )

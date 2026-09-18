@@ -110,7 +110,6 @@ private const val USER_LINK_BATTERY_PATH = "/api/v1/users/batteries/link"
 private const val USER_UNLINK_BATTERY_PATH = "/api/v1/users/batteries/unlink"
 private const val USER_AVATAR_PATH = "/api/v1/users/avatar"
 private val APP_VERSION = BuildConfig.VERSION_NAME
-private const val REMOTE_WRITE_POLL_MS = 8000L
 private const val UPLOAD_INTERVAL_MS = 15000L
 private const val CONFIG_UPLOAD_INTERVAL_MS = 300000L
 private const val CONFIG_PREFS_NAME = "bms_config_cache"
@@ -144,6 +143,8 @@ private const val DALY_CELL_OV_PROTECT_REG = 0x0131
 private const val DALY_CELL_OV_RECOVERY_REG = 0x0132
 private const val METRIC_ICON_BOX_DP = 48
 private const val METRIC_ICON_DP = 34
+// SECURITY: BMS unlock password is embedded in the client binary (and was logged).
+// Do not treat this as a server-side control; rotate/remove from source when possible.
 private const val SERVICE_SETTINGS_PASSWORD = "113355"
 private const val SERVICE_WRITE_MAX_RETRY_ROUNDS = 1
 private const val SERVICE_WRITE_VERIFY_MAX_ATTEMPTS = 2
@@ -607,7 +608,6 @@ class MainActivity : ComponentActivity() {
     private var remoteWriteInProgress: Boolean = false
     private var remoteWriteAwaitingVerify: Boolean = false
     private var pendingRemoteWrite: RemoteWriteCommand? = null
-    private var lastRemoteWritePollAt: Long = 0L
     private var serviceTemplateKey: String = "12v"
     private var serviceCapacityText: String = ""
     private var serviceWriteQueue = java.util.ArrayDeque<RemoteWriteCommand>()
@@ -629,13 +629,6 @@ class MainActivity : ComponentActivity() {
     private var serviceUploadStatusText: TextView? = null
     private var dashboardUploadStatusText: TextView? = null
     private var pendingFirstTelemetryUpload = false
-    private val remoteWritePollRunnable = object : Runnable {
-        override fun run() {
-            if (bluetoothGatt == null || writeCharacteristic == null || !polling) return
-            fetchAndApplyRemoteWrites()
-            mainHandler.postDelayed(this, REMOTE_WRITE_POLL_MS)
-        }
-    }
     private var lastKnownSoc: Double? = null
     private var lastKnownChargeMosTextText: String? = null
     private var lastKnownDischargeMosTextText: String? = null
@@ -4157,6 +4150,19 @@ class MainActivity : ComponentActivity() {
                 publish(QtcDbStatus.ERROR, lookup.reason)
                 return
             }
+            QtcLookup.ScopeLimited -> {
+                // DEVICE key cannot GET ADMIN telemetry. Confirm presence via ingest POST.
+                if (!stillCurrent()) return
+                publish(QtcDbStatus.SENDING)
+                val sent = postCurrentTelemetry()
+                if (!stillCurrent()) return
+                if (!sent.ok) {
+                    publish(QtcDbStatus.ERROR, sent.message)
+                    return
+                }
+                publish(QtcDbStatus.IN_DATABASE)
+                return
+            }
             QtcLookup.Missing -> Unit
         }
 
@@ -4172,7 +4178,8 @@ class MainActivity : ComponentActivity() {
         publish(QtcDbStatus.VERIFYING)
         when (val verify = lookupBatteryOnServer(uid)) {
             is QtcLookup.Exists -> publish(QtcDbStatus.ADDED)
-            is QtcLookup.Missing -> publish(QtcDbStatus.ERROR, "Сервер не подтвердил регистрацию")
+            QtcLookup.ScopeLimited -> publish(QtcDbStatus.ADDED)
+            QtcLookup.Missing -> publish(QtcDbStatus.ERROR, "Сервер не подтвердил регистрацию")
             is QtcLookup.Failed -> publish(QtcDbStatus.ERROR, verify.reason)
         }
     }
@@ -4180,6 +4187,8 @@ class MainActivity : ComponentActivity() {
     private sealed class QtcLookup {
         object Exists : QtcLookup()
         object Missing : QtcLookup()
+        /** DEVICE/EXECUTOR cannot read ADMIN telemetry; not a network outage. */
+        object ScopeLimited : QtcLookup()
         data class Failed(val reason: String) : QtcLookup()
     }
 
@@ -4190,7 +4199,14 @@ class MainActivity : ComponentActivity() {
         if (json.optBoolean("ok")) return QtcLookup.Exists
         return when (json.optString("error")) {
             "battery_not_found" -> QtcLookup.Missing
-            else -> QtcLookup.Failed("Нет связи с сервером")
+            // Service APK uses DEVICE key; fleet telemetry GET is ADMIN-only.
+            "forbidden", "unauthorized" -> QtcLookup.ScopeLimited
+            else -> {
+                val err = json.optString("error").trim()
+                QtcLookup.Failed(
+                    if (err.isEmpty()) "Нет связи с сервером" else "Ошибка сервера: $err",
+                )
+            }
         }
     }
 
@@ -7162,12 +7178,14 @@ class MainActivity : ComponentActivity() {
                 "Некорректный номер телефона"
             error == "name_required" ->
                 "Укажите ФИО для регистрации"
-            error == "unauthorized" || httpCode == 401 ->
+            error == "phone_already_exists" || httpCode == 409 ->
+                "Пользователь с таким номером уже зарегистрирован"
+            error == "unauthorized" || error == "forbidden" || httpCode == 401 || httpCode == 403 ->
                 "Ошибка авторизации приложения на сервере"
             error == "not_found" || httpCode == 404 ->
                 "Сервер не поддерживает регистрацию (endpoint недоступен). Обновите backend."
             httpCode in 500..599 ->
-                "Ошибка сервера. Попробуйте позже."
+                "Ошибка сервера. Повторите позже."
             error.isNotBlank() ->
                 "Не удалось зарегистрироваться ($error)"
             else ->
@@ -11875,157 +11893,19 @@ class MainActivity : ComponentActivity() {
         remoteWriteInProgress = false
         remoteWriteAwaitingVerify = false
         pendingRemoteWrite = null
-        stopRemoteWritePolling()
     }
 
     private fun startRemoteWritePolling() {
+        // Optional kick; sole executor is AppContainer.RemoteWriteCoordinator.
         appContainer.remoteWriteCoordinator.requestImmediatePoll(1500L)
-    }
-
-    private fun stopRemoteWritePolling() {
-        // Runtime-owned coordinator stops from DalyBmsRepository disconnect.
-        mainHandler.removeCallbacks(remoteWritePollRunnable)
-    }
-
-    private fun fetchAndApplyRemoteWrites(force: Boolean = false) {
-        if (isServiceApp()) return
-        if (remoteWriteInProgress || configReadInProgress) return
-        val uid = bmsUid()
-        if (bluetoothGatt == null || writeCharacteristic == null) return
-        if (uid.isBlank() || uid == "unknown_bms") return
-        val now = System.currentTimeMillis()
-        if (!force && now - lastRemoteWritePollAt < 2500L) return
-        lastRemoteWritePollAt = now
-
-        thread {
-            val encoded = URLEncoder.encode(uid, "UTF-8")
-            val json = adminJsonRequest(
-                "GET",
-                "/api/v1/batteries/$encoded/write-commands?status=pending&limit=20"
-            )
-            val commands = json?.optJSONArray("commands") ?: JSONArray()
-            val parsed = if (commands.length() > 0) {
-                parseRemoteWriteCommand(commands.optJSONObject(0))
-            } else {
-                null
-            }
-            runOnUiThread {
-                if (parsed != null) startRemoteWrite(parsed)
-            }
-        }
-    }
-
-    private fun parseRemoteWriteCommand(obj: JSONObject?): RemoteWriteCommand? {
-        if (obj == null) return null
-        val id = obj.optInt("id", 0)
-        val key = obj.optString("key")
-        val registerText = obj.optString("register")
-        val rawValue = obj.optInt("raw_value", Int.MIN_VALUE)
-        val value = obj.optDouble("value", Double.NaN)
-        if (id <= 0 || key.isBlank() || registerText.isBlank() || rawValue == Int.MIN_VALUE || value.isNaN()) {
-            return null
-        }
-        val register = try {
-            registerText.removePrefix("0x").removePrefix("0X").toInt(16)
-        } catch (_: Exception) {
-            return null
-        }
-        return RemoteWriteCommand(
-            id = id,
-            key = key,
-            label = obj.optString("label").ifBlank { key },
-            register = register,
-            rawValue = rawValue,
-            value = value,
-            scale = obj.optDouble("scale", 1.0).takeIf { it != 0.0 } ?: 1.0,
-            offset = obj.optDouble("offset", 0.0),
-            unit = obj.optString("unit")
-        )
     }
 
     @SuppressLint("MissingPermission")
     private fun startRemoteWrite(command: RemoteWriteCommand) {
-        if (command.localOnly) {
-            startServiceLocalWrite(command)
-            return
-        }
-        if (bmsRepository.isConfigIoBusy) return
-        if (remoteWriteInProgress || configReadInProgress) {
-            if (command.localOnly) {
-                mainHandler.postDelayed({ startRemoteWrite(command) }, 350)
-            }
-            return
-        }
-        if (bluetoothGatt == null || writeCharacteristic == null) {
-            if (command.localOnly) completeServiceWriteStep(command, false, null, "no_ble")
-            return
-        }
-        if (remoteWriteAlreadyMatches(command)) {
-            val actual = when (command.key) {
-                "nominal_capacity" -> currentNominalCapacityAh()
-                "runtime_soc" -> data.soc
-                    ?: scaledRegisterValue(command.register, command.scale, command.offset)
-                else -> scaledRegisterValue(command.register, command.scale, command.offset)
-            }
-            if (!command.localOnly) {
-                toast("${command.label}: уже совпадает")
-            }
-            if (command.localOnly) {
-                completeServiceWriteStep(command, true, actual, null)
-            } else {
-                ackRemoteWrite(command, "done", actual, null)
-                mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 400)
-            }
-            return
-        }
-
-        pendingRemoteWrite = command
-        remoteWriteInProgress = true
-        remoteWriteAwaitingVerify = false
-        pollLoopToken++
-        val prefix = if (command.localOnly) "Запись" else "Запись с сайта"
-        toast("$prefix: ${command.label} = ${formatTemplateNumber(command.displayValue ?: command.value)} ${command.unit}".trim())
-        if (!command.localOnly) ackRemoteWrite(command, "writing", null, null)
-
-        val timeFrame = buildDalyTimeFrame()
-        val writeFrame = buildModbusWriteSingleRequest(0x81, command.register, command.rawValue)
-        val openFrame = buildModbusWriteSingleRequest(0x81, 0x0174, 0x00A2)
-        configRaw["remote_write_key"] = command.key
-        configRaw["remote_write_raw"] = command.rawValue.toString()
-        configRaw["remote_write_frame"] = bytesToHex(writeFrame)
-
-        val timeOk = writeBleFrame(timeFrame)
-        configRaw["remote_write_time"] = if (timeOk) "ok" else "failed"
-        mainHandler.postDelayed({
-            val unlockOk = writeBleFrame(openFrame)
-            configRaw["remote_write_unlock"] = if (unlockOk) "ok" else "failed"
-            mainHandler.postDelayed({
-                val writeOk = writeBleFrame(writeFrame)
-                configRaw["remote_write_reg"] = if (writeOk) "ok" else "failed"
-                if (!writeOk) {
-                    failRemoteWrite("ble_write_failed")
-                    return@postDelayed
-                }
-                mainHandler.postDelayed({
-                    command.verifyAttempt = 0
-                    configRegisters.remove(command.register)
-                    Log.i(
-                        BLE_LOG_TAG,
-                        "WRITE ${command.key}: requested=${command.value}${command.unit} " +
-                            "raw=${command.rawValue} reg=0x%04X".format(command.register)
-                    )
-                    remoteWriteAwaitingVerify = true
-                    startConfigReadIfNeeded(force = true)
-                    if (!configReadInProgress) {
-                        mainHandler.postDelayed({
-                            if (remoteWriteAwaitingVerify && !configReadInProgress) {
-                                failRemoteWrite("config_read_not_started")
-                            }
-                        }, 400)
-                    }
-                }, 900)
-            }, 250)
-        }, 140)
+        // Server write_commands queue is executed only by RemoteWriteCoordinator (service flavor).
+        // MainActivity keeps local-only service template writes via startServiceLocalWrite.
+        if (!command.localOnly) return
+        startServiceLocalWrite(command)
     }
 
     @SuppressLint("MissingPermission")
@@ -12313,39 +12193,20 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        if (command.localOnly) {
-            pendingRemoteWrite = null
-            remoteWriteInProgress = false
-            rememberCurrentBmsState()
-            completeServiceWriteStep(command, ok, actual, if (ok) null else "not_confirmed")
-            if (ok) {
-                toast("✓ ${command.label}: ${formatTemplateNumber(actual)} ${command.unit}".trim())
-            } else {
-                toast(
-                    "✗ ${command.label}: требовалось ${formatTemplateNumber(command.value)} ${command.unit}, " +
-                        "фактически ${formatTemplateNumber(actual)} ${command.unit}".trim()
-                )
-            }
-            mainHandler.postDelayed({ pollOnce() }, 400)
-            return
-        }
-        ackRemoteWrite(
-            command,
-            if (ok) "done" else "failed",
-            actual,
-            if (ok) null else "not_confirmed"
-        )
+        // localOnly-only: server remote-write is handled by RemoteWriteCoordinator.
         pendingRemoteWrite = null
         remoteWriteInProgress = false
         rememberCurrentBmsState()
-        refreshManageIfVisible()
-        toast(
-            if (ok) "${command.label}: ${formatTemplateNumber(actual)} ${command.unit}".trim()
-            else "Не подтверждено: ${command.label}"
-        )
-        uploadConfigSnapshot(force = true)
+        completeServiceWriteStep(command, ok, actual, if (ok) null else "not_confirmed")
+        if (ok) {
+            toast("✓ ${command.label}: ${formatTemplateNumber(actual)} ${command.unit}".trim())
+        } else {
+            toast(
+                "✗ ${command.label}: требовалось ${formatTemplateNumber(command.value)} ${command.unit}, " +
+                    "фактически ${formatTemplateNumber(actual)} ${command.unit}".trim()
+            )
+        }
         mainHandler.postDelayed({ pollOnce() }, 400)
-        mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 1200)
     }
 
     private fun failRemoteWrite(reason: String) {
@@ -12354,33 +12215,12 @@ class MainActivity : ComponentActivity() {
         remoteWriteInProgress = false
         pendingRemoteWrite = null
         if (command != null) {
-            if (command.localOnly) {
-                completeServiceWriteStep(command, false, null, reason)
-            } else {
-                ackRemoteWrite(command, "failed", null, reason)
-            }
+            completeServiceWriteStep(command, false, null, reason)
         }
         toast("Не удалось записать параметр: $reason")
         mainHandler.postDelayed({ pollOnce() }, 400)
-        if (command == null || !command.localOnly) {
-            mainHandler.postDelayed({ fetchAndApplyRemoteWrites(force = true) }, 800)
-        }
     }
 
-    private fun ackRemoteWrite(command: RemoteWriteCommand, status: String, actual: Double?, error: String?) {
-        if (command.localOnly || command.id <= 0) return
-        val uid = bmsUid()
-        thread {
-            val encoded = URLEncoder.encode(uid, "UTF-8")
-            val body = JSONObject().apply {
-                put("api_key", BmsApiConfig.API_KEY)
-                put("status", status)
-                if (actual != null && actual.isFinite()) put("actual", actual)
-                if (!error.isNullOrBlank()) put("error", error)
-            }
-            adminJsonRequest("POST", "/api/v1/batteries/$encoded/write-commands/${command.id}/ack", body)
-        }
-    }
 
     private fun adminJsonRequest(
         method: String,

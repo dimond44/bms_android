@@ -250,6 +250,63 @@ class UserAuthRepositoryTest {
         val result = repository.updateAvatar(byteArrayOf(1, 2, 3))
         assertTrue(result is AuthResult.ValidationError)
     }
+
+    @Test
+    fun register_successMapsProfile() = runBlocking {
+        nextResponse = UserAuthHttpResponse(
+            httpCode = 201,
+            json = JSONObject(
+                """{"ok":true,"created":true,"user":{"name":"Пётр Тестов","phone":"+79630818526"},"batteries":[]}""",
+            ),
+        )
+        val result = repository.register(
+            fullName = "Пётр Тестов",
+            phoneE164 = "+79630818526",
+            email = "",
+            birthDate = "",
+        )
+        assertTrue(result is AuthResult.Success)
+        assertTrue(repository.authState.value is AuthState.Authorized)
+        assertEquals(
+            "+79630818526",
+            (repository.authState.value as AuthState.Authorized).profile.phoneE164,
+        )
+    }
+
+    @Test
+    fun register_conflictMapsPhoneAlreadyExists() = runBlocking {
+        nextResponse = UserAuthHttpResponse(
+            httpCode = 409,
+            json = JSONObject("""{"ok":false,"error":"phone_already_exists"}"""),
+        )
+        val result = repository.register(
+            fullName = "Пётр",
+            phoneE164 = "+79630818526",
+            email = "",
+            birthDate = "",
+        )
+        assertEquals(AuthResult.PhoneAlreadyExists, result)
+    }
+
+    @Test
+    fun register_unauthorizedMapsAuthMessage() = runBlocking {
+        nextResponse = UserAuthHttpResponse(
+            httpCode = 401,
+            json = JSONObject("""{"ok":false,"error":"unauthorized"}"""),
+        )
+        val result = repository.register(
+            fullName = "Пётр",
+            phoneE164 = "+79630818526",
+            email = "",
+            birthDate = "",
+        )
+        assertTrue(result is AuthResult.ServerError)
+        assertEquals(
+            "Ошибка авторизации приложения на сервере",
+            (result as AuthResult.ServerError).message,
+        )
+        assertEquals(401, result.httpCode)
+    }
 }
 
 /** In-memory [AuthSessionStorage] for JVM unit tests. */

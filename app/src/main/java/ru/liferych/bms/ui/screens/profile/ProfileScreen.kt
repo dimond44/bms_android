@@ -11,6 +11,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -164,7 +165,6 @@ fun ProfileScreen(
             initialPhase ?: phaseFromAuth(authState, profile),
         )
     }
-    var showLogoutConfirm by remember { mutableStateOf(false) }
     var showAvatarChooser by remember { mutableStateOf(false) }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
 
@@ -368,7 +368,10 @@ fun ProfileScreen(
                             current.birth,
                         )
                     },
-                    onLogoutClick = { showLogoutConfirm = true },
+                    onLogout = {
+                        onLogout()
+                        phase = ProfileUiPhase.Guest
+                    },
                     onChangePhoto = {
                         if (!avatarUi.isUploading) {
                             onClearAvatarMessage()
@@ -427,42 +430,6 @@ fun ProfileScreen(
             confirmButton = {},
             dismissButton = {
                 TextButton(onClick = { showAvatarChooser = false }) {
-                    Text("Отмена", color = LiferychColors.TextPrimary)
-                }
-            },
-            containerColor = LiferychColors.Surface,
-        )
-    }
-
-    if (showLogoutConfirm) {
-        AlertDialog(
-            onDismissRequest = { showLogoutConfirm = false },
-            title = {
-                Text(
-                    text = "Выход",
-                    color = LiferychColors.TextPrimary,
-                    fontWeight = FontWeight.Bold,
-                )
-            },
-            text = {
-                Text(
-                    text = "Вы действительно хотите выйти из профиля?",
-                    color = LiferychColors.TextSecondary,
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showLogoutConfirm = false
-                        onLogout()
-                        phase = ProfileUiPhase.Guest
-                    },
-                ) {
-                    Text("Выйти", color = Color(0xFFB4232D), fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showLogoutConfirm = false }) {
                     Text("Отмена", color = LiferychColors.TextPrimary)
                 }
             },
@@ -708,9 +675,10 @@ private fun ProfileAuthorizedBody(
     avatarMessage: String,
     onFormChange: (ProfileUiPhase.Authorized) -> Unit,
     onSave: () -> Unit,
-    onLogoutClick: () -> Unit,
+    onLogout: () -> Unit,
     onChangePhoto: () -> Unit,
 ) {
+    var confirmLogout by remember { mutableStateOf(false) }
     val canSave = isProfileSaveReady(name = form.name, phoneNational = form.phoneNational) &&
         !submitting
     Column(
@@ -870,13 +838,57 @@ private fun ProfileAuthorizedBody(
             enabled = canSave,
         )
         Spacer(Modifier.height(18.dp))
-        LogoutProfileButton(onClick = onLogoutClick)
-        Text(
-            text = "При выходе локальные АКБ очищаются. На сервере ваши АКБ сохраняются и вернутся при повторном входе.",
-            color = Color(0xFF6F7781),
-            fontSize = 12.sp,
-            modifier = Modifier.padding(top = 8.dp, bottom = 12.dp),
-        )
+        if (confirmLogout) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFFF6F7F9))
+                    .border(1.dp, LiferychColors.Border, RoundedCornerShape(14.dp))
+                    .padding(14.dp),
+            ) {
+                Text(
+                    text = "Выйти из профиля?",
+                    color = LiferychColors.TextPrimary,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = "При выходе локальные АКБ очищаются. На сервере ваши АКБ сохраняются и вернутся при повторном входе.",
+                    color = Color(0xFF6F7781),
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 8.dp, bottom = 12.dp),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        OutlineProfileButton(
+                            text = "Отмена",
+                            onClick = { confirmLogout = false },
+                        )
+                    }
+                    Box(modifier = Modifier.weight(1f)) {
+                        LogoutProfileButton(
+                            text = "Выйти",
+                            onClick = {
+                                confirmLogout = false
+                                onLogout()
+                            },
+                        )
+                    }
+                }
+            }
+        } else {
+            LogoutProfileButton(onClick = { confirmLogout = true })
+            Text(
+                text = "При выходе локальные АКБ очищаются. На сервере ваши АКБ сохраняются и вернутся при повторном входе.",
+                color = Color(0xFF6F7781),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 8.dp, bottom = 12.dp),
+            )
+        }
     }
 }
 
@@ -1095,7 +1107,10 @@ private fun OutlineProfileButton(
 }
 
 @Composable
-private fun LogoutProfileButton(onClick: () -> Unit) {
+private fun LogoutProfileButton(
+    onClick: () -> Unit,
+    text: String = "Выйти из профиля",
+) {
     val shape = RoundedCornerShape(14.dp)
     Box(
         modifier = Modifier
@@ -1107,11 +1122,12 @@ private fun LogoutProfileButton(onClick: () -> Unit) {
         contentAlignment = Alignment.Center,
     ) {
         Text(
-            text = "Выйти из профиля",
+            text = text,
             color = Color.White,
             fontSize = 15.sp,
             fontWeight = FontWeight.Bold,
             textAlign = TextAlign.Center,
+            maxLines = 1,
         )
     }
 }

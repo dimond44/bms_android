@@ -115,14 +115,15 @@ class AppContainer(
     )
 
     /**
-     * Application-level remote command poller; disabled for service flavor,
-     * matching legacy MainActivity semantics.
+     * Application-level remote command poller (USER and SERVICE flavors).
+     * Executes ADMIN-enqueued write_commands only — never creates them.
+     * Uses EXECUTOR credential (BuildConfig.BMS_EXECUTOR_API_KEY).
      */
     val remoteWriteCoordinator: RemoteWriteCoordinator = RemoteWriteCoordinator(
         repository = bmsRepository,
         api = remoteWriteApi,
         executor = remoteWriteExecutor,
-        enabled = !BuildConfig.IS_SERVICE,
+        enabled = true,
     )
 
     /** Phone GPS → server while a BMS is connected (no background permission). */
@@ -145,6 +146,15 @@ class AppContainer(
             repository = bmsRepository,
             configWriter = configRegisterWriter,
             diagnosticsRepository = configDiagnosticsRepository,
+        )
+
+    /**
+     * Factory SN reader (Modbus 0xD2 / 0x0057–0x005D) → [bmsIdentityStore].
+     */
+    val factorySerialReader: ru.liferych.bms.data.identity.FactorySerialReader =
+        ru.liferych.bms.data.identity.FactorySerialReader(
+            configWriter = configRegisterWriter,
+            identityStore = bmsIdentityStore,
         )
 
     init {

@@ -1,6 +1,9 @@
 ## Android SDK
 # sdk.dir=C\:\\Users\\USER\\AppData\\Local\\Android\\Sdk
 
-## BMS API key for http://5.3.87.2:3101
-## Insert the real key from the server. Do not invent a new one.
+## BMS API keys for https://5.3.87.2
+## DEVICE ingest (telemetry/warranty/location/…). Never ADMIN.
 BMS_API_KEY=
+## EXECUTOR: GET pending write-commands + ACK only. Never ADMIN, never enqueue.
+BMS_EXECUTOR_API_KEY=
+# aliases also accepted: DEVICE_API_KEY, EXECUTOR_API_KEY, BMS_SERVICE_API_KEY, SERVICE_API_KEY

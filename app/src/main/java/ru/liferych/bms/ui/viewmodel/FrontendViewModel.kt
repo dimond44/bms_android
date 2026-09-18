@@ -55,6 +55,8 @@ class FrontendViewModel(
         ru.liferych.bms.data.diagnostics.ConfigDiagnosticsRepository? = null,
     private val clientTemplateFixWriter:
         ru.liferych.bms.data.diagnostics.ClientTemplateFixWriter? = null,
+    private val factorySerialReader:
+        ru.liferych.bms.data.identity.FactorySerialReader? = null,
 ) : ViewModel() {
     val batteryState: StateFlow<BatteryState> = repository.batteryState
     val connectionState: StateFlow<BmsConnectionState> = repository.connectionState
@@ -111,6 +113,14 @@ class FrontendViewModel(
     private var diagnosticsFixing: Boolean = false
     private var diagnosticsFixProgress: String = ""
     private var diagnosticsFixError: String = ""
+    /** True while Diagnostics forced a live Modbus config read — quiet refresh must not cancel it. */
+    private var diagnosticsLiveReadInFlight: Boolean = false
+    /** Address for which a live config read was already attempted this connection. */
+    private var liveConfigAttemptedAddress: String? = null
+    /** Address for which factory SN Modbus read was attempted this connection. */
+    private var factorySerialAttemptedAddress: String? = null
+    /** Bumps when identity cache SN is updated so Dashboard re-reads prefs. */
+    private val _factorySerialTick = MutableStateFlow(0)
 
     private val _diagnosticsSnapshot =
         MutableStateFlow<ru.liferych.bms.data.diagnostics.DiagnosticsSnapshot?>(null)
@@ -270,10 +280,13 @@ class FrontendViewModel(
     /**
      * Factory serial for Dashboard «Серийный номер».
      *
-     * Source: legacy cache `bms_identity` / `sn_<MAC>` (from Modbus 0x0057–0x005D),
-     * not BLE telemetry and not MAC/device name.
+     * Source: legacy cache `bms_identity` / `sn_<MAC>` filled by Modbus 0xD2
+     * registers 0x0057–0x005D (same path as MainActivity). Not Bluetooth name.
      */
-    val selectedFactorySerial: StateFlow<String> = selectedBatteryId.map { id ->
+    val selectedFactorySerial: StateFlow<String> = combine(
+        selectedBatteryId,
+        _factorySerialTick,
+    ) { id, _ ->
         val raw = bmsIdentityStore.cachedFactorySerial(id)
         val display = bmsIdentityStore.displayFactorySerial(raw)
         display.ifBlank { "--" }
@@ -394,11 +407,17 @@ class FrontendViewModel(
             }
         }
         // Quiet template-check refresh for Dashboard overall status banner.
+        // Does not cancel an in-flight Diagnostics live Modbus read.
         viewModelScope.launch {
             combine(connectionState, batteryState, selectedBatteryId) { c, b, id ->
                 Triple(c, b, id)
             }.collect { (c, b, id) ->
-                if (c is BmsConnectionState.Connected &&
+                if (c !is BmsConnectionState.Connected) {
+                    liveConfigAttemptedAddress = null
+                    factorySerialAttemptedAddress = null
+                    return@collect
+                }
+                if (
                     !id.isNullOrBlank() &&
                     (b.voltage != null || b.soc != null)
                 ) {
@@ -1027,14 +1046,50 @@ class FrontendViewModel(
     }
 
     /**
+     * Once per connected MAC: Modbus SN Code → identity cache → Dashboard.
+     * Retries later when config I/O is busy (does not mark attempt as final).
+     */
+    private suspend fun refreshFactorySerialAfterDiagnostics(bleAddress: String) {
+        val reader = factorySerialReader ?: return
+        if (factorySerialAttemptedAddress.equals(bleAddress, true)) return
+        if (!bmsIdentityStore.cachedFactorySerial(bleAddress).isNullOrBlank()) {
+            factorySerialAttemptedAddress = bleAddress
+            _factorySerialTick.value = _factorySerialTick.value + 1
+            return
+        }
+        val result = withContext(Dispatchers.IO) {
+            reader.refreshIfNeeded(bleAddress, force = false)
+        }
+        when (result) {
+            is ru.liferych.bms.data.identity.FactorySerialRefresh.Done -> {
+                factorySerialAttemptedAddress = bleAddress
+                if (result.display.isNotBlank()) {
+                    _factorySerialTick.value = _factorySerialTick.value + 1
+                }
+            }
+            ru.liferych.bms.data.identity.FactorySerialRefresh.Failed -> {
+                factorySerialAttemptedAddress = bleAddress
+            }
+            ru.liferych.bms.data.identity.FactorySerialRefresh.Busy -> {
+                // Leave attempted unset so a later quiet refresh can retry.
+            }
+        }
+    }
+
+    /**
      * Refreshes template diagnostics without forcing Loading chrome (Dashboard banner).
+     * Skips when a job is already running so telemetry polls do not cancel Modbus reads.
      */
     private fun refreshDiagnosticsQuiet() {
+        if (diagnosticsJob?.isActive == true || diagnosticsLiveReadInFlight) return
         refreshDiagnostics(forceUi = false)
     }
 
     /**
      * Runs config-template check via [configDiagnosticsRepository].
+     *
+     * When config registers are not cached yet (or Diagnostics opened), performs one
+     * live Modbus read via [clientTemplateFixWriter] so UI leaves "checking".
      *
      * @param forceUi when true, show Loading until result (Diagnostics screen)
      */
@@ -1049,7 +1104,11 @@ class FrontendViewModel(
         if (forceUi && !diagnosticsFixing) {
             _diagnosticsUi.value = ru.liferych.bms.ui.model.DiagnosticsUiState.Loading
         }
-        diagnosticsJob?.cancel()
+        if (forceUi) {
+            diagnosticsJob?.cancel()
+        } else if (diagnosticsJob?.isActive == true) {
+            return
+        }
         diagnosticsJob = viewModelScope.launch {
             val battery = batteryState.value
             val savedName = _savedBatteries.value
@@ -1060,15 +1119,28 @@ class FrontendViewModel(
                 address = address,
                 bluetoothName = savedName,
             )
-            val snapshot = withContext(Dispatchers.IO) {
-                val fixer = clientTemplateFixWriter
-                if (forceUi && fixer != null) {
-                    fixer.refreshLiveConfig(
-                        bmsUid = uid,
-                        battery = battery,
-                        bluetoothName = savedName,
-                    )
-                } else {
+            val cachedRegisters = repo.loadRegisters(uid)
+            val fixer = clientTemplateFixWriter
+            val needLiveRead = fixer != null && (
+                forceUi ||
+                    (cachedRegisters.isEmpty() && liveConfigAttemptedAddress != address)
+                )
+            val snapshot = if (needLiveRead && fixer != null) {
+                diagnosticsLiveReadInFlight = true
+                try {
+                    withContext(Dispatchers.IO) {
+                        fixer.refreshLiveConfig(
+                            bmsUid = uid,
+                            battery = battery,
+                            bluetoothName = savedName,
+                        )
+                    }
+                } finally {
+                    diagnosticsLiveReadInFlight = false
+                    liveConfigAttemptedAddress = address
+                }
+            } else {
+                withContext(Dispatchers.IO) {
                     repo.refresh(
                         bmsUid = uid,
                         battery = battery,
@@ -1087,6 +1159,7 @@ class FrontendViewModel(
                 fixProgressText = diagnosticsFixProgress,
                 fixError = diagnosticsFixError,
             )
+            refreshFactorySerialAfterDiagnostics(address)
         }
     }
 
@@ -1115,6 +1188,8 @@ class FrontendViewModel(
             ru.liferych.bms.data.diagnostics.ConfigDiagnosticsRepository? = null,
         private val clientTemplateFixWriter:
             ru.liferych.bms.data.diagnostics.ClientTemplateFixWriter? = null,
+        private val factorySerialReader:
+            ru.liferych.bms.data.identity.FactorySerialReader? = null,
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -1127,6 +1202,7 @@ class FrontendViewModel(
                     avatarEncoder,
                     configDiagnosticsRepository,
                     clientTemplateFixWriter,
+                    factorySerialReader,
                 ) as T
             }
             throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")

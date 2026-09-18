@@ -343,12 +343,14 @@ fun registerFailureMessage(httpCode: Int, error: String): String {
             "Некорректный номер телефона"
         error == "name_required" ->
             "Укажите ФИО для регистрации"
-        error == "unauthorized" || httpCode == 401 ->
+        error == "phone_already_exists" || httpCode == 409 ->
+            "Пользователь с таким номером уже зарегистрирован"
+        error == "unauthorized" || error == "forbidden" || httpCode == 401 || httpCode == 403 ->
             "Ошибка авторизации приложения на сервере"
         error == "not_found" || httpCode == 404 ->
             "Сервер не поддерживает регистрацию (endpoint недоступен). Обновите backend."
         httpCode in 500..599 ->
-            "Ошибка сервера. Попробуйте позже."
+            "Ошибка сервера. Повторите позже."
         error.isNotBlank() ->
             "Не удалось зарегистрироваться ($error)"
         else ->

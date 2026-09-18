@@ -14,6 +14,10 @@ private val LiferychFontFamily = FontFamily(
 
 /**
  * Typography closer to legacy Inter weights used on CLIENT dashboard.
+ *
+ * App typography source of truth for Compose BMS UI (title/body/label/button).
+ * Glyph metrics use bundled Inter ([R.font.inter]); system fontScale is pinned
+ * in [LiferychTheme] so OEM Font size settings do not change layout scale.
  */
 val LiferychTypography = Typography(
     displayLarge = TextStyle(

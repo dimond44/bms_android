@@ -6,7 +6,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -141,9 +140,7 @@ private fun DashboardLegacyContent(
             .padding(top = LiferychDimens.Space8, bottom = LiferychDimens.Space24),
     ) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(IntrinsicSize.Min),
+            modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             InfoOneLineTile(
@@ -425,7 +422,7 @@ private fun CellMiniTile(
 private fun DashboardConnectedPreview() {
     LiferychTheme {
         DashboardScreen(
-            batteryName = "DALY-BMS-16S",
+            batteryName = "DL-D21A08120AF8",
             serialNumber = "224LG151200441",
             bmsVersion = "JHB-R24TK-V2.1",
             batteryState = previewBatteryState(),

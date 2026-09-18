@@ -46,46 +46,48 @@ fun InfoOneLineTile(
     modifier: Modifier = Modifier,
 ) {
     val shape = RoundedCornerShape(LiferychDimens.CardRadius)
+    // Fixed height: value/title must never stretch the Dashboard info row.
     Column(
         modifier = modifier
-            .heightIn(min = LiferychDimens.InfoTileMinHeight)
-            .fillMaxHeight()
+            .height(LiferychDimens.InfoTileHeight)
             .clip(shape)
             .background(LiferychColors.Surface)
             .border(LiferychDimens.CardBorderWidth, LiferychColors.Border, shape)
-            .padding(horizontal = 6.dp, vertical = 8.dp),
+            .padding(horizontal = 8.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.Center,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
             Icon(
                 painter = painterResource(iconRes),
                 contentDescription = null,
                 tint = LiferychColors.IconDefault,
-                modifier = Modifier.size(18.dp),
+                modifier = Modifier.size(15.dp),
             )
             Spacer(Modifier.width(4.dp))
             Text(
                 text = label,
                 color = LiferychColors.TextSecondary,
-                fontSize = 9.sp,
+                fontSize = 10.sp,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 2,
                 softWrap = true,
-                overflow = TextOverflow.Clip,
-                lineHeight = 11.sp,
+                overflow = TextOverflow.Ellipsis,
+                lineHeight = 12.sp,
+                modifier = Modifier.weight(1f),
             )
         }
         Spacer(Modifier.height(4.dp))
-        Text(
+        AutoSizeSingleLineText(
             text = value,
             color = LiferychColors.TextPrimary,
-            fontSize = 11.sp,
             fontWeight = FontWeight.SemiBold,
-            maxLines = 2,
-            softWrap = true,
-            overflow = TextOverflow.Clip,
-            lineHeight = 13.sp,
+            maxFontSize = 14.sp,
+            minFontSize = 10.sp,
             letterSpacing = (-0.2).sp,
+            modifier = Modifier.fillMaxWidth(),
         )
     }
 }

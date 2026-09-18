@@ -88,6 +88,8 @@ class RemoteWriteVerifierTest {
             error = null,
             createdAt = 1,
             updatedAt = 1,
+            leaseToken = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            expiresAt = 2,
         )
     }
 }

@@ -5,6 +5,10 @@ import java.util.UUID
 /**
  * Daly A5 request/response protocol helpers.
  * Behaviour must stay identical to the legacy MainActivity implementation.
+ *
+ * Frame layout (13 bytes): [A5][addr=0x40][cmd][len=0x08][8 payload][checksum].
+ * Checksum = low 8 bits of sum(bytes[0..11]). Do not change UUID candidates,
+ * command IDs, or checksum without a protocol dump / vendor docs.
  */
 object DalyProtocol {
     const val FRAME_START: Byte = 0xA5.toByte()
@@ -78,6 +82,7 @@ object DalyProtocol {
         return frame
     }
 
+    /** Daly A5: unsigned sum of the first [length] bytes, truncated to 8 bits. */
     fun checksum(bytes: ByteArray, length: Int): Byte {
         var sum = 0
         for (i in 0 until length) sum += bytes[i].toInt() and 0xFF

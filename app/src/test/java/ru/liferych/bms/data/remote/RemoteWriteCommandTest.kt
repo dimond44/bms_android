@@ -22,11 +22,13 @@ class RemoteWriteCommandTest {
                   "raw_value": 360,
                   "scale": 0.1,
                   "offset": 0,
-                  "status": "pending",
+                  "status": "writing",
+                  "lease_token": "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
                   "actual": null,
                   "error": null,
                   "created_at": 100,
-                  "updated_at": 200
+                  "updated_at": 200,
+                  "expires_at": 300
                 }
                 """.trimIndent(),
             ),
@@ -60,8 +62,10 @@ class RemoteWriteCommandTest {
         put("raw_value", 360)
         put("scale", 0.1)
         put("offset", 0.0)
-        put("status", "pending")
+        put("status", "writing")
+        put("lease_token", "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899")
         put("created_at", 1L)
         put("updated_at", 1L)
+        put("expires_at", 2L)
     }
 }

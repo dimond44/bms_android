@@ -138,7 +138,10 @@ class RemoteWriteCoordinator(
                     api.acknowledge(
                         bmsUid = uid,
                         commandId = command.id,
-                        ack = RemoteWriteAck(status = STATUS_WRITING),
+                        ack = RemoteWriteAck(
+                            status = STATUS_WRITING,
+                            leaseToken = command.leaseToken,
+                        ),
                     )
                 },
             )
@@ -151,6 +154,7 @@ class RemoteWriteCoordinator(
                         commandId = command.id,
                         ack = RemoteWriteAck(
                             status = STATUS_DONE,
+                            leaseToken = command.leaseToken,
                             actual = result.actual,
                         ),
                     )
@@ -166,6 +170,7 @@ class RemoteWriteCoordinator(
                         commandId = command.id,
                         ack = RemoteWriteAck(
                             status = STATUS_FAILED,
+                            leaseToken = command.leaseToken,
                             actual = result.actual,
                             error = result.error,
                         ),

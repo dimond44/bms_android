@@ -27,11 +27,11 @@ import ru.liferych.bms.ui.viewmodel.QrViewModel
 import ru.liferych.bms.ui.viewmodel.SupportViewModel
 
 /**
- * Compose CLIENT frontend entry.
+ * Compose frontend entry (LAUNCHER for USER and SERVICE).
  *
  * Uses shared AppContainer DalyBmsRepository + SavedBatteriesStore.
  * System splash: white + brand icon ([Theme.Liferych.Splash]).
- * Legacy MainActivity remains the launcher.
+ * Legacy MainActivity is not the launcher.
  */
 class FrontendActivity : ComponentActivity() {
     private val appContainer get() = (application as BmsApp).container
@@ -46,6 +46,7 @@ class FrontendActivity : ComponentActivity() {
             ru.liferych.bms.data.auth.ProfileAvatarEncoder(applicationContext),
             container.configDiagnosticsRepository,
             container.clientTemplateFixWriter,
+            container.factorySerialReader,
         )
     }
 

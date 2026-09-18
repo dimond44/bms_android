@@ -37,6 +37,19 @@ class BmsIdentityStore(
     }
 
     /**
+     * Persists factory serial for [address] (legacy `sn_<MAC>` key).
+     *
+     * @param address BLE MAC
+     * @param serial validated factory SN (not Bluetooth name)
+     */
+    fun saveFactorySerial(address: String, serial: String) {
+        val key = address.trim()
+        val sn = serial.trim()
+        if (key.isBlank() || sn.isBlank()) return
+        prefs.edit().putString("sn_$key", sn).apply()
+    }
+
+    /**
      * Persists HW version ASCII for [address] (legacy `hw_<MAC>` key).
      *
      * @param address BLE MAC
